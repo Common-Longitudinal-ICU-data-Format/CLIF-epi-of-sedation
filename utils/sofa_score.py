@@ -154,10 +154,10 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
 
     # Rename columns to indicate aggregation function used
     lab_summary = lab_summary.rename(columns={
-        "po2_arterial": "po2_arterial_min",
-        "platelet_count": "platelet_count_min",
-        "creatinine": "creatinine_max",
-        "bilirubin_total": "bilirubin_total_max"
+        "po2_arterial": "po2_arterial_recent",
+        "platelet_count": "platelet_count_recent",
+        "creatinine": "creatinine_recent",
+        "bilirubin_total": "bilirubin_total_recent"
     })
 
     #######################################################################
@@ -216,8 +216,8 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
         columns='vital_category',
         values='vital_value'
     ).reset_index()
-    # Add _min suffix to all columns except id_col
-    vital_summary.columns = [col if col == id_col else f"{col}_min" for col in vital_summary.columns]
+    # Add _recent suffix to all columns except id_col
+    vital_summary.columns = [col if col == id_col else f"{col}_recent" for col in vital_summary.columns]
     logger.info("Created vitals summary")
 
     def calc_pao2_vectorized(spo2_series):
@@ -243,7 +243,7 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
         return pao2
 
     # Add the calculated column
-    vital_summary['pao2_imputed_min'] = calc_pao2_vectorized(vital_summary['spo2_min'])
+    vital_summary['pao2_imputed_recent'] = calc_pao2_vectorized(vital_summary['spo2_recent'])
 
     logger.info("Imputed pao2 from spo2")
 
@@ -285,7 +285,7 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     ).reset_index()
 
     gcs_summary = gcs_summary.rename(columns={
-        "gcs_total": "min_gcs_score"
+        "gcs_total": "gcs_score_recent"
     }) 
 
     #######################################################################
@@ -433,16 +433,16 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
             'device_rank': 'last',
             'fio2_combined': 'last'
         })
-        .rename(columns={'device_rank': 'device_rank_min', 'fio2_combined': 'fio2_max'})
+        .rename(columns={'device_rank': 'device_rank_recent', 'fio2_combined': 'fio2_recent'})
         .reset_index()
     )
 
     # Map device ranks back to categories
     reverse_device_rank = {v: k for k, v in device_rank_dict.items()}
-    resp_summary['resp_support_max'] = resp_summary['device_rank_min'].map(reverse_device_rank)
+    resp_summary['resp_support_recent'] = resp_summary['device_rank_recent'].map(reverse_device_rank)
 
     # Final columns selection
-    resp_summary = resp_summary[[id_col, 'fio2_max', 'resp_support_max']]
+    resp_summary = resp_summary[[id_col, 'fio2_recent', 'resp_support_recent']]
 
     #######################################################################
     # 7. Merge Tables 
@@ -472,20 +472,20 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     #######################################################################
     # 8. SOFA score calculation
     #######################################################################
-    merged_df['p_f'] = np.where((merged_df['fio2_max'].notna()) & (merged_df['fio2_max'] != 0) & (merged_df['po2_arterial_min'].notna()),
-                          merged_df['po2_arterial_min'] / merged_df['fio2_max'], np.nan)
+    merged_df['p_f'] = np.where((merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['po2_arterial_recent'].notna()),
+                          merged_df['po2_arterial_recent'] / merged_df['fio2_recent'], np.nan)
 
-    merged_df['p_f_imputed'] = np.where((merged_df['fio2_max'].notna()) & (merged_df['fio2_max'] != 0) & (merged_df['pao2_imputed_min'].notna()),
-                                    merged_df['pao2_imputed_min'] / merged_df['fio2_max'], np.nan)
+    merged_df['p_f_imputed'] = np.where((merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['pao2_imputed_recent'].notna()),
+                                    merged_df['pao2_imputed_recent'] / merged_df['fio2_recent'], np.nan)
 
-    merged_df['s_f'] = np.where((merged_df['fio2_max'].notna()) & (merged_df['fio2_max'] != 0) & (merged_df['spo2_min'].notna()),
-                            merged_df['spo2_min'] / merged_df['fio2_max'], np.nan)
+    merged_df['s_f'] = np.where((merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['spo2_recent'].notna()),
+                            merged_df['spo2_recent'] / merged_df['fio2_recent'], np.nan)
     
-    print("Missing ratio of p_f (po2_arterial_min / fio2_max): ", merged_df.p_f.isna().sum()/merged_df.shape[0])
-    print("Missing ratio of p_f_imputed (pao2_imputed_min / fio2_max): ", merged_df.p_f_imputed.isna().sum()/merged_df.shape[0])
-    print("Missing ratio of s_f (spo2_min / fio2_max):", merged_df.s_f.isna().sum()/merged_df.shape[0])
+    print("Missing ratio of p_f (po2_arterial_recent / fio2_recent): ", merged_df.p_f.isna().sum()/merged_df.shape[0])
+    print("Missing ratio of p_f_imputed (pao2_imputed_recent / fio2_recent): ", merged_df.p_f_imputed.isna().sum()/merged_df.shape[0])
+    print("Missing ratio of s_f (spo2_recent / fio2_recent):", merged_df.s_f.isna().sum()/merged_df.shape[0])
 
-    print(f"\nMost of the missing values in p_f_imputed are caused by pao2_imputed_min, which is set to NaN when spo2>97")
+    print(f"\nMost of the missing values in p_f_imputed are caused by pao2_imputed_recent, which is set to NaN when spo2>97")
 
     sofa_df = merged_df.copy()
 
@@ -497,7 +497,7 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
         (sofa_df['dopamine'] > 15) | (sofa_df['epinephrine'] > 0.1) | (sofa_df['norepinephrine'] > 0.1),  #4
         (sofa_df['dopamine'] > 5) | ((sofa_df['epinephrine'] <= 0.1) & (sofa_df['epinephrine'] > 0)) | ((sofa_df['norepinephrine'] <= 0.1) & (sofa_df['norepinephrine'] > 0)),  #3
         ((sofa_df['dopamine'] <= 5) & (sofa_df['dopamine'] > 0)) | (sofa_df['dobutamine'] > 0),  #2
-        (sofa_df['map_min'] < 70) #1
+        (sofa_df['map_recent'] < 70) #1
     ]
 
     values = [4, 3, 2, 1]
@@ -511,10 +511,10 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
 
         # Condition and corresponsding values
     conditions = [
-        sofa_df['platelet_count_min'] < 20, #4
-        (sofa_df['platelet_count_min'] < 50) & (sofa_df['platelet_count_min'] >= 20), #3
-        (sofa_df['platelet_count_min'] < 100) & (sofa_df['platelet_count_min'] >= 50), #2
-        (sofa_df['platelet_count_min'] < 150) & (sofa_df['platelet_count_min'] >= 100), #1
+        sofa_df['platelet_count_recent'] < 20, #4
+        (sofa_df['platelet_count_recent'] < 50) & (sofa_df['platelet_count_recent'] >= 20), #3
+        (sofa_df['platelet_count_recent'] < 100) & (sofa_df['platelet_count_recent'] >= 50), #2
+        (sofa_df['platelet_count_recent'] < 150) & (sofa_df['platelet_count_recent'] >= 100), #1
     ]
 
     values = [4, 3, 2, 1]
@@ -528,10 +528,10 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
 
     # Condition and corresponsding values
     conditions = [
-        sofa_df['bilirubin_total_max'] >= 12, #4
-        (sofa_df['bilirubin_total_max'] >= 6 ) & (sofa_df['bilirubin_total_max'] < 12), #3
-        (sofa_df['bilirubin_total_max'] >= 2) & (sofa_df['bilirubin_total_max'] < 6), #2
-        (sofa_df['bilirubin_total_max'] >= 1.2) & (sofa_df['bilirubin_total_max'] < 2), #1
+        sofa_df['bilirubin_total_recent'] >= 12, #4
+        (sofa_df['bilirubin_total_recent'] >= 6 ) & (sofa_df['bilirubin_total_recent'] < 12), #3
+        (sofa_df['bilirubin_total_recent'] >= 2) & (sofa_df['bilirubin_total_recent'] < 6), #2
+        (sofa_df['bilirubin_total_recent'] >= 1.2) & (sofa_df['bilirubin_total_recent'] < 2), #1
     ]
 
     values = [4, 3, 2, 1]
@@ -545,8 +545,8 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
 
 
     conditions = [
-        (sofa_df['p_f'] < 100) & sofa_df['resp_support_max'].isin(["nippv", "cpap", "imv"]), #4
-        (sofa_df['p_f'] < 200) & (sofa_df['p_f'] >= 100) & sofa_df['resp_support_max'].isin(["nippv", "cpap", "imv"]), #3
+        (sofa_df['p_f'] < 100) & sofa_df['resp_support_recent'].isin(["nippv", "cpap", "imv"]), #4
+        (sofa_df['p_f'] < 200) & (sofa_df['p_f'] >= 100) & sofa_df['resp_support_recent'].isin(["nippv", "cpap", "imv"]), #3
         (sofa_df['p_f'] < 300) & (sofa_df['p_f'] >= 200), #2
         (sofa_df['p_f'] < 400) & (sofa_df['p_f'] >= 300), #1
     ]
@@ -558,8 +558,8 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
 
 
     conditions = [
-        (sofa_df['p_f_imputed'] < 100) & sofa_df['resp_support_max'].isin(["nippv", "cpap", "imv"]), #4
-        (sofa_df['p_f_imputed'] < 200) & (sofa_df['p_f_imputed'] >= 100) & sofa_df['resp_support_max'].isin(["nippv", "cpap", "imv"]), #3
+        (sofa_df['p_f_imputed'] < 100) & sofa_df['resp_support_recent'].isin(["nippv", "cpap", "imv"]), #4
+        (sofa_df['p_f_imputed'] < 200) & (sofa_df['p_f_imputed'] >= 100) & sofa_df['resp_support_recent'].isin(["nippv", "cpap", "imv"]), #3
         (sofa_df['p_f_imputed'] < 300) & (sofa_df['p_f_imputed'] >= 200), #2
         (sofa_df['p_f_imputed'] < 400) & (sofa_df['p_f_imputed'] >= 300), #1
     ]
@@ -577,10 +577,10 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     #######################################################################
 
     conditions = [
-        (sofa_df['min_gcs_score'] < 6), #4
-        (sofa_df['min_gcs_score'] >= 6) & (sofa_df['min_gcs_score'] <= 9), #3
-        (sofa_df['min_gcs_score'] >= 10) & (sofa_df['min_gcs_score'] <= 12), #2
-        (sofa_df['min_gcs_score'] >= 13) & (sofa_df['min_gcs_score'] <= 14), #1
+        (sofa_df['gcs_score_recent'] < 6), #4
+        (sofa_df['gcs_score_recent'] >= 6) & (sofa_df['gcs_score_recent'] <= 9), #3
+        (sofa_df['gcs_score_recent'] >= 10) & (sofa_df['gcs_score_recent'] <= 12), #2
+        (sofa_df['gcs_score_recent'] >= 13) & (sofa_df['gcs_score_recent'] <= 14), #1
     ]
 
     values = [4, 3, 2, 1]
@@ -593,10 +593,10 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     #######################################################################
 
     conditions = [
-        sofa_df['creatinine_max'] >= 5, #4
-        (sofa_df['creatinine_max'] >= 3.5) & (sofa_df['creatinine_max'] < 5), #3
-        (sofa_df['creatinine_max'] >= 2) & (sofa_df['creatinine_max'] < 3.5), #2
-        (sofa_df['creatinine_max'] >= 1.2) & (sofa_df['creatinine_max'] < 2), #1
+        sofa_df['creatinine_recent'] >= 5, #4
+        (sofa_df['creatinine_recent'] >= 3.5) & (sofa_df['creatinine_recent'] < 5), #3
+        (sofa_df['creatinine_recent'] >= 2) & (sofa_df['creatinine_recent'] < 3.5), #2
+        (sofa_df['creatinine_recent'] >= 1.2) & (sofa_df['creatinine_recent'] < 2), #1
     ]
 
     values = [4, 3, 2, 1]
