@@ -12,10 +12,21 @@ from sofa_score import compute_sofa
 res_df = compute_sofa(
     ids_w_dttm,            # DataFrame with id, start_dttm, stop_dttm (UTC)
     tables_path=...,
-    use_hospitalization_id=True,
-    id_mapping=None,       # DataFrame with hospitalization_id + custom id_col
+    use_hospitalization_id=True, # or False + id_mapping (new id , hospitalization_id)
+    id_mapping=None,       # DataFrame with new custom id_col + hospitalization_id 
     output_filepath=None,  # if given, write Parquet
 )
+
+Example
+-------
+sofa_df = compute_sofa(
+    ids_w_dttm = sofa_input_df,          # id, start_dttm, end_dttm  (local time)
+    tables_path = tables_path,
+    use_hospitalization_id = False,         # or False + id_mapping (new id , hospitalization_id)
+    id_mapping = id_mappings,              # first column should be your new id_variable, second column is hospitalization id
+    helper_module = pyCLIF,                # ← your existing loader
+    output_filepath = "../output/intermediate/sofa.parquet"
+    )
 
 Returned
 --------
@@ -23,6 +34,10 @@ Pandas DataFrame one row / id with worst components + total score.
 """
 
 import pandas as pd, numpy as np, logging, json
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'utils'))
+
 import pyCLIF
 from typing import Optional
 
@@ -40,7 +55,7 @@ logger.setLevel(logging.INFO)
 # Outlier config file
 ##############################################################################
 
-with open('../config/outlier_config.json', 'r', encoding='utf-8') as f:
+with open('config/outlier_config.json', 'r', encoding='utf-8') as f:
     outlier_cfg = json.load(f)
 
 
@@ -53,7 +68,7 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
                  id_mapping:Optional[pd.DataFrame]=None,
                  output_filepath:Optional[str]=None,
                  helper_module=None)->pd.DataFrame:
-    """Compute SOFA using worst value between start/stop for each id"""
+    """Compute SOFA using most recent value between start/stop for each id"""
     logger.info("Starting SOFA computation for %d rows", len(ids_w_dttm))
     load_data = pyCLIF.load_data
 
@@ -74,9 +89,11 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     #######################################################################
     # 1.  Labs
     #######################################################################
+    lab_dttm_name = 'lab_collect_dttm'
+    
     labs_required_columns = [
         'hospitalization_id',
-        'lab_order_dttm',
+        lab_dttm_name,
         'lab_category',
         'lab_value_numeric'
     ]
@@ -117,14 +134,15 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     )
     # Filter labs within time window
     lab_sub = lab_sub[
-        (lab_sub['lab_order_dttm'] >= lab_sub['start_dttm']) & 
-        (lab_sub['lab_order_dttm'] <= lab_sub['stop_dttm'])
+        (lab_sub[lab_dttm_name] >= lab_sub['start_dttm']) & 
+        (lab_sub[lab_dttm_name] <= lab_sub['stop_dttm'])
     ]
-    # Aggregate by time bucket
+    # Aggregate by time bucket - get most recent value
     lab_summary = (
         lab_sub
+        .sort_values(lab_dttm_name)
         .groupby([id_col, 'lab_category'])['lab_value_numeric']
-        .agg(lambda x: x.min() if x.name in ["po2_arterial", "platelet_count"] else x.max())
+        .last()  # Get the most recent (last) value
         .reset_index()
     )
 
@@ -187,8 +205,9 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     ]
     vital_summary = (
         vital_sub
+        .sort_values('recorded_dttm')
         .groupby([id_col, 'vital_category'])['vital_value']
-        .min()  # using min() for all vitals as we want the worst values
+        .last()  # Get the most recent (last) value
         .reset_index()
     ) 
     # Pivot the table
@@ -253,8 +272,9 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     ]
     gcs_summary = (
         gcs_sub
+        .sort_values('recorded_dttm')
         .groupby([id_col, 'assessment_category'])['numerical_value']
-        .min()  # using min() for gcs as we want the worst values
+        .last()  # Get the most recent (last) value
         .reset_index()
     ) 
     # Pivot the table
@@ -322,8 +342,9 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
 
     meds_summary = (
         meds_sub
+        .sort_values('admin_dttm')
         .groupby([id_col, 'med_category'])['med_dose_converted']
-        .max()  # using max() for all vasopressor as we want the worst values
+        .last()  # Get the most recent (last) value
         .reset_index()
     ) 
     # Pivot the table
@@ -403,11 +424,18 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     # Apply device ranking
     resp_new['device_rank'] = resp_new['device_category'].map(device_rank_dict)
 
-    # Aggregate to get worst FiO2 and device per hospitalization
-    resp_summary = resp_new.groupby(id_col).agg(
-        device_rank_min=('device_rank', lambda x: np.nan if x.isna().all() else x.min(skipna=True)),
-        fio2_max=('fio2_combined', lambda x: np.nan if x.isna().all() else x.max(skipna=True))
-    ).reset_index()
+    # Aggregate to get most recent FiO2 and device per hospitalization
+    resp_summary = (
+        resp_new
+        .sort_values('recorded_dttm')
+        .groupby(id_col)
+        .agg({
+            'device_rank': 'last',
+            'fio2_combined': 'last'
+        })
+        .rename(columns={'device_rank': 'device_rank_min', 'fio2_combined': 'fio2_max'})
+        .reset_index()
+    )
 
     # Map device ranks back to categories
     reverse_device_rank = {v: k for k, v in device_rank_dict.items()}
