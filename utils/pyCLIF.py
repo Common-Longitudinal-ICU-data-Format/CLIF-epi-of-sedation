@@ -929,6 +929,34 @@ med_unit_info = {
                              'milli-units/min', 'milli-units/hr','milli-units/kg/h','milliunits/kg/h',
                              'milli-units/kg/min', 'milliunits/kg/min' ],
     },
+    'dexmedetomidine': {
+        'required_unit': 'mcg/kg/min',
+        'acceptable_units': ['mcg/kg/min', 'mcg/kg/hr', 'mg/kg/hr', 'mcg/min', 'mg/hr'],
+    },
+    'fentanyl': {
+        'required_unit': 'mcg/kg/min',
+        'acceptable_units': ['mcg/kg/min', 'mcg/kg/hr', 'mg/kg/hr', 'mcg/min', 'mg/hr'],
+    },
+    'hydromorphone': {
+        'required_unit': 'mcg/kg/min',
+        'acceptable_units': ['mcg/kg/min', 'mcg/kg/hr', 'mg/kg/hr', 'mcg/min', 'mg/hr'],
+    },
+    'ketamine': {
+        'required_unit': 'mcg/kg/min',
+        'acceptable_units': ['mcg/kg/min', 'mcg/kg/hr', 'mg/kg/hr', 'mcg/min', 'mg/hr'],
+    },
+    'lorazepam': {
+        'required_unit': 'mcg/kg/min',
+        'acceptable_units': ['mcg/kg/min', 'mcg/kg/hr', 'mg/kg/hr', 'mcg/min', 'mg/hr'],
+    },
+    'midazolam': {
+        'required_unit': 'mcg/kg/min',
+        'acceptable_units': ['mcg/kg/min', 'mcg/kg/hr', 'mg/kg/hr', 'mcg/min', 'mg/hr'],
+    },
+    'propofol': {
+        'required_unit': 'mcg/kg/min',
+        'acceptable_units': ['mcg/kg/min', 'mcg/kg/hr', 'mg/kg/hr', 'mcg/min', 'mg/hr'],
+    }
 }
 
 def check_dose_unit(row):
@@ -976,28 +1004,31 @@ def get_conversion_factor(med_category: str,
         return factor_if_known if has_weight else None
     # ──────────────────────────────────────────────────────────
 
-    if med_category in ["norepinephrine", "epinephrine",
-                        "phenylephrine", "dopamine",
-                        "dobutamine", "metaraminol"]:
+    if med_category in [
+        "norepinephrine", "epinephrine", "phenylephrine", "dopamine", "dobutamine", "metaraminol", 
+        # sedatives:
+        "midazolam", "lorazepam", "hydromorphone", "fentanyl", "propofol", "dexmedetomidine", "ketamine"
+        ]:
         if med_dose_unit == "mcg/kg/min": return 1.0
-        elif med_dose_unit == "mcg/kg/hr": return 1/60
-        elif med_dose_unit == "mg/kg/hr": return 1000/60
+        elif med_dose_unit in ["mcg/kg/hr", "mcg/kg/hour"]: return 1/60
+        elif med_dose_unit in ["mcg/hr", "mcg/hour"]: return w_needed(1/60/weight_kg)
+        elif med_dose_unit in ["mg/kg/hr", "mg/kg/hour"]: return 1000/60
         elif med_dose_unit == "mg/kg/min": return 1000
         elif med_dose_unit == "mcg/min": return w_needed(1/weight_kg)
-        elif med_dose_unit == "mg/hr": return w_needed(1000/60/weight_kg)
+        elif med_dose_unit in ["mg/hr", "mg/hour"]: return w_needed(1000/60/weight_kg)
     elif med_category == "angiotensin":
         if med_dose_unit == "ng/kg/min": return 1/1_000
-        elif med_dose_unit == "ng/kg/hr": return 1/1_000/60
+        elif med_dose_unit in ["ng/kg/hr", "ng/kg/hour"]: return 1/1_000/60
         elif med_dose_unit == "mcg/kg/min": return 1.0
     elif med_category == "vasopressin":
         if med_dose_unit == "units/min": return 1.0
         elif med_dose_unit in ["units/hr", "units/hour"]: return 1/60
         elif med_dose_unit == "milliunits/min": return 1/1_000
         elif med_dose_unit == "milli-units/min": return 1/1_000
-        elif med_dose_unit == "milliunits/hr": return 1/1_000/60
-        elif med_dose_unit == "milli-units/hr": return 1/1_000/60
-        elif med_dose_unit == "milliunits/kg/hr": return w_needed(1/1_000/60/weight_kg)
-        elif med_dose_unit == "milli-units/kg/hr": return w_needed(1/1_000/60/weight_kg)
+        elif med_dose_unit in ["milliunits/hr", "milliunits/hour"]: return 1/1_000/60
+        elif med_dose_unit in ["milli-units/hr", "milli-units/hour"]: return 1/1_000/60
+        elif med_dose_unit in ["milliunits/kg/hr", "milliunits/kg/hour"]: return w_needed(1/1_000/60/weight_kg)
+        elif med_dose_unit in ["milli-units/kg/hr", "milli-units/kg/hour"]: return w_needed(1/1_000/60/weight_kg)
         elif med_dose_unit == "milliunits/kg/min": return w_needed(1/1_000/weight_kg)
         elif med_dose_unit == "milli-units/kg/min": return w_needed(1/1_000/weight_kg)
     return None                               # unit not recognised
