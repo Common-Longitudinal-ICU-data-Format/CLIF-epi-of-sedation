@@ -472,11 +472,15 @@ def compute_sofa(ids_w_dttm:pd.DataFrame,
     #######################################################################
     # 8. SOFA score calculation
     #######################################################################
-    merged_df['p_f'] = np.where((merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['po2_arterial_recent'].notna()),
-                          merged_df['po2_arterial_recent'] / merged_df['fio2_recent'], np.nan)
+    merged_df['p_f'] = np.where(
+        (merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['po2_arterial_recent'].notna()),
+        merged_df['po2_arterial_recent'] / merged_df['fio2_recent'], 
+        np.nan)
 
-    merged_df['p_f_imputed'] = np.where((merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['pao2_imputed_recent'].notna()),
-                                    merged_df['pao2_imputed_recent'] / merged_df['fio2_recent'], np.nan)
+    merged_df['p_f_imputed'] = np.where(
+        (merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['pao2_imputed_recent'].notna()),
+        merged_df['pao2_imputed_recent'] / merged_df['fio2_recent'], 
+        np.nan)
 
     merged_df['s_f'] = np.where((merged_df['fio2_recent'].notna()) & (merged_df['fio2_recent'] != 0) & (merged_df['spo2_recent'].notna()),
                             merged_df['spo2_recent'] / merged_df['fio2_recent'], np.nan)
