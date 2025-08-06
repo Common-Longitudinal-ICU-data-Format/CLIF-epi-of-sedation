@@ -112,38 +112,3 @@ If you prefer to run the analysis manually, follow these steps:
    Run the following files from the code directory:
    1. Run the [01_cohort_id.ipynb](code/01_cohort_id.ipynb) notebook to identify the study cohort and calculate sedative doses
    2. Upload results from [output/final](output/final/) to the project shared folder
-
-## Analysis Components
-
-### Time Window Analysis
-- Analyzes data at hour 24 and hour 72 of mechanical ventilation
-- Specifically examines the one-hour window after the 24th/72nd hour of MV
-- Patients who expired or were extubated before hour 72 are excluded from 72-hour analysis
-
-### Sedative Dose Calculations
-- Converts all medication doses to standardized units:
-  - Fentanyl equivalents (mcg/kg/min) - includes fentanyl and hydromorphone
-  - Midazolam equivalents (mg/hr) - includes midazolam and lorazepam
-  - Propofol (mg/hr)
-  - Dexmedetomidine (mcg/kg/hr)
-- Calculates hourly and cumulative doses over analysis windows
-- Handles unit conversions and weight-based dosing
-
-### Day/Night Shift Analysis
-- Explores diurnal variation in sedation practices
-- Compares sedation doses between day and night shifts
-- Investigates whether higher doses are used at night to manage patients
-
-### SOFA Score Calculation
-- Computes Sequential Organ Failure Assessment (SOFA) scores using most recent values within time windows
-- Includes cardiovascular, coagulation, liver, respiratory, CNS, and renal components
-- Used to assess illness severity and adjust for patient acuity in analyses
-- Total SOFA score ranges from 0-24
-
-### Statistical Analysis
-- Descriptive statistics (Table 1) stratified by demographics, time windows, and shifts
-- Regression analyses examining:
-  - Associations between sedative doses and patient characteristics
-  - Differences in sedation practices between day and night shifts
-  - Relationships with respiratory failure severity (P/F ratio)
-  - Associations with shock severity (vasopressor doses)
