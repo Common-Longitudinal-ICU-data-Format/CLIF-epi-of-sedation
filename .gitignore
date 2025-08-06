@@ -1,3 +1,5 @@
+/docs
+
 # R specific gitignores
 .Rprofile
 .Rhistory
