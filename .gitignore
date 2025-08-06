@@ -1,4 +1,5 @@
 /docs
+.sedation/
 
 # R specific gitignores
 .Rprofile
