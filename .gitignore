@@ -289,9 +289,11 @@ data/
 *.xlsx
 *.xls
 *.parquet
-*.json
+# *.json
 !config/config.json
 # !mcide/*.csv
+config/mimic_config.json
+config/ucmc_config.json
 
 # Output directories
 output/
