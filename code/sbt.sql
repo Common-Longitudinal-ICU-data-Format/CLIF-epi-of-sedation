@@ -11,12 +11,15 @@ WITH sbt_state AS (
         , peep_set
         , pressure_support_set
         , tracheostomy
-        , _prev_mode: LAG(mode_category, 1, 'none') OVER w
+        --, _prev_mode: LAG(mode_category, 1, 'none') OVER w
         , hospitalization_id, recorded_dttm
         , _sbt_state: CASE
             WHEN (mode_category IN ('pressure support/cpap') AND peep_set <= 8 AND pressure_support_set <= 8)
                 OR regexp_matches(device_name, 't[\s_-]?piece') 
-                THEN TRUE ELSE FALSE END
+                THEN 1 ELSE 0 END
+        , extub: CASE
+            WHEN LAG(device_category) OVER w = 'imv'
+                AND device_category != 'imv' THEN 1 ELSE 0 END
     WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
 ),
 
@@ -27,7 +30,7 @@ sbt_block_changes AS (
         -- A new block starts when '_sbt_state' flips from FALSE to TRUE or TRUE to FALSE
         , _chg: CASE
             WHEN _sbt_state IS DISTINCT FROM LAG(_sbt_state) OVER w
-            THEN TRUE ELSE FALSE END
+            THEN 1 ELSE 0 END
     WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
 ),
 
@@ -79,11 +82,12 @@ final_joined AS (
         , s.device_category, s.device_name, s.mode_category, s.mode_name
         , s.hospitalization_id, s.recorded_dttm
         -- Final SBT flag: TRUE if the block duration is >= 30 mins 
-        , _sbt_done: CASE
-            WHEN _block_duration_mins >= 30 AND s._sbt_state
-            THEN TRUE ELSE FALSE END
+        , sbt_done: CASE
+            WHEN _block_duration_mins >= 30 AND s._sbt_state = 1
+            THEN 1 ELSE 0 END
+        , extub
 )
 
 FROM final_joined
-WHERE hospitalization_id IN ('20001361', '20004088', '20005024', '20006409')
+--WHERE hospitalization_id IN ('20001361', '20004088', '20005024', '20006409')
 ORDER BY hospitalization_id, recorded_dttm;
