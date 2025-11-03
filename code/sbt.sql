@@ -108,8 +108,8 @@ WITH t1 AS (
         AND t3._block_id = b._block_id
         -- AND t3._sbt_state
     ASOF LEFT JOIN cs_df as c
-        ON t3._extub_1st = 1 -- find the code status most recent to the extubation (of which only the first one is relevant) 
-        AND c.hospitalization_id = t3.hospitalization_id
+        ON -- t3._extub_1st = 1 AND -- find the code status most recent to the extubation (of which only the first one is relevant) 
+        c.hospitalization_id = t3.hospitalization_id
         AND c.start_dttm <= t3.recorded_dttm
     ASOF LEFT JOIN hosp_df as h -- find the discharge category
         ON -- t3._extub_1st = 1 AND 
@@ -121,7 +121,7 @@ WITH t1 AS (
         , t3.tracheostomy
         , _block_duration_mins: COALESCE(b._duration_mins, 0)
         , t3.device_category, t3.device_name, t3.mode_category, t3.mode_name
-        , t3.hospitalization_id, t3.recorded_dttm
+        , t3.hospitalization_id, event_dttm: t3.recorded_dttm
         -- Final SBT flag: TRUE if the block duration is >= 30 mins 
         , sbt_done: CASE
             WHEN _block_duration_mins >= 30 AND t3._sbt_state = 1
@@ -150,13 +150,14 @@ WITH t1 AS (
             AND _last_vitals_within_24h_of_extub = 1
             AND _fail_extub = 0
             AND TRIM(LOWER(discharge_category)) in ('hospice', 'expired')
+            -- AND _withdrawl_lst = 0
             THEN 1 ELSE 0 END
 )
 
 FROM t4
--- WHERE (tracheostomy = 0 OR _trach_1st = 1)
-    --AND hospitalization_id IN ('20001361', '20004088', '20005024', '20006409', '21341369', '20134240')
-ORDER BY hospitalization_id, recorded_dttm;
+WHERE (tracheostomy = 0 OR _trach_1st = 1)
+    AND hospitalization_id IN ('20001361', '20004088', '20005024', '20006409', '21341369', '20134240', '20008807', '20014600')
+ORDER BY hospitalization_id, event_dttm;
 
 
 
