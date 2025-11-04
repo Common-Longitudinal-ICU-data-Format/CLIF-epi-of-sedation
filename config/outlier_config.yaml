@@ -1,0 +1,256 @@
+# Outlier Configuration for Numeric Column Range Validation
+# This configuration file defines acceptable ranges for numeric columns across all tables
+# Values outside these ranges will be converted to NaN by the outlier detection function
+
+# Configuration structure:
+# - Simple numeric columns: direct min/max ranges
+# - Category-dependent columns: ranges organized by category value
+
+tables:
+  # Hospitalization table
+  hospitalization:
+    age_at_admission:
+      min: 0
+      max: 120
+
+  # Labs table - numeric values depend on lab category
+  labs:
+    lab_value_numeric:
+      po2_arterial:
+        min: 0.0
+        max: 700.0
+      ph_arterial:
+        min: 6.0
+        max: 10.0
+      ph_venous:
+        min: 5.0
+        max: 10.0
+
+  # Medication administration continuous table - dose depends on medication category and unit
+  medication_admin_continuous:
+    med_dose:
+      # Vasoactive medications
+      norepinephrine:
+        "mcg/kg/min":
+          min: 0.0
+          max: 3.0
+        "mcg/min":
+          min: 0.0
+          max: 200.0
+        "mg/hr":
+          min: 0.0
+          max: 10.0
+      epinephrine:
+        "mcg/kg/min":
+          min: 0.0
+          max: 2.0
+        "mcg/min":
+          min: 0.0
+          max: 100.0
+        "mg/hr":
+          min: 0.0
+          max: 5.0
+      phenylephrine:
+        "mcg/kg/min":
+          min: 0.0
+          max: 10.0
+        "mcg/min":
+          min: 0.0
+          max: 500.0
+        "mg/hr":
+          min: 0.0
+          max: 20.0
+      vasopressin:
+        "units/min":
+          min: 0.0
+          max: 0.1
+        "units/hr":
+          min: 0.0
+          max: 6.0
+      dopamine:
+        "mcg/kg/min":
+          min: 0.0
+          max: 50.0
+        "mg/hr":
+          min: 0.0
+          max: 100.0
+      dobutamine:
+        "mcg/kg/min":
+          min: 0.0
+          max: 20.0
+        "mg/hr":
+          min: 0.0
+          max: 50.0
+      milrinone:
+        "mcg/kg/min":
+          min: 0.0
+          max: 1.0
+        "mg/hr":
+          min: 0.0
+          max: 2.0
+      
+      # Sedation medications
+      propofol:
+        "mcg/kg/min":
+          min: 0.0
+          max: 200.0
+        "mg/hr":
+          min: 0.0
+          max: 400.0
+        "mg/kg/hr":
+          min: 0.0
+          max: 10.0
+      midazolam:
+        "mcg/kg/min":
+          min: 0.0
+          max: 10.0
+        "mg/hr":
+          min: 0.0
+          max: 20.0
+      fentanyl:
+        "mcg/kg/hr":
+          min: 0.0
+          max: 10.0
+        "mcg/hr":
+          min: 0.0
+          max: 500.0
+        "mg/hr":
+          min: 0.0
+          max: 1.0
+      lorazepam:
+        "mg/hr":
+          min: 0.0
+          max: 10.0
+        "mcg/kg/min":
+          min: 0.0
+          max: 5.0
+      
+      # Paralytic medications
+      cisatracurium:
+        "mcg/kg/min":
+          min: 0.0
+          max: 10.0
+        "mg/hr":
+          min: 0.0
+          max: 20.0
+      vecuronium:
+        "mcg/kg/min":
+          min: 0.0
+          max: 5.0
+        "mg/hr":
+          min: 0.0
+          max: 10.0
+      rocuronium:
+        "mcg/kg/min":
+          min: 0.0
+          max: 20.0
+        "mg/hr":
+          min: 0.0
+          max: 50.0
+  medication_admin_intermittent:
+    med_dose:
+      propofol:
+        "mg":
+          min: 0.0
+          max: 400.0     # Typical bolus 10–200 mg; 400 mg upper bound for induction/extreme cases
+      midazolam:
+        "mg":
+          min: 0.0
+          max: 20.0      # Typical bolus 1–5 mg; 20 mg upper bound for tolerance or cumulative error
+      fentanyl:
+        "mcg":
+          min: 0.0
+          max: 500.0     # Typical bolus 25–200 mcg; 500 mcg upper bound for highly tolerant patients
+      hydromorphone:
+        "mg":
+          min: 0.0
+          max: 4.0       # Typical bolus 0.2–2 mg; 4 mg upper bound for opioid-tolerant ICU patients
+      lorazepam:
+        "mg":
+          min: 0.0
+          max: 10.0      # Typical bolus 1–4 mg; 10 mg upper bound for severe agitation or error tolerance
+
+  # Respiratory support table - multiple numeric columns
+  respiratory_support:
+    fio2_set:
+      min: 0.21
+      max: 1.0
+    lpm_set:
+      min: 0.0
+      max: 60.0
+    tidal_volume_set:
+      min: 100.0
+      max: 3000.0
+    resp_rate_set:
+      min: 0
+      max: 200
+    pressure_control_set:
+      min: -50.0
+      max: 50.0
+    pressure_support_set:
+      min: -50.0
+      max: 50.0
+    flow_rate_set:
+      min: -50.0
+      max: 100.0
+    peak_inspiratory_pressure_set:
+      min: -50.0
+      max: 100.0
+    inspiratory_time_set:
+      min: -1.0
+      max: 50.0
+    peep_set:
+      min: 0.0
+      max: 30.0
+    tidal_volume_obs:
+      min: 100.0
+      max: 3000.0
+    resp_rate_obs:
+      min: 0
+      max: 200
+    plateau_pressure_obs:
+      min: 0.0
+      max: 100.0
+    peak_inspiratory_pressure_obs:
+      min: -50.0
+      max: 100.0
+    peep_obs:
+      min: 0.0
+      max: 50.0
+    minute_vent_obs:
+      min: 0.0
+      max: 40.0
+    mean_airway_pressure_obs:
+      min: 0.0
+      max: 50.0
+
+  # Vitals table - values depend on vital category
+  vitals:
+    vital_value:
+      temp_c:
+        min: 32
+        max: 44
+      heart_rate:
+        min: 0
+        max: 300
+      sbp:
+        min: 0
+        max: 300
+      dbp:
+        min: 0
+        max: 200
+      spo2:
+        min: 50
+        max: 100
+      respiratory_rate:
+        min: 0
+        max: 60
+      map:
+        min: 0
+        max: 250
+      height_cm:
+        min: 76
+        max: 255
+      weight_kg:
+        min: 30
+        max: 1100
