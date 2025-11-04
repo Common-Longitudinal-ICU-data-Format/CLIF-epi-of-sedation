@@ -54,7 +54,9 @@ The analysis produces the following outputs in the [`output/final`](output/READM
   - GEE (Generalized Estimating Equations) examining associations between day-night sedation dose differences and next-day SBT completion, controlling for baseline sedation, pH levels, P/F ratios, vasopressor support, and age
   - Logistic regression examining associations between day-night sedation dose differences and next-day successful extubation (defined as extubation without reintubation within 24 hours and without withdrawal of life-sustaining treatment)
 
-## Configuration
+## Run the project
+
+### Configuration
 
 1. Navigate to the `config/` directory
 
@@ -67,49 +69,76 @@ The analysis produces the following outputs in the [`output/final`](output/READM
 
 4. The analysis uses `config/outlier_config.yaml` for outlier detection and handling on vitals, labs, respiratory support parameters, and medications. This configuration file is provided and should work across sites, but can be customized if needed.
 
-## Environment setup and project execution
 
-The environment setup code is provided in the `run_project.sh` file for macOS/Linux and `run_project.bat` for Windows.
+### Option 1: Using uv (Recommended)
 
-**For macOS/Linux:**
+[uv](https://docs.astral.sh/uv/) is a fast Python package manager that simplifies dependency management.
 
-1. Make the script executable: 
-```bash
-chmod +x run_project.sh
-```
+1. Install uv (if not already installed):
 
-2. Run the script:
-```bash
-./run_project.sh
-```
+   ```bash
+   # macOS/Linux
+   curl -LsSf https://astral.sh/uv/install.sh | sh
 
-3. Restart your IDE to load the new virtual environment and select the `Python (sedation)` kernel in the Jupyter notebook.
+   # Windows (PowerShell)
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
 
-**For Windows:**
+2. Sync dependencies and set up the environment:
 
-1. Run the script in the command prompt:
-```bat
-run_project.bat
-```
+   ```bash
+   uv sync
+   ```
 
-## Manual Setup and Execution
+3. Activate the virtual environment:
 
-If you prefer to run the analysis manually, follow these steps:
+   ```bash
+   # macOS/Linux
+   source .venv/bin/activate
 
-1. **Setup Python Environment**
-   - Create a virtual environment: `python3 -m venv .sedation`
-   - Activate the environment:
-     - Windows: `.sedation\Scripts\activate`
-     - macOS/Linux: `source .sedation/bin/activate`
-   - Install dependencies: 
-     ```bash
-     pip install -r requirements.txt
-     pip install jupyter ipykernel
-     ```
-   - Register kernel: `python -m ipykernel install --user --name=.sedation --display-name="Python (sedation)"`
-   - Restart your IDE to load the new virtual environment and select the `Python (sedation)` kernel in the Jupyter notebook.
+   # Windows
+   .venv\Scripts\activate
+   ```
 
-2. **Run Analysis**
-   Run the following files from the code directory:
-   1. Run the [sedation_sbt.ipynb](code/sedation_sbt.ipynb) notebook to identify the study cohort, characterize sedation patterns, and analyze Spontaneous Breathing Trial (SBT) outcomes.
-   2. Upload results from [output/final](output/final/) to the project shared folder
+4. Open your IDE, select the `.venv` Python interpreter, and open `code/sedation_sbt.ipynb` to run the analysis interactively.
+
+5. Upload results from [output/final](output/final/) to the project shared folder
+
+### Option 2: Using traditional Python virtual environment
+
+1. Create a virtual environment:
+
+   ```bash
+   # macOS/Linux
+   python3 -m venv .venv
+
+   # Windows
+   python -m venv .venv
+   ```
+
+2. Activate the environment:
+
+   ```bash
+   # macOS/Linux
+   source .venv/bin/activate
+
+   # Windows
+   .venv\Scripts\activate
+   ```
+
+3. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   pip install jupyter ipykernel
+   ```
+
+4. Register Jupyter kernel:
+
+   ```bash
+   python -m ipykernel install --user --name=.venv --display-name="Python (sedation)"
+   ```
+
+5. Open your IDE, select the `.venv` Python interpreter, and open `code/sedation_sbt.ipynb` to run the analysis interactively.
+
+6. Upload results from [output/final](output/final/) to the project shared folder
