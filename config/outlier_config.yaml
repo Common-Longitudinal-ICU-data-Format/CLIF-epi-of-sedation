@@ -61,7 +61,7 @@ tables:
           min: 0.0
           max: 20.0
       vasopressin:
-        "units/min":
+        "u/min":
           min: 0.0
           max: 0.1
         "units/hr":
@@ -97,6 +97,9 @@ tables:
         "mg/hr":
           min: 0.0
           max: 400.0
+        "mg/min":
+          min: 0.0
+          max: 50
         "mg/kg/hr":
           min: 0.0
           max: 10.0
@@ -107,6 +110,9 @@ tables:
         "mg/hr":
           min: 0.0
           max: 20.0
+        "mg/min":
+          min: 0.0
+          max: 1.5
       fentanyl:
         "mcg/kg/hr":
           min: 0.0
@@ -117,6 +123,9 @@ tables:
         "mg/hr":
           min: 0.0
           max: 1.0
+        "mcg/min":
+          min: 0.0
+          max: 8.5
       lorazepam:
         "mg/hr":
           min: 0.0
@@ -124,6 +133,9 @@ tables:
         "mcg/kg/min":
           min: 0.0
           max: 5.0
+        "mcg/min":
+          min: 0.0
+          max: 0.2
       
       # Paralytic medications
       cisatracurium:
@@ -164,7 +176,7 @@ tables:
       hydromorphone:
         "mg":
           min: 0.0
-          max: 4.0       # Typical bolus 0.2–2 mg; 4 mg upper bound for opioid-tolerant ICU patients
+          max: 40.0       # Typical bolus 0.2–2 mg; 4 mg upper bound for opioid-tolerant ICU patients
       lorazepam:
         "mg":
           min: 0.0
