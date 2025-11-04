@@ -156,7 +156,7 @@ WITH t1 AS (
 
 FROM t4
 WHERE (tracheostomy = 0 OR _trach_1st = 1)
-    AND hospitalization_id IN ('20001361', '20004088', '20005024', '20006409', '21341369', '20134240', '20008807', '20014600')
+    -- AND hospitalization_id IN ('20001361', '20004088', '20005024', '20006409', '21341369', '20134240', '20008807', '20014600')
 ORDER BY hospitalization_id, event_dttm;
 
 
