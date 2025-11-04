@@ -2,69 +2,70 @@
 
 ## CLIF VERSION 
 
-2.0.0
+2.1.0
 
 ## Objective
 
-The primary objective of this project is to describe the epidemiology of sedation in mechanically ventilated ICU patients across the CLIF consortium. This analysis examines sedative medication usage patterns and investigates whether there is diurnal variation in sedation practices, specifically exploring if higher sedation doses are administered during night shifts compared to day shifts for patients with similar clinical characteristics. The study analyzes sedative doses over 24 and 72-hour windows from initial intubation and explores associations with patient demographics, illness severity (SOFA scores), and time of day.
+This project investigates diurnal variation in sedation practices by comparing sedative doses administered during day shifts (7am-7pm) versus night shifts (7pm-7am). The study aggregates sedation exposure by day and shift throughout each patient's mechanical ventilation course and explores associations between day-night sedation differences and subsequent Spontaneous Breathing Trial (SBT) completion and successful extubation, while controlling for respiratory function (pH, P/F ratio), vasopressor support, and patient age.
 
 ## Required CLIF tables and fields
 
 Please refer to the online [CLIF data dictionary](https://clif-consortium.github.io/website/data-dictionary.html), [ETL tools](https://github.com/clif-consortium/CLIF/tree/main/etl-to-clif-resources), and [specific table contacts](https://github.com/clif-consortium/CLIF?tab=readme-ov-file#relational-clif) for more information on constructing the required tables and fields.
 
 The following tables are required:
-1. **patient**: `patient_id`, `race_category`, `ethnicity_category`, `sex_category`, `death_dttm`
-2. **hospitalization**: `patient_id`, `hospitalization_id`, `admission_dttm`, `discharge_dttm`, `age_at_admission`
-3. **adt**: `hospitalization_id`, `in_dttm`, `out_dttm`, `location_category` 
-   - Used to identify ICU stays and create unique ICU stay identifiers
+
+1. **patient**: `patient_id`
+
+2. **hospitalization**: `patient_id`, `hospitalization_id`, `discharge_dttm`, `discharge_category`, `age_at_admission`
+
+3. **adt**: `hospitalization_id`, `in_dttm`, `out_dttm`, `location_category`
+
 4. **vitals**: `hospitalization_id`, `recorded_dttm`, `vital_category`, `vital_value`
-   - `vital_category` = 'heart_rate', 'resp_rate', 'sbp', 'dbp', 'map', 'spo2', 'weight_kg', 'height_cm'
-5. **labs**: `hospitalization_id`, `lab_collect_dttm`, `lab_category`, `lab_value_numeric`
-   - `lab_category` = 'creatinine', 'platelet_count', 'po2_arterial', 'bilirubin_total'
-6. **medication_admin_continuous**: `hospitalization_id`, `admin_dttm`, `med_category`, `med_dose`, `med_dose_unit`
-   - Sedatives: "propofol", "midazolam", "fentanyl", "dexmedetomidine", "lorazepam", "hydromorphone", "ketamine"
-   - Vasopressors: "norepinephrine", "epinephrine", "phenylephrine", "vasopressin", "dopamine", "angiotensin", "dobutamine", "milrinone"
-7. **respiratory_support**: `hospitalization_id`, `recorded_dttm`, `device_category`, `mode_category`, `fio2_set`, `peep_set`, `lpm_set`, `tracheostomy`, `resp_rate_set`, `tidal_volume_set`, `resp_rate_obs`
-   - Used to identify mechanical ventilation periods and calculate P/F ratios
-8. **patient_assessments**: `hospitalization_id`, `recorded_dttm`, `assessment_category`, `numerical_value`
-   - `assessment_category` = 'gcs_total', 'rass', 'RASS'
-9. **crrt_therapy**: `hospitalization_id`, `recorded_dttm` (optional table for SOFA renal scoring)
+   - `vital_category` = 'weight_kg' (used for weight-based dose conversions)
 
-## Cohort identification
+5. **labs**: `hospitalization_id`, `lab_order_dttm`, `lab_result_dttm`, `lab_category`, `lab_value_numeric`
+   - `lab_category` = 'ph_arterial', 'ph_venous', 'po2_arterial' (for P/F ratio calculation)
 
-The cohort consists of adult patients admitted to an ICU with continuous mechanical ventilation for 24 hours or more via endotracheal tube.
+6. **medication_admin_continuous**: `hospitalization_id`, `admin_dttm`, `med_name`, `med_category`, `med_dose`, `med_dose_unit`, `mar_action_name`, `mar_action_category`
+   - Sedatives: `med_category` = "propofol", "midazolam", "fentanyl", "lorazepam", "hydromorphone"
+   - Vasopressors: `med_category` = "norepinephrine", "epinephrine", "phenylephrine", "dopamine", "vasopressin", "angiotensin"
 
-Inclusion criteria:
-- On continuous invasive mechanical ventilation (device_category = 'IMV') via endotracheal tube for ≥24 hours
-- Age ≥ 18 years at admission
-- Admitted to an ICU (identified through ADT location_category = 'icu')
+7. **medication_admin_intermittent**: `hospitalization_id`, `admin_dttm`, `med_name`, `med_category`, `med_dose`, `med_dose_unit`, `mar_action_name`, `mar_action_category`
+   - Sedatives: "propofol", "midazolam", "fentanyl", "lorazepam", "hydromorphone"
 
-Exclusion criteria:
-- Patients with tracheostomy (using tracheostomy column in respiratory_support table)
-- Re-intubations within 72 hours of first intubation
+8. **respiratory_support**: `hospitalization_id`, `recorded_dttm`, `device_name`, `device_category`, `mode_name`, `mode_category`, `fio2_set`, `peep_set`, `pressure_support_set`, `tracheostomy`, `resp_rate_set`, `tidal_volume_set`, `peak_inspiratory_pressure_set`
+   - Used to identify mechanical ventilation periods, calculate P/F ratios, and identify SBT events
+
+9. **code_status**: `patient_id`, `start_dttm`, `code_status_category`
+   - Used to identify withdrawal of life-sustaining treatment
+
 
 ## Expected Results
 
 The analysis produces the following outputs in the [`output/final`](output/README.md) directory:
-- Table 1 descriptive statistics stratified by:
-  - Demographics (age, sex, race, ethnicity)  
-  - Time windows (hour 24 and hour 72 of mechanical ventilation)
-  - Shift times (day shift vs night shift) to explore diurnal variation
-- Enumeration of medication dosing units to ensure coverage
-- Regression analyses examining:
-  - Associations between sedative doses and patient characteristics
-  - Day vs night shift differences in sedation dosing
-  - Relationships with illness severity (SOFA scores)
-- SOFA score calculations using most recent values within specified time windows
+
+- **Table 1 (Day 1 Overall)**: Descriptive statistics for the first day of mechanical ventilation, including sedation doses, pH levels, P/F ratios, vasopressor support (norepinephrine equivalents), and SBT outcomes
+
+- **Table 1 (Day 1 by Shift)**: Descriptive statistics stratified by day shift (7am-7pm) versus night shift (7pm-7am), with statistical tests comparing sedation dosing patterns between shifts
+
+- **Sedation by Hour of Day Visualization**: Three-panel bar chart showing mean hourly doses of propofol, fentanyl equivalents, and midazolam equivalents across the 24-hour cycle
+
+- **Regression Analyses**:
+  - GEE (Generalized Estimating Equations) examining associations between day-night sedation dose differences and next-day SBT completion, controlling for baseline sedation, pH levels, P/F ratios, vasopressor support, and age
+  - Logistic regression examining associations between day-night sedation dose differences and next-day successful extubation (defined as extubation without reintubation within 24 hours and without withdrawal of life-sustaining treatment)
 
 ## Configuration
 
 1. Navigate to the `config/` directory
+
 2. Rename `config_template.json` to `config.json`
+
 3. Update the `config.json` with site-specific settings including:
    - Site name
    - Data table paths
    - Timezone information
+
+4. The analysis uses `config/outlier_config.yaml` for outlier detection and handling on vitals, labs, respiratory support parameters, and medications. This configuration file is provided and should work across sites, but can be customized if needed.
 
 ## Environment setup and project execution
 
@@ -110,5 +111,5 @@ If you prefer to run the analysis manually, follow these steps:
 
 2. **Run Analysis**
    Run the following files from the code directory:
-   1. Run the [01_cohort_id.ipynb](code/01_cohort_id.ipynb) notebook to identify the study cohort and calculate sedative doses
+   1. Run the [sedation_sbt.ipynb](code/sedation_sbt.ipynb) notebook to identify the study cohort, characterize sedation patterns, and analyze Spontaneous Breathing Trial (SBT) outcomes.
    2. Upload results from [output/final](output/final/) to the project shared folder
