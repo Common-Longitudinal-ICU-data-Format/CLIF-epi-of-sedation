@@ -69,7 +69,6 @@ The analysis produces the following outputs in the [`output/final`](output/READM
 
 4. The analysis uses `config/outlier_config.yaml` for outlier detection and handling on vitals, labs, respiratory support parameters, and medications. This configuration file is provided and should work across sites, but can be customized if needed.
 
-
 ### Option 1: Using uv (Recommended)
 
 [uv](https://docs.astral.sh/uv/) is a fast Python package manager that simplifies dependency management.
@@ -96,15 +95,23 @@ The analysis produces the following outputs in the [`output/final`](output/READM
    # macOS/Linux
    source .venv/bin/activate
 
-   # Windows
-   .venv\Scripts\activate
+   # Windows (Command Prompt)
+   .venv\Scripts\activate.bat
+
+   # Windows (PowerShell)
+   .venv\Scripts\Activate.ps1
+   ```
+
+   **Note for Windows PowerShell users**: If you get an execution policy error, run:
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
 
 4. Open your IDE, select the `.venv` Python interpreter, and open `code/sedation_sbt.ipynb` to run the analysis interactively.
 
 5. Upload results from [output/final](output/final/) to the project shared folder
 
-### Option 2: Using traditional Python virtual environment
+### Option 2: Using traditional Python virtual environment (Manual setup)
 
 1. Create a virtual environment:
 
@@ -122,8 +129,16 @@ The analysis produces the following outputs in the [`output/final`](output/READM
    # macOS/Linux
    source .venv/bin/activate
 
-   # Windows
-   .venv\Scripts\activate
+   # Windows (Command Prompt)
+   .venv\Scripts\activate.bat
+
+   # Windows (PowerShell)
+   .venv\Scripts\Activate.ps1
+   ```
+
+   **Note for Windows PowerShell users**: If you get an execution policy error, run:
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
 
 3. Install dependencies:
@@ -142,3 +157,29 @@ The analysis produces the following outputs in the [`output/final`](output/READM
 5. Open your IDE, select the `.venv` Python interpreter, and open `code/sedation_sbt.ipynb` to run the analysis interactively.
 
 6. Upload results from [output/final](output/final/) to the project shared folder
+
+### Option 3: Using automated setup scripts (not robustly tested)
+
+The easiest way to set up the project is using the provided setup scripts that handle all environment configuration automatically.
+
+**For macOS/Linux:**
+```bash
+./run_project.sh
+```
+
+**For Windows (Command Prompt or PowerShell):**
+```cmd
+run_project.bat
+```
+
+The scripts will:
+
+- Create a `.venv` virtual environment
+
+- Install all required dependencies
+
+- Register the Jupyter kernel
+
+- Validate your configuration
+
+After the script completes, open your IDE (VS Code, PyCharm, etc.), select the `.venv` Python interpreter, and open `code/sedation_sbt.ipynb` to run the analysis interactively.

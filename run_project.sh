@@ -94,23 +94,23 @@ export MPLBACKEND=Agg
 show_banner
 
 # Step 1: Create virtual environment
-show_progress 1 6 "Create Virtual Environment"
-if [ ! -d ".sedation" ]; then
-    log_echo "Creating virtual environment (.sedation)..."
-    python3 -m venv .sedation 2>&1 | tee -a "$LOG_FILE" || handle_error "Create Virtual Environment"
+show_progress 1 5 "Create Virtual Environment"
+if [ ! -d ".venv" ]; then
+    log_echo "Creating virtual environment (.venv)..."
+    python3 -m venv .venv 2>&1 | tee -a "$LOG_FILE" || handle_error "Create Virtual Environment"
 else
     log_echo "Virtual environment already exists."
 fi
 log_echo "${GREEN}✅ Completed: Create Virtual Environment${RESET}"
 
 # Step 2: Activate virtual environment
-show_progress 2 6 "Activate Virtual Environment"
+show_progress 2 5 "Activate Virtual Environment"
 log_echo "Activating virtual environment..."
-source .sedation/bin/activate || handle_error "Activate Virtual Environment"
+source .venv/bin/activate || handle_error "Activate Virtual Environment"
 log_echo "${GREEN}✅ Completed: Activate Virtual Environment${RESET}"
 
 # Step 3: Install dependencies
-show_progress 3 6 "Install Dependencies"
+show_progress 3 5 "Install Dependencies"
 log_echo "Upgrading pip..."
 python -m pip install --upgrade pip 2>&1 | tee -a "$LOG_FILE" || handle_error "Upgrade pip"
 
@@ -120,13 +120,13 @@ pip install jupyter ipykernel 2>&1 | tee -a "$LOG_FILE" || handle_error "Install
 log_echo "${GREEN}✅ Completed: Install Dependencies${RESET}"
 
 # Step 4: Register Jupyter kernel
-show_progress 4 6 "Register Jupyter Kernel"
+show_progress 4 5 "Register Jupyter Kernel"
 log_echo "Registering Jupyter kernel..."
-python -m ipykernel install --user --name=.sedation --display-name="Python (sedation)" 2>&1 | tee -a "$LOG_FILE" || handle_error "Register Jupyter Kernel"
+python -m ipykernel install --user --name=.venv --display-name="Python (sedation)" 2>&1 | tee -a "$LOG_FILE" || handle_error "Register Jupyter Kernel"
 log_echo "${GREEN}✅ Completed: Register Jupyter Kernel${RESET}"
 
-# Step 5: Change to code directory and validate data
-show_progress 5 6 "Setup Working Directory & Validate Data"
+# Step 5: Validate configuration and data
+show_progress 5 5 "Validate Configuration & Data"
 log_echo "Checking current directory structure..."
 
 # Check if data path exists
@@ -154,42 +154,16 @@ else
     log_echo "${YELLOW}Please copy config/config_template.json to config/config.json and update it${RESET}"
 fi
 
-log_echo "${GREEN}✅ Completed: Setup Working Directory${RESET}"
-
-# Step 6: Execute notebook
-show_progress 6 6 "Execute Analysis Notebook"
-
-if [ -d "code" ]; then
-    cd code || handle_error "Change to code directory"
-    
-    log_echo "Executing 01_cohort_id.ipynb..."
-    # Ensure buffer is flushed before executing
-    sync
-    # Convert notebook to script, suppress nbconvert messages, then run with Python
-    log_echo "Converting and executing notebook..."
-    set -o pipefail  # Make pipes fail if any command fails
-    jupyter nbconvert --to script --stdout --log-level ERROR 01_cohort_id.ipynb 2>/dev/null | python -u 2>&1 | tee ../logs/01_cohort_id.log | tee -a "$LOG_FILE"
-    # Check if the pipeline failed
-    if [ $? -ne 0 ]; then
-        handle_error "Execute 01_cohort_id.ipynb"
-        log_echo "${RED}❌ Failed: 01_cohort_id.ipynb${RESET}"
-    else
-        log_echo "${GREEN}✅ Completed: 01_cohort_id.ipynb${RESET}"
-    fi
-    cd ..
-else
-    log_echo "${YELLOW}⚠️  Code directory not found. Please run the notebook manually:${RESET}"
-    log_echo "${BLUE}   cd code && jupyter notebook 01_cohort_id.ipynb${RESET}"
-fi
+log_echo "${GREEN}✅ Completed: Validate Configuration & Data${RESET}"
 
 # Final summary
 separator
-log_echo "${CYAN}${BOLD}📋 EXECUTION SUMMARY${RESET}"
+log_echo "${CYAN}${BOLD}📋 SETUP COMPLETE${RESET}"
 separator
 
 # Display success/failure summary
 if [ ${#FAILED_STEPS[@]} -eq 0 ]; then
-    log_echo "${GREEN}${BOLD}🎉 SUCCESS! All analysis steps completed successfully!${RESET}"
+    log_echo "${GREEN}${BOLD}🎉 SUCCESS! Environment setup completed successfully!${RESET}"
 else
     log_echo "${YELLOW}${BOLD}⚠️  PARTIAL SUCCESS: Some steps failed${RESET}"
     log_echo ""
@@ -198,41 +172,24 @@ else
         log_echo "${RED}  ❌ $step${RESET}"
     done
     log_echo ""
-    log_echo "${YELLOW}Please check the individual log files for error details${RESET}"
+    log_echo "${YELLOW}Please check the log file for error details: ${LOG_FILE}${RESET}"
 fi
 
 log_echo ""
-log_echo "${BLUE}📊 Results saved to: output/final/${RESET}"
-log_echo "${BLUE}📝 Full log saved to: ${LOG_FILE}${RESET}"
-log_echo "${BLUE}📄 Individual logs in: logs/${RESET}"
 separator
-
-# Notebook option
+log_echo "${CYAN}${BOLD}📝 NEXT STEPS${RESET}"
+separator
 log_echo ""
-log_echo "${CYAN}Would you like to open the Jupyter notebook for interactive analysis?${RESET}"
-log_echo "${BLUE}The notebook allows you to review and modify the analysis${RESET}"
+log_echo "${BOLD}To run the analysis:${RESET}"
 log_echo ""
-
-while true; do
-    read -p "Open Jupyter notebook? (y/n): " yn
-    case $yn in
-        [Yy]*)
-            log_echo "${GREEN}🚀 Starting Jupyter notebook...${RESET}"
-            cd code
-            jupyter notebook 01_cohort_id.ipynb
-            break
-            ;;
-        [Nn]*)
-            log_echo "${BLUE}Notebook launch skipped. You can run it later with:${RESET}"
-            log_echo "${BLUE}   cd code && jupyter notebook 01_cohort_id.ipynb${RESET}"
-            break
-            ;;
-        *)
-            log_echo "${RED}Please answer y or n${RESET}"
-            ;;
-    esac
-done
-
+log_echo "  ${CYAN}1.${RESET} Open your IDE (VS Code, PyCharm, etc.)"
+log_echo "  ${CYAN}2.${RESET} Select the ${BOLD}.venv${RESET} Python interpreter"
+log_echo "  ${CYAN}3.${RESET} Open: ${BOLD}code/sedation_sbt.ipynb${RESET}"
+log_echo "  ${CYAN}4.${RESET} Run the notebook interactively"
 log_echo ""
-log_echo "${GREEN}Thank you for running the CLIF Epidemiology of Sedation Project!${RESET}"
+log_echo "${BLUE}📝 Setup log saved to: ${LOG_FILE}${RESET}"
+separator
+log_echo ""
+log_echo "${GREEN}Thank you for using the CLIF Epidemiology of Sedation Project!${RESET}"
+log_echo ""
 read -rp "Press [Enter] to exit..."
