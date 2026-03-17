@@ -16,7 +16,7 @@
 
 import marimo
 
-__generated_with = "0.20.2"
+__generated_with = "0.21.0"
 app = marimo.App()
 
 
@@ -109,13 +109,11 @@ def _(mo):
     return
 
 
-@app.cell
-def _():
-    def read_sql(path: str) -> str:
-        """Read a SQL file and return its contents as a string."""
-        with open(path) as f:
-            return f.read()
-    return (read_sql,)
+@app.function
+def read_sql(path: str) -> str:
+    """Read a SQL file and return its contents as a string."""
+    with open(path) as f:
+        return f.read()
 
 
 @app.cell
@@ -123,7 +121,24 @@ def _(duckdb, pd):
     def add_day_shift_id(df: pd.DataFrame, timestamp_name='event_dttm') -> pd.DataFrame:
         df['_dh'] = df[timestamp_name].dt.floor('h', ambiguous='NaT')
         df['_hr'] = df[timestamp_name].dt.hour
-        _q = "\n    WITH day_starts AS (\n        FROM df\n        SELECT *\n            , _shift: CASE WHEN _hr >= 7 AND _hr < 19 THEN 'day' ELSE 'night' END\n            , _is_day_start: CASE\n                WHEN _hr = 7 AND COALESCE(LAG(_hr) OVER w, -1) != 7 THEN 1\n                ELSE 0 END\n        WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _dh)       \n    )\n    FROM day_starts\n    -- INNER JOIN cohort_hosp_ids_df USING (hospitalization_id)\n    SELECT *\n        , _nth_day: SUM(_is_day_start) OVER w\n        , _day_shift: 'day' || _nth_day::INT::TEXT || '_' || _shift\n    WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _dh)       \n    ORDER BY hospitalization_id, _dh\n    "
+        _q = """
+    WITH day_starts AS (
+        FROM df
+        SELECT *
+            , _shift: CASE WHEN _hr >= 7 AND _hr < 19 THEN 'day' ELSE 'night' END
+            , _is_day_start: CASE
+                WHEN _hr = 7 AND COALESCE(LAG(_hr) OVER w, -1) != 7 THEN 1
+                ELSE 0 END
+        WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _dh)       
+    )
+    FROM day_starts
+    -- INNER JOIN cohort_hosp_ids_df USING (hospitalization_id)
+    SELECT *
+        , _nth_day: SUM(_is_day_start) OVER w
+        , _day_shift: 'day' || _nth_day::INT::TEXT || '_' || _shift
+    WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _dh)       
+    ORDER BY hospitalization_id, _dh
+    """
         return duckdb.sql(_q).df()
 
     return (add_day_shift_id,)
@@ -134,9 +149,46 @@ def _(duckdb, pd):
     def remove_meds_duplicates(meds_df: pd.DataFrame) -> pd.DataFrame:
         if 'mar_action_category' not in meds_df.columns:
             print('mar_action_category not available, deduping by mar_action_name instead')
-            _q = f"\n        SELECT *\n        FROM meds_df\n        QUALIFY ROW_NUMBER() OVER (\n            PARTITION BY hospitalization_id, admin_dttm, med_category\n            ORDER BY \n                -- apply mar action dedup logic\n                CASE WHEN mar_action_name IS NULL THEN 10\n                    WHEN regexp_matches(mar_action_name, 'verify', 'i') THEN 9\n                    WHEN regexp_matches(mar_action_name, '(stopped)|(held)|(paused)|(completed)', 'i') THEN 8\n                    ELSE 1 END,\n                -- if tied at the same mar action, deprioritize zero or null doses\n                CASE WHEN med_dose > 0 THEN 1\n                    ELSE 2 END,\n                -- prioritize larger doses\n                med_dose DESC \n        ) = 1\n        ORDER BY hospitalization_id, med_category, admin_dttm;\n        "
+            _q = f"""
+        SELECT *
+        FROM meds_df
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY hospitalization_id, admin_dttm, med_category
+            ORDER BY 
+                -- apply mar action dedup logic
+                CASE WHEN mar_action_name IS NULL THEN 10
+                    WHEN regexp_matches(mar_action_name, 'verify', 'i') THEN 9
+                    WHEN regexp_matches(mar_action_name, '(stopped)|(held)|(paused)|(completed)', 'i') THEN 8
+                    ELSE 1 END,
+                -- if tied at the same mar action, deprioritize zero or null doses
+                CASE WHEN med_dose > 0 THEN 1
+                    ELSE 2 END,
+                -- prioritize larger doses
+                med_dose DESC 
+        ) = 1
+        ORDER BY hospitalization_id, med_category, admin_dttm;
+        """
         else:
-            _q = f"\n        SELECT *\n        FROM meds_df\n        QUALIFY ROW_NUMBER() OVER (\n            PARTITION BY hospitalization_id, admin_dttm, med_category\n            ORDER BY \n                -- apply mar action dedup logic\n                CASE WHEN mar_action_category IS NULL THEN 10\n                    WHEN mar_action_category in ('verify', 'not_given') THEN 9\n                    WHEN mar_action_category = 'stop' THEN 8\n                    WHEN mar_action_category = 'going' THEN 7\n                    ELSE 1 END,\n                -- if tied at the same mar action, deprioritize zero or null doses\n                CASE WHEN med_dose > 0 THEN 1\n                    ELSE 2 END,\n                -- prioritize larger doses\n                med_dose DESC \n        ) = 1\n        ORDER BY hospitalization_id, med_category, admin_dttm;\n        "
+            _q = f"""
+        SELECT *
+        FROM meds_df
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY hospitalization_id, admin_dttm, med_category
+            ORDER BY 
+                -- apply mar action dedup logic
+                CASE WHEN mar_action_category IS NULL THEN 10
+                    WHEN mar_action_category in ('verify', 'not_given') THEN 9
+                    WHEN mar_action_category = 'stop' THEN 8
+                    WHEN mar_action_category = 'going' THEN 7
+                    ELSE 1 END,
+                -- if tied at the same mar action, deprioritize zero or null doses
+                CASE WHEN med_dose > 0 THEN 1
+                    ELSE 2 END,
+                -- prioritize larger doses
+                med_dose DESC 
+        ) = 1
+        ORDER BY hospitalization_id, med_category, admin_dttm;
+        """
         return duckdb.sql(_q).to_df()
 
     return (remove_meds_duplicates,)
@@ -163,7 +215,7 @@ def _():
         )
 
     hosp_ids_w_icu_stays = adt.df['hospitalization_id'].unique().tolist()
-    return (Adt, Hospitalization, hosp_ids_w_icu_stays)
+    return Adt, Hospitalization, hosp_ids_w_icu_stays
 
 
 @app.cell
@@ -251,11 +303,17 @@ def _(duckdb, read_sql, resp_p):
 
 
 @app.cell
-def _(all_streaks, duckdb):
+def _(duckdb):
     # build the observation-window hourly time grids
     # start and end time for each hospitalization_id is the start and end of the first IMV streak of 24 hours or longer
     # the end of the imv streak means extubation, which we evaulates whether as successful or not
-    _q = '\nFROM all_streaks\nSELECT hospitalization_id, _streak_id, _start_dttm, _end_dttm, _duration_hrs\nWHERE _at_least_24h = 1 -- has to last for at least 24 hours\n    AND _on_imv = 1 -- has to be an IMV streak\n    AND _streak_id = 1 -- has to bethe first IMV streak\n'
+    _q = """
+    FROM all_streaks
+    SELECT hospitalization_id, _streak_id, _start_dttm, _end_dttm, _duration_hrs
+    WHERE _at_least_24h = 1 -- has to last for at least 24 hours
+    AND _on_imv = 1 -- has to be an IMV streak
+    AND _streak_id = 1 -- has to bethe first IMV streak
+    """
     cohort_imv_streaks_f = duckdb.sql(_q).df()
     return (cohort_imv_streaks_f,)
 
@@ -270,7 +328,13 @@ def _(cohort_imv_streaks_f):
 def _(cohort_imv_streaks_f, duckdb):
     cohort_imv_streaks_f['_start_hr'] = cohort_imv_streaks_f['_start_dttm'].dt.floor('h', ambiguous='NaT')
     cohort_imv_streaks_f['_end_hr'] = cohort_imv_streaks_f['_end_dttm'].dt.ceil('h', ambiguous='NaT')
-    _q = "\nSELECT \n    hospitalization_id,\n    unnest(generate_series(_start_hr, _end_hr, INTERVAL '1 hour')) AS event_dttm\nFROM cohort_imv_streaks_f\nORDER BY hospitalization_id, event_dttm\n"
+    _q = """
+    SELECT 
+    hospitalization_id,
+    unnest(generate_series(_start_hr, _end_hr, INTERVAL '1 hour')) AS event_dttm
+    FROM cohort_imv_streaks_f
+    ORDER BY hospitalization_id, event_dttm
+    """
     cohort_hrly_grids = duckdb.sql(_q).df()
     return (cohort_hrly_grids,)
 
@@ -322,17 +386,21 @@ def _(mo):
 
 
 @app.cell
-def _(Hospitalization, apply_outlier_handling, cohort_imv_streaks_f, duckdb):
+def _(Hospitalization, apply_outlier_handling, duckdb):
     from clifpy import Patient
     pt = Patient.from_file(config_path='config/config.json', columns=['patient_id', 'death_dttm'])
     pt_df = pt.df
     hosp = Hospitalization.from_file(config_path='config/config.json', columns=['patient_id', 'hospitalization_id', 'discharge_dttm', 'discharge_category', 'age_at_admission'])
     apply_outlier_handling(hosp, outlier_config_path='config/outlier_config.yaml')
     hosp_df = hosp.df
-    _q = '\nFROM hosp_df\nINNER JOIN cohort_imv_streaks_f USING (hospitalization_id)\nSELECT DISTINCT patient_id, hospitalization_id\n'
+    _q = """
+    FROM hosp_df
+    INNER JOIN cohort_imv_streaks_f USING (hospitalization_id)
+    SELECT DISTINCT patient_id, hospitalization_id
+    """
     pt_to_hosp_id_mapper = duckdb.sql(_q).df()
     cohort_pt_ids = pt_to_hosp_id_mapper['patient_id'].tolist()
-    return (cohort_pt_ids, hosp_df, pt_to_hosp_id_mapper)
+    return (cohort_pt_ids,)
 
 
 @app.cell(hide_code=True)
@@ -354,9 +422,15 @@ def _(mo):
 @app.cell
 def _(co, duckdb):
     vitals_path = co.data_directory + '/clif_vitals.parquet'
-    _q = f"\n-- find the latest recorded vital for each hospitalization\nFROM '{vitals_path}'\nSELECT hospitalization_id\n    , MAX(recorded_dttm) AS recorded_dttm\nGROUP BY hospitalization_id\n"
+    _q = f"""
+    -- find the latest recorded vital for each hospitalization
+    FROM '{vitals_path}'
+    SELECT hospitalization_id
+    , MAX(recorded_dttm) AS recorded_dttm
+    GROUP BY hospitalization_id
+    """
     last_vitals_df = duckdb.sql(_q).df()
-    return (last_vitals_df,)
+    return
 
 
 @app.cell
@@ -386,13 +460,17 @@ def _(mo):
 
 
 @app.cell
-def _(cohort_pt_ids, duckdb, pt_to_hosp_id_mapper):
+def _(cohort_pt_ids, duckdb):
     from clifpy import CodeStatus
     cs = CodeStatus.from_file(config_path='config/config.json', columns=['patient_id', 'start_dttm', 'code_status_category'], filters={'patient_id': cohort_pt_ids})
     cs_df = cs.df
-    _q = '\nFROM cs_df\nLEFT JOIN pt_to_hosp_id_mapper USING (patient_id)\nSELECT hospitalization_id, start_dttm, code_status_category\n'
+    _q = """
+    FROM cs_df
+    LEFT JOIN pt_to_hosp_id_mapper USING (patient_id)
+    SELECT hospitalization_id, start_dttm, code_status_category
+    """
     cs_df = duckdb.sql(_q).df()
-    return (cs_df,)
+    return
 
 
 @app.cell(hide_code=True)
@@ -411,9 +489,20 @@ def _(cs_df, duckdb, hosp_df, last_vitals_df, read_sql, resp_p):
 
 
 @app.cell
-def _(duckdb, sbt_outcomes):
+def _(duckdb):
     ## QA
-    _q = '\n-- look for represenative examples to eyeball\nFROM sbt_outcomes\nSELECT hospitalization_id\n    , MAX(_trach_1st) AS _trach_1st\n    , MAX(_fail_extub) AS _fail_extub\n    , COUNT(*) AS _n\nGROUP BY hospitalization_id\nHAVING _trach_1st = 1 AND _fail_extub = 1 AND _N > 100\nORDER BY _n\nLIMIT 10\n'
+    _q = """
+    -- look for represenative examples to eyeball
+    FROM sbt_outcomes
+    SELECT hospitalization_id
+    , MAX(_trach_1st) AS _trach_1st
+    , MAX(_fail_extub) AS _fail_extub
+    , COUNT(*) AS _n
+    GROUP BY hospitalization_id
+    HAVING _trach_1st = 1 AND _fail_extub = 1 AND _N > 100
+    ORDER BY _n
+    LIMIT 10
+    """
     duckdb.sql(_q).df()
     return
 
@@ -421,28 +510,59 @@ def _(duckdb, sbt_outcomes):
 @app.cell
 def _(duckdb, sbt_outcomes):
     sbt_outcomes['_dh'] = sbt_outcomes['event_dttm'].dt.floor('h', ambiguous='NaT')
-    _q = '\nFROM sbt_outcomes\nSELECT hospitalization_id, _dh\n    -- , _nth_day\n    , sbt_done: COALESCE(MAX(sbt_done), 0)\n    -- , _extub_1st: COALESCE(MAX(_extub_1st), 0)\n    , success_extub: COALESCE(MAX(_success_extub), 0)\n    , trach_1st: COALESCE(MAX(_trach_1st), 0)\nGROUP BY hospitalization_id, _dh\nORDER BY hospitalization_id, _dh\n'
+    _q = """
+    FROM sbt_outcomes
+    SELECT hospitalization_id, _dh
+    -- , _nth_day
+    , sbt_done: COALESCE(MAX(sbt_done), 0)
+    -- , _extub_1st: COALESCE(MAX(_extub_1st), 0)
+    , success_extub: COALESCE(MAX(_success_extub), 0)
+    , trach_1st: COALESCE(MAX(_trach_1st), 0)
+    GROUP BY hospitalization_id, _dh
+    ORDER BY hospitalization_id, _dh
+    """
     sbt_outcomes_hrly = duckdb.sql(_q).df()
-    return (sbt_outcomes_hrly,)
+    return
 
 
 @app.cell
-def _(cohort_hrly_grids_f, duckdb, sbt_outcomes_hrly):
-    _q = '\nFROM cohort_hrly_grids_f\nLEFT JOIN sbt_outcomes_hrly USING (hospitalization_id, _dh)\nSELECT *\nORDER BY hospitalization_id, _dh\n'
+def _(duckdb):
+    _q = """
+    FROM cohort_hrly_grids_f
+    LEFT JOIN sbt_outcomes_hrly USING (hospitalization_id, _dh)
+    SELECT *
+    ORDER BY hospitalization_id, _dh
+    """
     cohort_sbt_outcomes_hrly = duckdb.sql(_q).df()
-    return (cohort_sbt_outcomes_hrly,)
+    return
 
 
 @app.cell
-def _(cohort_sbt_outcomes_hrly, duckdb):
-    _q = '\nFROM cohort_sbt_outcomes_hrly\nSELECT hospitalization_id, _nth_day\n    , sbt_done: COALESCE(MAX(sbt_done), 0)\n    , success_extub: COALESCE(MAX(success_extub), 0)\n    , trach_1st: COALESCE(MAX(trach_1st), 0)\n    , n_hrs: COUNT(*)\nGROUP BY hospitalization_id, _nth_day\nORDER BY hospitalization_id, _nth_day\n'
+def _(duckdb):
+    _q = """
+    FROM cohort_sbt_outcomes_hrly
+    SELECT hospitalization_id, _nth_day
+    , sbt_done: COALESCE(MAX(sbt_done), 0)
+    , success_extub: COALESCE(MAX(success_extub), 0)
+    , trach_1st: COALESCE(MAX(trach_1st), 0)
+    , n_hrs: COUNT(*)
+    GROUP BY hospitalization_id, _nth_day
+    ORDER BY hospitalization_id, _nth_day
+    """
     cohort_sbt_outcomes_daily = duckdb.sql(_q).df()
     return (cohort_sbt_outcomes_daily,)
 
 
 @app.cell
 def _(cohort_sbt_outcomes_daily, duckdb):
-    _q = '\nFROM cohort_sbt_outcomes_daily\nSELECT\n    hospitalization_id\n    , sbt_done: COALESCE(MAX(sbt_done), 0)\n    , success_extub: COALESCE(MAX(success_extub), 0)\nGROUP BY hospitalization_id\n'
+    _q = """
+    FROM cohort_sbt_outcomes_daily
+    SELECT
+    hospitalization_id
+    , sbt_done: COALESCE(MAX(sbt_done), 0)
+    , success_extub: COALESCE(MAX(success_extub), 0)
+    GROUP BY hospitalization_id
+    """
     cohort_sbt_outcomes_by_pt = duckdb.sql(_q).df()
     print(f"success_extub rate: {cohort_sbt_outcomes_by_pt['success_extub'].mean()}")
     print(f"sbt_done rate per day: {cohort_sbt_outcomes_daily['sbt_done'].mean()}")
@@ -523,14 +643,41 @@ def _(apply_outlier_handling, cohort_hosp_ids, duckdb):
     labs = Labs.from_file(config_path='config/config.json', columns=['hospitalization_id', 'lab_order_dttm', 'lab_result_dttm', 'lab_category', 'lab_value_numeric'], filters={'hospitalization_id': cohort_hosp_ids, 'lab_category': ['ph_arterial', 'ph_venous']})
     apply_outlier_handling(labs, outlier_config_path='config/outlier_config.yaml')
     labs_df = labs.df
-    _q = '\nPIVOT_WIDER labs_df\nON lab_category\nUSING MAX(lab_value_numeric)\n'
+    _q = """
+    PIVOT_WIDER labs_df
+    ON lab_category
+    USING MAX(lab_value_numeric)
+    """
     labs_w = duckdb.sql(_q).df()
-    return (Labs, labs_w)
+    return (Labs,)
 
 
 @app.cell
-def _(cohort_shift_change_grids, duckdb, labs_w):
-    _q = "\nFROM cohort_shift_change_grids g\nASOF LEFT JOIN labs_w l ON\n    g.hospitalization_id = l.hospitalization_id \n    AND l.lab_order_dttm <= g.event_dttm\nSELECT g.*\n    , l.lab_order_dttm\n    , l.lab_result_dttm\n    , l.ph_arterial\n    , l.ph_venous -- change it to ph_venous: NULL if ph_venous is not available\n    , ph: COALESCE(ph_arterial, ph_venous + 0.05)\n    , _time_diff: g.event_dttm - l.lab_order_dttm\n    , _within_12_hours: CASE WHEN _time_diff <= INTERVAL '12 hour' THEN 1 ELSE 0 END\n    , ph_level: CASE \n        WHEN _within_12_hours = 0 THEN 'missing'\n        WHEN ph < 7.20 THEN 'ph_lt72'\n        WHEN ph >= 7.20 AND ph < 7.30 THEN 'ph_72_73'\n        WHEN ph >= 7.30 AND ph < 7.40 THEN 'ph_73_74'\n        WHEN ph >= 7.40 AND ph < 7.45 THEN 'ph_74_745'\n        WHEN ph >= 7.45 THEN 'ph_ge745'\n        ELSE 'missing'\n    END\nORDER BY g.hospitalization_id, g.event_dttm\n"
+def _(cohort_shift_change_grids, duckdb):
+    _q = """
+    FROM cohort_shift_change_grids g
+    ASOF LEFT JOIN labs_w l ON
+    g.hospitalization_id = l.hospitalization_id 
+    AND l.lab_order_dttm <= g.event_dttm
+    SELECT g.*
+    , l.lab_order_dttm
+    , l.lab_result_dttm
+    , l.ph_arterial
+    , l.ph_venous -- change it to ph_venous: NULL if ph_venous is not available
+    , ph: COALESCE(ph_arterial, ph_venous + 0.05)
+    , _time_diff: g.event_dttm - l.lab_order_dttm
+    , _within_12_hours: CASE WHEN _time_diff <= INTERVAL '12 hour' THEN 1 ELSE 0 END
+    , ph_level: CASE 
+        WHEN _within_12_hours = 0 THEN 'missing'
+        WHEN ph < 7.20 THEN 'ph_lt72'
+        WHEN ph >= 7.20 AND ph < 7.30 THEN 'ph_72_73'
+        WHEN ph >= 7.30 AND ph < 7.40 THEN 'ph_73_74'
+        WHEN ph >= 7.40 AND ph < 7.45 THEN 'ph_74_745'
+        WHEN ph >= 7.45 THEN 'ph_ge745'
+        ELSE 'missing'
+    END
+    ORDER BY g.hospitalization_id, g.event_dttm
+    """
     ph_df = duckdb.sql(_q).df()
     assert len(ph_df) == len(cohort_shift_change_grids), 'length altered'
     return (ph_df,)
@@ -549,16 +696,43 @@ def _(Labs, apply_outlier_handling, cohort_hosp_ids, duckdb):
     po2 = Labs.from_file(config_path='config/config.json', columns=['hospitalization_id', 'lab_order_dttm', 'lab_result_dttm', 'lab_category', 'lab_value_numeric'], filters={'hospitalization_id': cohort_hosp_ids, 'lab_category': ['po2_arterial']})
     apply_outlier_handling(po2, outlier_config_path='config/outlier_config.yaml')
     po2_df = po2.df
-    _q = '\nPIVOT_WIDER po2_df\nON lab_category\nUSING MAX(lab_value_numeric)\n'
+    _q = """
+    PIVOT_WIDER po2_df
+    ON lab_category
+    USING MAX(lab_value_numeric)
+    """
     po2_w = duckdb.sql(_q).df()
-    return (po2_w,)
+    return
 
 
 @app.cell
-def _(cohort_shift_change_grids, duckdb, po2_w, resp_p):
-    _q = "\nFROM cohort_shift_change_grids g\nASOF LEFT JOIN resp_p r ON\n    g.hospitalization_id = r.hospitalization_id \n    AND r.recorded_dttm <= g.event_dttm\nASOF LEFT JOIN po2_w p ON\n    g.hospitalization_id = p.hospitalization_id \n    AND p.lab_order_dttm <= g.event_dttm\nSELECT g.*\n    , fio2_dttm: r.recorded_dttm\n    , fio2_set: r.fio2_set\n    , po2_dttm: p.lab_order_dttm\n    , po2_arterial: p.po2_arterial\n    , pf: po2_arterial / fio2_set\n    , pf_level: CASE\n        WHEN pf is NULL THEN 'missing'\n        WHEN pf < 100 THEN 'pf_lt100'\n        WHEN pf >= 100 AND pf < 200 THEN 'pf_100_200'\n        WHEN pf >= 200 AND pf < 300 THEN 'pf_200_300'\n        WHEN pf >= 300 THEN 'pf_ge300'\n        ELSE 'missing'\n    END\nORDER BY g.hospitalization_id, g.event_dttm\n"
+def _(duckdb):
+    _q = """
+    FROM cohort_shift_change_grids g
+    ASOF LEFT JOIN resp_p r ON
+    g.hospitalization_id = r.hospitalization_id 
+    AND r.recorded_dttm <= g.event_dttm
+    ASOF LEFT JOIN po2_w p ON
+    g.hospitalization_id = p.hospitalization_id 
+    AND p.lab_order_dttm <= g.event_dttm
+    SELECT g.*
+    , fio2_dttm: r.recorded_dttm
+    , fio2_set: r.fio2_set
+    , po2_dttm: p.lab_order_dttm
+    , po2_arterial: p.po2_arterial
+    , pf: po2_arterial / fio2_set
+    , pf_level: CASE
+        WHEN pf is NULL THEN 'missing'
+        WHEN pf < 100 THEN 'pf_lt100'
+        WHEN pf >= 100 AND pf < 200 THEN 'pf_100_200'
+        WHEN pf >= 200 AND pf < 300 THEN 'pf_200_300'
+        WHEN pf >= 300 THEN 'pf_ge300'
+        ELSE 'missing'
+    END
+    ORDER BY g.hospitalization_id, g.event_dttm
+    """
     pf_df = duckdb.sql(_q).df()
-    return (pf_df,)
+    return
 
 
 @app.cell(hide_code=True)
@@ -597,10 +771,44 @@ def _(
 
 @app.cell
 def _(cohort_shift_change_grids, cont_veso_converted, duckdb, ph_df):
-    _q = "\nFROM cohort_shift_change_grids g\nASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'dopamine') m1 ON\n    g.hospitalization_id = m1.hospitalization_id \n    AND m1.admin_dttm <= g.event_dttm\nASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'norepinephrine') m2 ON\n    g.hospitalization_id = m2.hospitalization_id \n    AND m2.admin_dttm <= g.event_dttm\nASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'epinephrine') m3 ON\n    g.hospitalization_id = m3.hospitalization_id \n    AND m3.admin_dttm <= g.event_dttm\nASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'phenylephrine') m4 ON\n    g.hospitalization_id = m4.hospitalization_id \n    AND m4.admin_dttm <= g.event_dttm\nASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'angiotensin') m5 ON\n    g.hospitalization_id = m5.hospitalization_id \n    AND m5.admin_dttm <= g.event_dttm\nASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'vasopressin') m6 ON\n    g.hospitalization_id = m6.hospitalization_id \n    AND m6.admin_dttm <= g.event_dttm\nSELECT g.*\n    , dopamine: COALESCE(m1.med_dose, 0)\n    , norepinephrine: COALESCE(m2.med_dose, 0)\n    , epinephrine: COALESCE(m3.med_dose, 0)\n    , phenylephrine: COALESCE(m4.med_dose, 0)\n    , angiotensin: COALESCE(m5.med_dose, 0)\n    , vasopressin: COALESCE(m6.med_dose, 0)\n    , _nee: norepinephrine \n        + epinephrine \n        + phenylephrine / 10.0 \n        + dopamine / 100.0 \n        + vasopressin * 2.5 \n        + angiotensin * 10\nORDER BY g.hospitalization_id, g.event_dttm\n"
+    _q = """
+    FROM cohort_shift_change_grids g
+    ASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'dopamine') m1 ON
+    g.hospitalization_id = m1.hospitalization_id 
+    AND m1.admin_dttm <= g.event_dttm
+    ASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'norepinephrine') m2 ON
+    g.hospitalization_id = m2.hospitalization_id 
+    AND m2.admin_dttm <= g.event_dttm
+    ASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'epinephrine') m3 ON
+    g.hospitalization_id = m3.hospitalization_id 
+    AND m3.admin_dttm <= g.event_dttm
+    ASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'phenylephrine') m4 ON
+    g.hospitalization_id = m4.hospitalization_id 
+    AND m4.admin_dttm <= g.event_dttm
+    ASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'angiotensin') m5 ON
+    g.hospitalization_id = m5.hospitalization_id 
+    AND m5.admin_dttm <= g.event_dttm
+    ASOF LEFT JOIN (SELECT * FROM cont_veso_converted WHERE med_category = 'vasopressin') m6 ON
+    g.hospitalization_id = m6.hospitalization_id 
+    AND m6.admin_dttm <= g.event_dttm
+    SELECT g.*
+    , dopamine: COALESCE(m1.med_dose, 0)
+    , norepinephrine: COALESCE(m2.med_dose, 0)
+    , epinephrine: COALESCE(m3.med_dose, 0)
+    , phenylephrine: COALESCE(m4.med_dose, 0)
+    , angiotensin: COALESCE(m5.med_dose, 0)
+    , vasopressin: COALESCE(m6.med_dose, 0)
+    , _nee: norepinephrine 
+        + epinephrine 
+        + phenylephrine / 10.0 
+        + dopamine / 100.0 
+        + vasopressin * 2.5 
+        + angiotensin * 10
+    ORDER BY g.hospitalization_id, g.event_dttm
+    """
     vaso_df = duckdb.sql(_q).df()
     assert len(ph_df) == len(cohort_shift_change_grids), 'length altered'
-    return (vaso_df,)
+    return
 
 
 @app.cell(hide_code=True)
@@ -612,12 +820,41 @@ def _(mo):
 
 
 @app.cell
-def _(cohort_shift_change_grids, duckdb, pf_df, ph_df, vaso_df):
-    _q = '\nFROM cohort_shift_change_grids g\nLEFT JOIN ph_df ph USING (hospitalization_id, event_dttm)\nLEFT JOIN pf_df pf USING (hospitalization_id, event_dttm)\nLEFT JOIN vaso_df v USING (hospitalization_id, event_dttm)\nSELECT g.*\n    , ph.ph_level\n    , ph.ph\n    , pf.pf_level\n    , pf.pf\n    , v._nee\nORDER BY hospitalization_id, event_dttm\n'
+def _(duckdb):
+    _q = """
+    FROM cohort_shift_change_grids g
+    LEFT JOIN ph_df ph USING (hospitalization_id, event_dttm)
+    LEFT JOIN pf_df pf USING (hospitalization_id, event_dttm)
+    LEFT JOIN vaso_df v USING (hospitalization_id, event_dttm)
+    SELECT g.*
+    , ph.ph_level
+    , ph.ph
+    , pf.pf_level
+    , pf.pf
+    , v._nee
+    ORDER BY hospitalization_id, event_dttm
+    """
     covs = duckdb.sql(_q).df()
-    _q = "\nFROM covs\nSELECT hospitalization_id\n    --, event_dttm: MIN(event_dttm)\n    , _nth_day\n    , ph_level_7am: COALESCE(ANY_VALUE(CASE WHEN _hr = 7 THEN ph_level END), 'missing')\n    , ph_level_7pm: COALESCE(ANY_VALUE(CASE WHEN _hr = 19 THEN ph_level END), 'missing')\n    , pf_level_7am: COALESCE(ANY_VALUE(CASE WHEN _hr = 7 THEN pf_level END), 'missing')\n    , pf_level_7pm: COALESCE(ANY_VALUE(CASE WHEN _hr = 19 THEN pf_level END), 'missing')\n    , nee_7am: COALESCE(ANY_VALUE(CASE WHEN _hr = 7 THEN _nee END), 0)\n    , nee_7pm: COALESCE(ANY_VALUE(CASE WHEN _hr = 19 THEN _nee END), 0)\n    , _ph_7am: ANY_VALUE(CASE WHEN _hr = 7 THEN ph END)\n    , _ph_7pm: ANY_VALUE(CASE WHEN _hr = 19 THEN ph END)\n    , _pf_7am: ANY_VALUE(CASE WHEN _hr = 7 THEN pf END)\n    , _pf_7pm: ANY_VALUE(CASE WHEN _hr = 19 THEN pf END)\nGROUP BY hospitalization_id, _nth_day\nORDER BY hospitalization_id, _nth_day\n"
+    _q = """
+    FROM covs
+    SELECT hospitalization_id
+    --, event_dttm: MIN(event_dttm)
+    , _nth_day
+    , ph_level_7am: COALESCE(ANY_VALUE(CASE WHEN _hr = 7 THEN ph_level END), 'missing')
+    , ph_level_7pm: COALESCE(ANY_VALUE(CASE WHEN _hr = 19 THEN ph_level END), 'missing')
+    , pf_level_7am: COALESCE(ANY_VALUE(CASE WHEN _hr = 7 THEN pf_level END), 'missing')
+    , pf_level_7pm: COALESCE(ANY_VALUE(CASE WHEN _hr = 19 THEN pf_level END), 'missing')
+    , nee_7am: COALESCE(ANY_VALUE(CASE WHEN _hr = 7 THEN _nee END), 0)
+    , nee_7pm: COALESCE(ANY_VALUE(CASE WHEN _hr = 19 THEN _nee END), 0)
+    , _ph_7am: ANY_VALUE(CASE WHEN _hr = 7 THEN ph END)
+    , _ph_7pm: ANY_VALUE(CASE WHEN _hr = 19 THEN ph END)
+    , _pf_7am: ANY_VALUE(CASE WHEN _hr = 7 THEN pf END)
+    , _pf_7pm: ANY_VALUE(CASE WHEN _hr = 19 THEN pf END)
+    GROUP BY hospitalization_id, _nth_day
+    ORDER BY hospitalization_id, _nth_day
+    """
     covs_daily = duckdb.sql(_q).df()
-    return (covs, covs_daily)
+    return
 
 
 @app.cell(hide_code=True)
@@ -667,10 +904,27 @@ def _(apply_outlier_handling, cont_sed):
 
 
 @app.cell
-def _(cont_sed_converted, duckdb):
-    _q = "\n-- converting to wide format\nWITH t1 AS (\n    SELECT hospitalization_id\n        , admin_dttm as event_dttm\n        , med_category_unit: med_category || '_' || REPLACE(med_dose_unit, '/', '_') || '_cont'\n        , med_dose\n    FROM cont_sed_converted\n)\n, t2 AS (\n    PIVOT_WIDER t1\n    ON med_category_unit\n    USING FIRST(med_dose)\n)\nSELECT *\nFROM t2\nORDER BY hospitalization_id, event_dttm\n"
+def _(duckdb):
+    _q = """
+    -- converting to wide format
+    WITH t1 AS (
+    SELECT hospitalization_id
+        , admin_dttm as event_dttm
+        , med_category_unit: med_category || '_' || REPLACE(med_dose_unit, '/', '_') || '_cont'
+        , med_dose
+    FROM cont_sed_converted
+    )
+    , t2 AS (
+    PIVOT_WIDER t1
+    ON med_category_unit
+    USING FIRST(med_dose)
+    )
+    SELECT *
+    FROM t2
+    ORDER BY hospitalization_id, event_dttm
+    """
     cont_sed_w = duckdb.sql(_q).df()
-    return (cont_sed_w,)
+    return
 
 
 @app.cell(hide_code=True)
@@ -703,35 +957,62 @@ def _(
     apply_outlier_handling(intm_sed, outlier_config_path='config/outlier_config.yaml')
     print(f'{len(intm_sed_converted)} rows in intm_sed_converted')
     intm_sed_converted = intm_sed.df
-    return (intm_sed_converted,)
+    return
 
 
 @app.cell
-def _(duckdb, intm_sed_converted):
-    _q = "\n-- converting to wide format\nWITH t1 AS (\n    SELECT hospitalization_id\n        , admin_dttm as event_dttm\n        , med_category_unit: med_category || '_' || REPLACE(med_dose_unit, '/', '_') || '_intm'\n        , med_dose: CASE WHEN mar_action_category = 'not_given' THEN 0 ELSE med_dose END\n    FROM intm_sed_converted\n)\n, t2 AS (\n    PIVOT_WIDER t1\n    ON med_category_unit\n    USING FIRST(med_dose)\n)\nSELECT *\nFROM t2\nORDER BY hospitalization_id, event_dttm\n"
+def _(duckdb):
+    _q = """
+    -- converting to wide format
+    WITH t1 AS (
+    SELECT hospitalization_id
+        , admin_dttm as event_dttm
+        , med_category_unit: med_category || '_' || REPLACE(med_dose_unit, '/', '_') || '_intm'
+        , med_dose: CASE WHEN mar_action_category = 'not_given' THEN 0 ELSE med_dose END
+    FROM intm_sed_converted
+    )
+    , t2 AS (
+    PIVOT_WIDER t1
+    ON med_category_unit
+    USING FIRST(med_dose)
+    )
+    SELECT *
+    FROM t2
+    ORDER BY hospitalization_id, event_dttm
+    """
     intm_sed_w = duckdb.sql(_q).df()
-    return (intm_sed_w,)
+    return
 
 
 @app.cell
-def _(cohort_hrly_grids_f, cont_sed_w, duckdb):
-    _q = '\n-- create the hourly grid for the wide sedation table\nFROM cohort_hrly_grids_f g\nFULL JOIN cont_sed_w m USING (hospitalization_id, event_dttm)\nORDER BY hospitalization_id, event_dttm\n'
+def _(duckdb):
+    _q = """
+    -- create the hourly grid for the wide sedation table
+    FROM cohort_hrly_grids_f g
+    FULL JOIN cont_sed_w m USING (hospitalization_id, event_dttm)
+    ORDER BY hospitalization_id, event_dttm
+    """
     cont_sed_wg = duckdb.sql(_q).df()
     cont_sed_wg['_dh'] = cont_sed_wg['event_dttm'].dt.floor('h', ambiguous='NaT')
     cont_sed_wg['_hr'] = cont_sed_wg['event_dttm'].dt.hour
     # wide table with hourly grids inserted
     print(len(cont_sed_wg))
-    return (cont_sed_wg,)
+    return
 
 
 @app.cell
-def _(cohort_hrly_grids_f, duckdb, intm_sed_w):
-    _q = '\n-- create the hourly grid for the wide sedation table\nFROM cohort_hrly_grids_f g\nFULL JOIN intm_sed_w m USING (hospitalization_id, event_dttm)\nORDER BY hospitalization_id, event_dttm\n'
+def _(duckdb):
+    _q = """
+    -- create the hourly grid for the wide sedation table
+    FROM cohort_hrly_grids_f g
+    FULL JOIN intm_sed_w m USING (hospitalization_id, event_dttm)
+    ORDER BY hospitalization_id, event_dttm
+    """
     intm_sed_wg = duckdb.sql(_q).df()
     intm_sed_wg['_dh'] = intm_sed_wg['event_dttm'].dt.floor('h', ambiguous='NaT')
     intm_sed_wg['_hr'] = intm_sed_wg['event_dttm'].dt.hour
     print(len(intm_sed_wg))
-    return (intm_sed_wg,)
+    return
 
 
 @app.cell(hide_code=True)
@@ -750,16 +1031,44 @@ def _(cont_sed_wg, duckdb, read_sql):
 
 
 @app.cell
-def _(duckdb, intm_sed_wg):
-    _q = "\nFROM intm_sed_wg\nSELECT hospitalization_id, _dh\n    , SUM(COALESCE(COLUMNS('_intm'), 0))\nGROUP BY hospitalization_id, _dh\nORDER BY hospitalization_id, _dh\n"
+def _(duckdb):
+    _q = """
+    FROM intm_sed_wg
+    SELECT hospitalization_id, _dh
+    , SUM(COALESCE(COLUMNS('_intm'), 0))
+    GROUP BY hospitalization_id, _dh
+    ORDER BY hospitalization_id, _dh
+    """
     intm_sed_dose_by_hr = duckdb.sql(_q).df()
     print(len(intm_sed_dose_by_hr))
-    return (intm_sed_dose_by_hr,)
+    return
 
 
 @app.cell
-def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, duckdb, intm_sed_dose_by_hr):
-    _q = '\n-- join the cont and intm hourly cumm dose table\nWITH t1 as (\n    FROM cohort_hrly_grids_f g\n    LEFT JOIN intm_sed_dose_by_hr i USING (hospitalization_id, _dh)\n    LEFT JOIN cont_sed_dose_by_hr c USING (hospitalization_id, _dh)\n    SELECT *\n)\n, t2 as (\n    SELECT *\n        , fentanyl_mcg_total: fentanyl_mcg_intm + fentanyl_mcg_min_cont\n        , hydromorphone_mg_total: hydromorphone_mg_intm + hydromorphone_mg_min_cont\n        , lorazepam_mg_total: lorazepam_mg_intm + lorazepam_mg_min_cont\n        , midazolam_mg_total: midazolam_mg_intm + midazolam_mg_min_cont\n        , propofol_mg_total: propofol_mg_intm + propofol_mg_min_cont\n        , _midazolam_eq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total\n        , _fentanyl_eq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total\n    FROM t1\n)\nSELECT *\nFROM t2\nORDER BY hospitalization_id, _dh\n'
+def _(duckdb):
+    _q = """
+    -- join the cont and intm hourly cumm dose table
+    WITH t1 as (
+    FROM cohort_hrly_grids_f g
+    LEFT JOIN intm_sed_dose_by_hr i USING (hospitalization_id, _dh)
+    LEFT JOIN cont_sed_dose_by_hr c USING (hospitalization_id, _dh)
+    SELECT *
+    )
+    , t2 as (
+    SELECT *
+        , fentanyl_mcg_total: fentanyl_mcg_intm + fentanyl_mcg_min_cont
+        , hydromorphone_mg_total: hydromorphone_mg_intm + hydromorphone_mg_min_cont
+        , lorazepam_mg_total: lorazepam_mg_intm + lorazepam_mg_min_cont
+        , midazolam_mg_total: midazolam_mg_intm + midazolam_mg_min_cont
+        , propofol_mg_total: propofol_mg_intm + propofol_mg_min_cont
+        , _midazolam_eq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
+        , _fentanyl_eq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
+    FROM t1
+    )
+    SELECT *
+    FROM t2
+    ORDER BY hospitalization_id, _dh
+    """
     #assert len(sed_dose_by_hr) == len(cont_sed_dose_by_hr), 'length altered for cont sed'
     #assert len(sed_dose_by_hr) == len(intm_sed_dose_by_hr), 'length altered for intm sed'
     sed_dose_by_hr = duckdb.sql(_q).df()
@@ -775,8 +1084,16 @@ def _(mo):
 
 
 @app.cell
-def _(duckdb, sed_dose_by_hr):
-    _q = '\nFROM sed_dose_by_hr\nSELECT _shift\n    , propofol_mg: AVG(propofol_mg_total)\n    , _fentanyl_eq_mcg: AVG(_fentanyl_eq_mcg_total)\n    , _midazolam_eq_mg: AVG(_midazolam_eq_mg_total)\nGROUP BY _shift\nORDER BY _shift\n'
+def _(duckdb):
+    _q = """
+    FROM sed_dose_by_hr
+    SELECT _shift
+    , propofol_mg: AVG(propofol_mg_total)
+    , _fentanyl_eq_mcg: AVG(_fentanyl_eq_mcg_total)
+    , _midazolam_eq_mg: AVG(_midazolam_eq_mg_total)
+    GROUP BY _shift
+    ORDER BY _shift
+    """
     # sed_dose_by_shift.to_csv(f'output/final/{SITE_NAME}_sed_dose_by_shift_{CURRENT_TIME_STR}.csv', index=False)
     sed_dose_by_shift = duckdb.sql(_q).df()
     return (sed_dose_by_shift,)
@@ -815,7 +1132,15 @@ def _(mo):
 
 @app.cell
 def _(CURRENT_TIME_STR, SITE_NAME, duckdb, sed_dose_by_hr):
-    _q = '\nFROM sed_dose_by_hr\nSELECT _hr\n    , propofol_mg: AVG(propofol_mg_total)\n    , _fentanyl_eq_mcg: AVG(_fentanyl_eq_mcg_total)\n    , _midazolam_eq_mg: AVG(_midazolam_eq_mg_total)\nGROUP BY _hr\nORDER BY _hr\n'
+    _q = """
+    FROM sed_dose_by_hr
+    SELECT _hr
+    , propofol_mg: AVG(propofol_mg_total)
+    , _fentanyl_eq_mcg: AVG(_fentanyl_eq_mcg_total)
+    , _midazolam_eq_mg: AVG(_midazolam_eq_mg_total)
+    GROUP BY _hr
+    ORDER BY _hr
+    """
     sed_dose_by_hr_of_day = duckdb.sql(_q).df()
     sed_dose_by_hr_of_day.to_csv(f'output/final/{SITE_NAME}_sed_dose_by_hr_of_day_{CURRENT_TIME_STR}.csv', index=False)
     return (sed_dose_by_hr_of_day,)
@@ -909,8 +1234,20 @@ def _(mo):
 
 
 @app.cell
-def _(duckdb, sed_dose_by_hr):
-    _q = '\n-- Aggregate per hospitalization, day, shift\nFROM sed_dose_by_hr\nSELECT\n    hospitalization_id,\n    _nth_day,\n    _shift,\n    SUM(propofol_mg_total) AS propofol_mg_total,\n    SUM(_fentanyl_eq_mcg_total) AS fentanyl_eq_mcg_total,\n    SUM(_midazolam_eq_mg_total) AS midazolam_eq_mg_total\nGROUP BY hospitalization_id, _nth_day, _shift\nORDER BY hospitalization_id, _nth_day, _shift\n'
+def _(duckdb):
+    _q = """
+    -- Aggregate per hospitalization, day, shift
+    FROM sed_dose_by_hr
+    SELECT
+    hospitalization_id,
+    _nth_day,
+    _shift,
+    SUM(propofol_mg_total) AS propofol_mg_total,
+    SUM(_fentanyl_eq_mcg_total) AS fentanyl_eq_mcg_total,
+    SUM(_midazolam_eq_mg_total) AS midazolam_eq_mg_total
+    GROUP BY hospitalization_id, _nth_day, _shift
+    ORDER BY hospitalization_id, _nth_day, _shift
+    """
     sed_dose_agg = duckdb.sql(_q).df()
     sed_dose_daily = sed_dose_agg.pivot(index=['hospitalization_id', '_nth_day'], columns='_shift', values=['propofol_mg_total', 'fentanyl_eq_mcg_total', 'midazolam_eq_mg_total']).reset_index()
     sed_dose_daily.columns = ['hospitalization_id', '_nth_day', 'propofol_day' if ('propofol_mg_total', 'day') in sed_dose_daily.columns else None, 'propofol_night' if ('propofol_mg_total', 'night') in sed_dose_daily.columns else None, 'fentanyl_eq_day' if ('fentanyl_eq_mcg_total', 'day') in sed_dose_daily.columns else None, 'fentanyl_eq_night' if ('fentanyl_eq_mcg_total', 'night') in sed_dose_daily.columns else None, 'midazolam_eq_day' if ('midazolam_eq_mg_total', 'day') in sed_dose_daily.columns else None, 'midazolam_eq_night' if ('midazolam_eq_mg_total', 'night') in sed_dose_daily.columns else None]
@@ -924,7 +1261,7 @@ def _(duckdb, sed_dose_by_hr):
     #     'midazolam_eq_day', 'midazolam_eq_night'
     # ]
     sed_dose_daily = sed_dose_daily.loc[:, [c for c in sed_dose_daily.columns if c is not None]]
-    return (sed_dose_agg, sed_dose_daily)
+    return
 
 
 @app.cell(disabled=True)
@@ -948,16 +1285,46 @@ def _(mo):
 
 
 @app.cell
-def _(cohort_sbt_outcomes_daily, covs_daily, duckdb, hosp_df, sed_dose_daily):
-    _q = "\nFROM cohort_sbt_outcomes_daily o\nLEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)\nLEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)\nLEFT JOIN hosp_df h USING (hospitalization_id)\nSELECT o.hospitalization_id\n    , o._nth_day\n    , o.n_hrs\n    , _sbt_done_today: o.sbt_done\n    , _success_extub_today: o.success_extub\n    , sbt_done_next_day: LEAD(o.sbt_done) OVER w\n    , success_extub_next_day: LEAD(o.success_extub) OVER w\n    --, o.trach_1st\n    , _propofol_day: COALESCE(s.propofol_day, 0)\n    , _propofol_night: COALESCE(s.propofol_night, 0)\n    , _fentanyl_eq_day: COALESCE(s.fentanyl_eq_day, 0)\n    , _fentanyl_eq_night: COALESCE(s.fentanyl_eq_night, 0)\n    , _midazolam_eq_day: COALESCE(s.midazolam_eq_day, 0)\n    , _midazolam_eq_night: COALESCE(s.midazolam_eq_night, 0)\n    , propofol_diff: COALESCE(s.propofol_night, 0) - COALESCE(s.propofol_day, 0)\n    , fentanyl_eq_diff: COALESCE(s.fentanyl_eq_night, 0) - COALESCE(s.fentanyl_eq_day, 0)\n    , midazolam_eq_diff: COALESCE(s.midazolam_eq_night, 0) - COALESCE(s.midazolam_eq_day, 0)\n    , COLUMNS('(7am)|(7pm)')\n    , age: h.age_at_admission\nWINDOW w AS (PARTITION BY hospitalization_id ORDER BY _nth_day)\nORDER BY o.hospitalization_id, o._nth_day\n"
+def _(duckdb):
+    _q = """
+    FROM cohort_sbt_outcomes_daily o
+    LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
+    LEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)
+    LEFT JOIN hosp_df h USING (hospitalization_id)
+    SELECT o.hospitalization_id
+    , o._nth_day
+    , o.n_hrs
+    , _sbt_done_today: o.sbt_done
+    , _success_extub_today: o.success_extub
+    , sbt_done_next_day: LEAD(o.sbt_done) OVER w
+    , success_extub_next_day: LEAD(o.success_extub) OVER w
+    --, o.trach_1st
+    , _propofol_day: COALESCE(s.propofol_day, 0)
+    , _propofol_night: COALESCE(s.propofol_night, 0)
+    , _fentanyl_eq_day: COALESCE(s.fentanyl_eq_day, 0)
+    , _fentanyl_eq_night: COALESCE(s.fentanyl_eq_night, 0)
+    , _midazolam_eq_day: COALESCE(s.midazolam_eq_day, 0)
+    , _midazolam_eq_night: COALESCE(s.midazolam_eq_night, 0)
+    , propofol_diff: COALESCE(s.propofol_night, 0) - COALESCE(s.propofol_day, 0)
+    , fentanyl_eq_diff: COALESCE(s.fentanyl_eq_night, 0) - COALESCE(s.fentanyl_eq_day, 0)
+    , midazolam_eq_diff: COALESCE(s.midazolam_eq_night, 0) - COALESCE(s.midazolam_eq_day, 0)
+    , COLUMNS('(7am)|(7pm)')
+    , age: h.age_at_admission
+    WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _nth_day)
+    ORDER BY o.hospitalization_id, o._nth_day
+    """
     cohort_merged = duckdb.sql(_q).df()
     cohort_merged.dropna(subset=['age'], inplace=True)
-    return (cohort_merged,)
+    return
 
 
 @app.cell
-def _(cohort_merged, duckdb):
-    _q = '\nFROM cohort_merged\nSELECT *\nWHERE _nth_day > 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL\n'
+def _(duckdb):
+    _q = """
+    FROM cohort_merged
+    SELECT *
+    WHERE _nth_day > 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL
+    """
     cohort_merged_final = duckdb.sql(_q).df()
     return (cohort_merged_final,)
 
@@ -977,12 +1344,12 @@ def _(CURRENT_TIME_STR, SITE_NAME):
     def gen_and_save_tableone(file_name, **kwargs):
         """
         Wrapper for tableone.TableOne that automatically saves results to a CSV file.
-    
+
         Args:
             data: DataFrame to create table one from
             file_name: Name for the output file (without extension)
             **kwargs: All other arguments passed to tableone.TableOne
-    
+
         Returns:
             tableone.TableOne object
         """
@@ -994,15 +1361,39 @@ def _(CURRENT_TIME_STR, SITE_NAME):
 
 
 @app.cell
-def _(cohort_merged_final, duckdb):
-    _q = '\nFROM cohort_merged_final\nSELECT * -- EXCLUDE(hospitalization_id)\nWHERE _nth_day = 1\n'
+def _(duckdb):
+    _q = """
+    FROM cohort_merged_final
+    SELECT * -- EXCLUDE(hospitalization_id)
+    WHERE _nth_day = 1
+    """
     cohort_merged_for_t1 = duckdb.sql(_q).df()
     return (cohort_merged_for_t1,)
 
 
 @app.cell
-def _(cohort_merged_for_t1, covs, duckdb, hosp_df, sed_dose_agg):
-    _q = '\nWITH t1 AS (\n    FROM cohort_merged_for_t1 g\n    LEFT JOIN sed_dose_agg s USING (hospitalization_id, _nth_day)\n    LEFT JOIN hosp_df h USING (hospitalization_id)\n    SELECT g.hospitalization_id, g._nth_day\n        , s._shift\n        , s.propofol_mg_total\n        , s.fentanyl_eq_mcg_total\n        , s.midazolam_eq_mg_total\n        , h.patient_id\n)\n, t2 AS (\n    FROM t1\n    LEFT JOIN covs c USING (hospitalization_id, _nth_day, _shift)\n    SELECT *\n)\nSELECT *\nFROM t2\nORDER BY hospitalization_id, _nth_day, _shift\n'
+def _(cohort_merged_for_t1, duckdb):
+    _q = """
+    WITH t1 AS (
+    FROM cohort_merged_for_t1 g
+    LEFT JOIN sed_dose_agg s USING (hospitalization_id, _nth_day)
+    LEFT JOIN hosp_df h USING (hospitalization_id)
+    SELECT g.hospitalization_id, g._nth_day
+        , s._shift
+        , s.propofol_mg_total
+        , s.fentanyl_eq_mcg_total
+        , s.midazolam_eq_mg_total
+        , h.patient_id
+    )
+    , t2 AS (
+    FROM t1
+    LEFT JOIN covs c USING (hospitalization_id, _nth_day, _shift)
+    SELECT *
+    )
+    SELECT *
+    FROM t2
+    ORDER BY hospitalization_id, _nth_day, _shift
+    """
     cohort_merged_for_t1_w_by_shift = duckdb.sql(_q).df()
     assert len(cohort_merged_for_t1) * 2 == len(cohort_merged_for_t1_w_by_shift)
     return (cohort_merged_for_t1_w_by_shift,)
@@ -1076,7 +1467,10 @@ def _(CURRENT_TIME_STR, SITE_NAME, cohort_merged_final):
 def _(CURRENT_TIME_STR, SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
     import statsmodels.api as _sm
-    sbt_done_formula = 'sbt_done_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +\n    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +\n    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age\n'
+    sbt_done_formula = """sbt_done_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
+    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +
+    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age
+    """
     gee_model = _smf.gee(formula=sbt_done_formula, groups='hospitalization_id', data=cohort_merged_final, family=_sm.families.Binomial())
     gee_result = gee_model.fit()
     print(gee_result.summary())
@@ -1096,7 +1490,10 @@ def _(CURRENT_TIME_STR, SITE_NAME, cohort_merged_final, pd):
 def _(CURRENT_TIME_STR, SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
     # Logit regression with clustered standard errors
-    success_extub_formula = 'success_extub_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +\n    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +\n    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age\n'
+    success_extub_formula = """success_extub_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
+    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +
+    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age
+    """
     logit_model = _smf.logit(formula=success_extub_formula, data=cohort_merged_final)
     logit_result = logit_model.fit(cov_type='cluster', cov_kwds={'groups': cohort_merged_final['hospitalization_id']})
     print(logit_result.summary())
