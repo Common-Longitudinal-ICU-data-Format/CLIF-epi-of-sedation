@@ -373,7 +373,42 @@ def _():
     )
 
     nmb_df = nmb.df
-    return (MedicationAdminContinuous,)
+    return MedicationAdminContinuous, nmb_df
+
+
+@app.cell
+def _(nmb_df, cohort_hrly_grids_f):
+    nmb_excluded_patient_days = mo.sql(
+        f"""
+        -- Compute NMB duration per patient-day and flag those >1 hour for exclusion
+        WITH nmb_w_duration AS (
+            FROM nmb_df
+            SELECT hospitalization_id
+                , admin_dttm
+                , med_dose
+                , _duration_min: EXTRACT(EPOCH FROM (
+                    LEAD(admin_dttm, 1, admin_dttm) OVER w - admin_dttm
+                  )) / 60.0
+            WINDOW w AS (PARTITION BY hospitalization_id ORDER BY admin_dttm)
+        )
+        , nmb_hrly AS (
+            FROM cohort_hrly_grids_f g
+            ASOF LEFT JOIN nmb_w_duration n
+                ON g.hospitalization_id = n.hospitalization_id
+                AND n.admin_dttm <= g.event_dttm
+            SELECT g.hospitalization_id
+                , g._nth_day
+                , n.med_dose
+                , n._duration_min
+        )
+        FROM nmb_hrly
+        SELECT hospitalization_id, _nth_day
+            , _nmb_total_min: SUM(CASE WHEN med_dose > 0 THEN _duration_min ELSE 0 END)
+        GROUP BY hospitalization_id, _nth_day
+        HAVING _nmb_total_min > 60
+        """
+    )
+    return (nmb_excluded_patient_days,)
 
 
 @app.cell(hide_code=True)
@@ -1461,10 +1496,12 @@ def _(cohort_sbt_outcomes_daily, covs_daily, hosp_df, sed_dose_daily):
 
 
 @app.cell
-def _(cohort_merged):
+def _(cohort_merged, nmb_excluded_patient_days):
     cohort_merged_final = mo.sql(
         f"""
+        -- Exclude patient-days with >1 hour NMB
         FROM cohort_merged
+        ANTI JOIN nmb_excluded_patient_days USING (hospitalization_id, _nth_day)
         SELECT *
         WHERE _nth_day > 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL
         """

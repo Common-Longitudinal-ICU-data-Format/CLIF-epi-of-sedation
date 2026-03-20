@@ -26,7 +26,7 @@ Master tracker for all analytical definitions and their implementation status.
 | spec                                                                                   | status | code reference                                                                                                                                                                                          |
 | -------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Tracheostomy patients — exclude all rows after tracheostomy placement                  | DONE   | `sbt.sql` line 158: `WHERE (tracheostomy = 0 OR _trach_1st = 1)`. `cohort_id.sql`: streak end time is `COALESCE(_trach_dttm, _next_start_dttm, _last_observed_dttm)`                                    |
-| Patient-days on neuromuscular blockade >1 hour (cisatracurium, vecuronium, rocuronium) | TODO   | `sedation_sbt.py` lines 362-376: NMB data loaded via `MedicationAdminContinuous.from_file()` but NOT used to filter cohort. Need to compute NMB episode durations and exclude patient-days with >1h NMB |
+| Patient-days on neuromuscular blockade >1 hour. Agents: cisatracurium, vecuronium, rocuronium (all verified in mCIDE, med_group: paralytics). Pancuronium excluded — not in mCIDE. | DONE | `sedation_sbt.py`: NMB loaded (line ~367), duration computed via LEAD + SUM per patient-day (new cell after NMB load), patient-days with >60 min NMB excluded via ANTI JOIN in `cohort_merged_final` |
 
 
 ### Encounter Stitching
@@ -142,20 +142,6 @@ Master tracker for all analytical definitions and their implementation status.
 | Covariates sampled at shift changes | pH, P/F, NEE measured at 7am and 7pm (`ph_level_7am/7pm`, `pf_level_7am/7pm`, `nee_7am/7pm`)                                                                                                         | DONE   | `sedation_sbt.py` lines 953-990              |
 | Daytime sedation doses              | `_propofol_day`, `_fentanyl_eq_day`, `_midazolam_eq_day` included as regression covariates                                                                                                           | DONE   | `sedation_sbt.py` lines 1444-1449, 1616-1617 |
 
-
-### Vasopressor Unit Conversion
-
-
-| vasopressor    | preferred unit | status |
-| -------------- | -------------- | ------ |
-| norepinephrine | mcg/kg/min     | DONE   |
-| epinephrine    | mcg/kg/min     | DONE   |
-| phenylephrine  | mcg/kg/min     | DONE   |
-| dopamine       | mcg/kg/min     | DONE   |
-| vasopressin    | u/min          | DONE   |
-| angiotensin    | mcg/kg/min     | DONE   |
-
-
 ### Planned but Not Yet Implemented
 
 
@@ -170,6 +156,19 @@ Master tracker for all analytical definitions and their implementation status.
 | GCS at intubation          | patient_assessments table                                  | FUTURE |
 | ICU type / location        | ADT table                                                  | FUTURE |
 | Position (prone/not prone) | position table                                             | FUTURE |
+
+### Vasopressor Unit Conversion
+
+
+| vasopressor    | preferred unit | status |
+| -------------- | -------------- | ------ |
+| norepinephrine | mcg/kg/min     | DONE   |
+| epinephrine    | mcg/kg/min     | DONE   |
+| phenylephrine  | mcg/kg/min     | DONE   |
+| dopamine       | mcg/kg/min     | DONE   |
+| vasopressin    | u/min          | DONE   |
+| angiotensin    | mcg/kg/min     | DONE   |
+
 
 
 ---
@@ -326,7 +325,7 @@ Items specified in the analysis plan documents but not yet implemented.
 | --- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | A1  | SBT eligibility screening                | ABC trial criteria: SpO2>=88%, FiO2<=50%, PEEP<=8, RASS>=-2, NEE<0.2, no dobutamine>=5, no milrinone, no vasopressin, no ICP>15   | patient_assessments (RASS), vitals (SpO2), respiratory_support, additional vasopressors (dobutamine, milrinone) | HIGH                   |
 | A2  | SBT success/failure detection            | ABC trial failure criteria: RR>35, RR<8 for 5min, SpO2<88% for 5min, GCS<=8, tachycardia>130, bradycardia<60, tidal volume>=250cc | vitals (RR, HR, SpO2), patient_assessments (GCS), respiratory_support (TV)                                      | HIGH                   |
-| A3  | NMB exclusion                            | Exclude patient-days with NMB >1 hour. Code loads NMB data but doesn't wire up filtering                                          | episode duration calculation from existing NMB data                                                             | LOW                    |
+| A3  | ~~NMB exclusion~~                        | ~~DONE. Patient-days with >1h NMB (cisatracurium, vecuronium, rocuronium) now excluded via ANTI JOIN in `cohort_merged_final`~~    | —                                                                                                               | —                      |
 | A4  | Weight-adjusted propofol                 | Use mcg/kg/min x weight x time instead of absolute mg                                                                             | admission weight from vitals (already loaded)                                                                   | LOW                    |
 | A5  | Morphine tracking                        | Add morphine to fentanyl equivalency (10mg morphine = 100mcg fentanyl)                                                            | load morphine from medication_admin_continuous/intermittent                                                     | LOW                    |
 | A6  | Additional covariates                    | Sex, SOFA (`calculate_sofa2_daily`), surgical vs medical, Charlson comorbidity index (`clifpy.utils.cci`), sepsis                 | hospitalization, patient, labs, vitals, meds, hospital_diagnosis                                                | MEDIUM                 |
