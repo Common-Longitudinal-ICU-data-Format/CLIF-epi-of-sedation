@@ -1,5 +1,7 @@
-/docs
+/docs/*.docx
+
 .sedation/
+*/__marimo__/*
 
 # R specific gitignores
 .Rprofile
@@ -35,7 +37,6 @@ initialize_renv.R
 *.html
 
 mcide/
-docs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
