@@ -187,12 +187,13 @@ def _(cont_sed_converted, t1, t2):
     cont_sed_w = mo.sql(
         f"""
         -- Pivot continuous sedation to wide format (one column per drug_unit)
+        -- NOTE: stop events forced to dose=0 so forward-fill doesn't propagate stale rates (audit H1)
         WITH t1 AS (
         FROM cont_sed_converted
         SELECT hospitalization_id
             , admin_dttm AS event_dttm
             , med_category_unit: med_category || '_' || REPLACE(med_dose_unit, '/', '_') || '_cont'
-            , med_dose
+            , med_dose: CASE WHEN mar_action_category IN ('stop', 'not_given') THEN 0 ELSE med_dose END
         )
         , t2 AS (
         PIVOT_WIDER t1

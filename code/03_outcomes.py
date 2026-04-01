@@ -182,7 +182,7 @@ def _(resp_p):
             , _sbt_state: CASE
                 WHEN (mode_category IN ('pressure support/cpap')
                       AND peep_set <= 8 AND pressure_support_set <= 8)
-                    OR regexp_matches(device_name, 't1[\\s_-]?piece')
+                    OR regexp_matches(device_name, 't[\\s_-]?piece', 'i')
                     THEN 1 ELSE 0 END
             , _intub: CASE
                 WHEN LAG(device_category) OVER w IS DISTINCT FROM 'imv'
