@@ -26,7 +26,7 @@ Master tracker for all analytical definitions and their implementation status.
 | spec                                                                                   | status | code reference                                                                                                                                                                                          |
 | -------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Tracheostomy patients — exclude all rows after tracheostomy placement                  | DONE   | `sbt.sql` line 158: `WHERE (tracheostomy = 0 OR _trach_1st = 1)`. `cohort_id.sql`: streak end time is `COALESCE(_trach_dttm, _next_start_dttm, _last_observed_dttm)`                                    |
-| Patient-days on neuromuscular blockade >1 hour. Agents: cisatracurium, vecuronium, rocuronium (all verified in mCIDE, med_group: paralytics). Pancuronium excluded — not in mCIDE. | DONE | `sedation_sbt.py`: NMB loaded (line ~367), duration computed via LEAD + SUM per patient-day (new cell after NMB load), patient-days with >60 min NMB excluded via ANTI JOIN in `cohort_merged_final` |
+| NMB exclusion. Agents: cisatracurium, vecuronium, rocuronium (all verified in mCIDE, med_group: paralytics). Pancuronium excluded — not in mCIDE. Original spec: patient-day level (>1h NMB on a given day). **Changed to hospitalization-level**: exclude entire hospitalization if patient ever received >1h NMB on any day. Rationale: NMB patients are a fundamentally different population (severe ARDS, deep sedation for ventilator synchrony). Patient-day code preserved as comment in `05_analytical_dataset.py` for reversion. | DONE | `01_cohort.py`: NMB loaded, duration via LEAD + SUM per patient-day, flagged days saved to `output/nmb_excluded.parquet`. `05_analytical_dataset.py`: ANTI JOIN on `hospitalization_id` only (hosp-level). |
 
 
 ### Encounter Stitching
@@ -111,8 +111,8 @@ Master tracker for all analytical definitions and their implementation status.
 
 | formula                                                  | conversion factor                   | status      | code reference                      |
 | -------------------------------------------------------- | ----------------------------------- | ----------- | ----------------------------------- |
-| fentanyl_eq (mcg) = hydromorphone_mg × 50 + fentanyl_mcg | 2mg hydromorphone = 100mcg fentanyl | DONE        | `sedation_sbt.py` line 1204         |
-| midazolam_eq (mg) = lorazepam_mg × 2 + midazolam_mg      | 1mg midazolam = 0.5mg lorazepam     | DONE        | `sedation_sbt.py` line 1203         |
+| fenteq (mcg) = hydromorphone_mg × 50 + fentanyl_mcg | 2mg hydromorphone = 100mcg fentanyl | DONE        | `sedation_sbt.py` line 1204         |
+| midazeq (mg) = lorazepam_mg × 2 + midazolam_mg      | 1mg midazolam = 0.5mg lorazepam     | DONE        | `sedation_sbt.py` line 1203         |
 | morphine equivalency: 10mg morphine = 100mcg fentanyl    | —                                   | NOT_TRACKED | morphine not loaded as a medication |
 
 
@@ -121,8 +121,8 @@ Master tracker for all analytical definitions and their implementation status.
 
 | spec                                                                                                 | status | code reference                                                                                   |
 | ---------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------ |
-| Sum hourly doses by `(hospitalization_id, _nth_day, _shift)` for propofol, fentanyl_eq, midazolam_eq | DONE   | `sedation_sbt.py` lines 1377-1405: `sed_dose_agg` → `sed_dose_daily` via pandas pivot            |
-| Exposure variable: `diff = night - day` for each drug class                                          | DONE   | `sedation_sbt.py` lines 1450-1452: `propofol_diff`, `fentanyl_eq_diff`, `midazolam_eq_diff`      |
+| Sum hourly doses by `(hospitalization_id, _nth_day, _shift)` for propofol, fenteq, midazeq | DONE   | `sedation_sbt.py` lines 1377-1405: `sed_dose_agg` → `sed_dose_daily` via pandas pivot            |
+| Exposure variable: `diff = night - day` for each drug class                                          | DONE   | `sedation_sbt.py` lines 1450-1452: `prop_dif`, `fenteq_dif`, `midazeq_diff`      |
 | Weight-adjusted propofol (mcg/kg/min × weight × time)                                                | FUTURE | Original plan specifies weight-adjusted; code uses absolute mg. Abstract reports in 100mg units. |
 
 
@@ -140,7 +140,7 @@ Master tracker for all analytical definitions and their implementation status.
 | P/F ratio                           | `po2_arterial / fio2_set`. ASOF LEFT JOIN on resp + labs. Categorized: `pf_lt100`, `pf_100_200`, `pf_200_300`, `pf_ge300`, `missing`                                                                 | DONE   | `sedation_sbt.py` lines 724-752              |
 | Norepinephrine equivalent (NEE)     | Formula: `NE + epi + phenylephrine/10 + dopamine/100 + vasopressin×2.5 + angiotensin×10` (all in mcg/kg/min except vasopressin in u/min). ASOF LEFT JOIN per vasopressor.                            | DONE   | `sedation_sbt.py` lines 862-936              |
 | Covariates sampled at shift changes | pH, P/F, NEE measured at 7am and 7pm (`ph_level_7am/7pm`, `pf_level_7am/7pm`, `nee_7am/7pm`)                                                                                                         | DONE   | `sedation_sbt.py` lines 953-990              |
-| Daytime sedation doses              | `_propofol_day`, `_fentanyl_eq_day`, `_midazolam_eq_day` included as regression covariates                                                                                                           | DONE   | `sedation_sbt.py` lines 1444-1449, 1616-1617 |
+| Daytime sedation doses              | `_prop_day`, `_fenteq_day`, `_midazeq_day` included as regression covariates                                                                                                           | DONE   | `sedation_sbt.py` lines 1444-1449, 1616-1617 |
 
 ### Planned but Not Yet Implemented
 
@@ -182,7 +182,7 @@ Master tracker for all analytical definitions and their implementation status.
 
 | spec                                                                                                                                          | status | code reference                  |
 | --------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------- |
-| SBT state: `mode_category IN ('pressure support/cpap') AND peep_set <= 8 AND pressure_support_set <= 8`, OR T-piece (regex: `t1[\s_-]?piece`) | DONE   | `sbt.sql` lines 16-19           |
+| SBT state: `mode_category IN ('pressure support/cpap') AND peep_set <= 8 AND pressure_support_set <= 8`, OR T-piece (regex: `t[\s_-]?piece`) | DONE   | `sbt.sql` lines 16-19           |
 | Gaps-and-islands to identify contiguous SBT blocks (`_block_id` via cumsum of `_chg_sbt_state`)                                               | DONE   | `sbt.sql` lines 36-57           |
 | SBT duration: block end = start of next block or last observed time; `_duration_mins = date_diff('minute', _start_dttm, _end_dttm)`           | DONE   | `sbt.sql` lines 94-101          |
 | `sbt_done = 1` if block duration >= 30 minutes AND `_sbt_state = 1`                                                                           | DONE   | `sbt.sql` lines 125-128         |
@@ -266,11 +266,11 @@ Intentionally pivoted to extubation success for the abstract. Documented here fo
 
 | analysis                                                                                                                                                                                                                                                                       | status | code reference                                         |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------ | ------------------------------------------------------ |
-| GEE: `sbt_done_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff + _propofol_day + _midazolam_eq_day + _fentanyl_eq_day + ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age`, groups = `hospitalization_id`, family = Binomial | DONE   | `sedation_sbt.py` lines 1611-1631                      |
+| GEE: `sbt_done_next_day ~ prop_dif + fenteq_dif + midazeq_diff + _prop_day + _midazeq_day + _fenteq_day + ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age`, groups = `hospitalization_id`, family = Binomial | DONE   | `sedation_sbt.py` lines 1611-1631                      |
 | Logistic regression with clustered SEs: `success_extub_next_day ~ [same formula]`, clustered by `hospitalization_id`                                                                                                                                                           | DONE   | `sedation_sbt.py` lines 1634-1653                      |
 | TableOne: overall (day 1 characteristics)                                                                                                                                                                                                                                      | DONE   | `sedation_sbt.py` lines 1556-1562                      |
 | TableOne: by shift (day vs night comparison)                                                                                                                                                                                                                                   | DONE   | `sedation_sbt.py` lines 1573-1580                      |
-| Day vs night t-tests (Welch's) on propofol, fentanyl_eq, midazolam_eq                                                                                                                                                                                                          | DONE   | `sedation_sbt.py` lines 1242-1262                      |
+| Day vs night t-tests (Welch's) on propofol, fenteq, midazeq                                                                                                                                                                                                          | DONE   | `sedation_sbt.py` lines 1242-1262                      |
 | Pairwise Pearson correlation matrix of continuous variables                                                                                                                                                                                                                    | DONE   | `sedation_sbt.py` lines 1591-1608                      |
 | Hourly sedation dose bar chart (reordered 7am-6am, with 7pm cutoff line)                                                                                                                                                                                                       | DONE   | `sedation_sbt.py` lines 1290-1366                      |
 | Meta-analysis across sites: DerSimonian-Laird random-effects                                                                                                                                                                                                                   | DONE   | per ATS abstract; implemented in `meta_analysis.ipynb` |
@@ -378,3 +378,66 @@ From prior studies (Mehta, Seymour, Wongtangman) and the original analysis plan.
 | D8  | Latent class analysis              | Identify distinct sedation practice phenotypes across institutions                                          | HIGH   |
 
 
+---
+
+## 9. Audit Remediation
+
+Tracker for resolving findings from the peer review code audit (`docs/code_audit.md`, 2026-03-31). Each row links to the audit finding ID for full details.
+
+**Status key:** `OPEN` = not started, `IN_PROGRESS` = actively being fixed, `FIXED` = code updated, `WONT_FIX` = accepted risk (with rationale), `DEFERRED` = postponed to future work
+
+### Critical
+
+| ID | finding | files | status | resolution notes |
+|----|---------|-------|--------|------------------|
+| C1 | T-piece regex has stray `1` — misses real T-piece devices | `03_outcomes.py:185`, `analysis_plan.md:185` | FIXED | Removed `1` from regex, added case-insensitive flag `'i'`. Spec updated in §5. |
+| C2 | `mode_category` case mismatch with CLIF mCIDE (`'pressure support/cpap'` vs `'Pressure Support/CPAP'`) | `03_outcomes.py:184` | WONT_FIX | clifpy waterfall processing lowercases all mode_category values; no mismatch in practice |
+| C3 | Column name mismatch: `_success_extub` vs `success_extub`; stale `n_hrs` reference | `03_outcomes.py:409`, `05_analytical_dataset.py:118-120` | FIXED | 05 now correctly references `o._success_extub`; `n_hrs` removed from SELECT |
+| C4 | Vasopressor ASOF join has no staleness window (pH has 12h, vasopressors have none) | `04_covariates.py:360-405` | WONT_FIX | Intentional — ICU vasopressor infusions run for days; ASOF carry-forward reflects clinical reality |
+| C5 | P/F ratio ASOF join has no staleness window (inconsistent with pH) | `04_covariates.py:206-233` | DEFERRED | Add to sensitivity analysis (similar to SOFA2 approach); not blocking for current analysis |
+
+### High
+
+| ID | finding | files | status | resolution notes |
+|----|---------|-------|--------|------------------|
+| H1 | Continuous dose forward-fill persists past infusion stop if stop event has non-zero dose | `02_exposure.py:189-195` | FIXED | Enforced `med_dose = 0` for `mar_action_category IN ('stop', 'not_given')` in continuous pivot step, matching intermittent pattern |
+| H2 | FULL JOIN introduces out-of-window medication events | `02_exposure.py:212-225` | OPEN | Change to LEFT JOIN |
+| H3 | NMB duration = inter-admin interval, not pharmacological effect | `01_cohort.py:368-414` | OPEN | Review whether NMB is mostly continuous (OK) or bolus (needs fix) |
+| H4 | NULL PEEP/PS silently excludes valid SBTs | `03_outcomes.py:183-187` | OPEN | Add COALESCE or explicit NULL handling |
+| H5 | Failed extubation check doesn't exclude tracheostomy transitions (diverges from spec) | `03_outcomes.py:235-242` | OPEN | Add `AND tracheostomy = 0` to EXISTS subquery |
+| H6 | Table 1 describes Day 1 only; models use all patient-days | `06_table1.py:96-103` | OPEN | Add full-population Table 1 or report day distribution |
+| H7 | T-test on hourly data violates independence | `07_analysis.py:104-121` | OPEN | Aggregate to patient-day level before t-test |
+
+### Medium
+
+| ID | finding | files | status | resolution notes |
+|----|---------|-------|--------|------------------|
+| M1 | Partial-day bias in dose measurement (Day 1 may have unequal shift hours) | `05_analytical_dataset.py:158` | OPEN | Normalize by hours observed or exclude partial days |
+| M2 | `COALESCE(dose, 0)` conflates no-drug with not-observed | `05_analytical_dataset.py:123-128` | OPEN | Distinguish true zeros from structural missingness |
+| M3 | Missing key covariates (sex, SOFA, RASS, Charlson, ICU type) | `05_analytical_dataset.py:133` | OPEN | Overlaps with §8 items A6, A7, A9. Prioritize sex + SOFA. |
+| M4 | Inconsistent GEE vs logit modeling across outcomes | `07_analysis.py:230-274` | OPEN | Use GEE for both; see audit discussion |
+| M5 | GEE working correlation structure unspecified (defaults to independence) | `07_analysis.py:238` | OPEN | Specify exchangeable; report QIC comparison |
+| M6 | Categorical covariate reference levels uncontrolled | `07_analysis.py:234-236` | OPEN | Set explicit reference levels (e.g. `ph_73_74`, `pf_200_300`) |
+| M7 | Venous pH +0.05 adjustment uncited | `04_covariates.py:151` | OPEN | Add citation; consider sensitivity analysis |
+| M8 | Encounter stitching computed but unused | `01_cohort.py:106-111` | OPEN | Overlaps with §8 item B1. Decide: wire in or remove. |
+| M9 | `_end_mode` computed same as `_start_mode` (identical ORDER BY) | `03_outcomes.py:264-265` | OPEN | Fix ORDER BY or remove unused column |
+
+### Low
+
+| ID | finding | files | status | resolution notes |
+|----|---------|-------|--------|------------------|
+| L1 | CONSORT flow incomplete (missing downstream exclusions) | `01_cohort.py:441-464` | OPEN | Add steps for null-age, day-0, null-outcome exclusions |
+| L2 | Typo `_withdrawl_lst` throughout | `03_outcomes.py`, `05_analytical_dataset.py` | OPEN | Rename to `_withdrawal_lst` |
+| L3 | Dexmedetomidine/ketamine excluded without justification | `analysis_plan.md:73-74` | OPEN | Document rationale in manuscript methods |
+| L4 | Morphine not in fentanyl equivalency | `analysis_plan.md:75, 116` | OPEN | Overlaps with §8 item A5. Add morphine or report prevalence. |
+| L5 | No sensitivity analyses on key thresholds (24h IMV, 60min NMB, 30min SBT) | — | OPEN | Add at least one SA (e.g. SBT >= 20min or >= 45min) |
+| L6 | Hourly grid extends 1 hour past IMV streak end | `01_cohort.py:310` | OPEN | Remove `+ INTERVAL '1 hour'` or document rationale |
+
+### Plan-vs-Code Concordance
+
+| item | source | status | resolution notes |
+|------|--------|--------|------------------|
+| Bolus inclusion contradicts "continuous drip only" spec | `Sedative Exposure Plan.md:59` | OPEN | Document as intentional scope expansion or revert |
+| Analysis design changed from hour-24/72 to daily aggregation | `Sedative Exposure Plan.md:81-84` | OPEN | Document when/why the pivot was made |
+| `analysis_plan.md` line references stale (point to old `sedation_sbt.py`) | `analysis_plan.md` throughout | OPEN | Update all code references to `01_cohort.py`–`07_analysis.py` |
+| Competing risks not addressed for extubation outcome | `code_audit.md` concordance | OPEN | Overlaps with §8 item D6. Discuss in limitations at minimum. |
