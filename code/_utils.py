@@ -2,6 +2,7 @@
 
 import duckdb
 import pandas as pd
+from pathlib import Path
 
 
 def add_day_shift_id(
@@ -77,3 +78,118 @@ def remove_meds_duplicates(meds_df: pd.DataFrame) -> pd.DataFrame:
         ORDER BY hospitalization_id, med_category, admin_dttm;
         """
     return duckdb.sql(_q).to_df()
+
+
+def consort_to_markdown(consort_json: dict) -> str:
+    """Convert a CONSORT flow JSON to a markdown table.
+
+    Expected JSON structure:
+        {"site": "...", "steps": [{"step": N, "description": "...", "n_remaining": N, ...}, ...]}
+    """
+    rows = []
+    rows.append("| Step | Description | Remaining | Excluded | Reason |")
+    rows.append("|------|-------------|-----------|----------|--------|")
+    for s in consort_json["steps"]:
+        n_remaining = f"{s.get('n_remaining', ''):,}" if 'n_remaining' in s else ""
+        n_excluded = f"{s.get('n_excluded', ''):,}" if 'n_excluded' in s else ""
+        if 'n_patient_days_excluded' in s:
+            n_excluded = f"{s['n_patient_days_excluded']:,} patient-days ({s.get('n_hospitalizations_affected', '?')} hosp)"
+        reason = s.get("exclusion_reason", "")
+        rows.append(f"| {s['step']} | {s['description']} | {n_remaining} | {n_excluded} | {reason} |")
+    return "\n".join(rows)
+
+
+def plot_consort(consort_json: dict, output_path: Path) -> None:
+    """Draw a vertical CONSORT flowchart and save as PNG.
+
+    Expected JSON structure:
+        {"site": "...", "steps": [{"step": N, "description": "...", "n_remaining": N,
+         "n_excluded": N, "exclusion_reason": "..."}, ...]}
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    steps = consort_json["steps"]
+    n_steps = len(steps)
+    fig_height = max(8, n_steps * 2.0)
+    fig, ax = plt.subplots(figsize=(14, fig_height))
+    fig.patch.set_facecolor("#000000")
+    ax.set_facecolor("#000000")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    main_x = 0.38
+    excl_x = 0.78
+    box_w = 0.32
+    box_h = 0.055
+    y_top = 0.92
+    y_bottom = 0.05
+    y_spacing = (y_top - y_bottom) / max(n_steps - 1, 1)
+
+    main_color = "#2d6a4f"
+    main_edge = "#40916c"
+    excl_color = "#9b2226"
+    excl_edge = "#c1121f"
+    start_color = "#1d3557"
+    start_edge = "#457b9d"
+    arrow_color = "#aaaaaa"
+    text_color = "#ffffff"
+
+    def draw_box(x_center, y_center, w, h, text, facecolor, edgecolor, fontsize=8):
+        x0 = x_center - w / 2
+        y0 = y_center - h / 2
+        box = mpatches.FancyBboxPatch(
+            (x0, y0), w, h,
+            boxstyle="round,pad=0.008",
+            facecolor=facecolor, edgecolor=edgecolor, linewidth=1.5,
+        )
+        ax.add_patch(box)
+        ax.text(x_center, y_center, text, ha="center", va="center",
+                fontsize=fontsize, fontweight="bold", color=text_color, wrap=True)
+
+    def draw_arrow(x0, y0, x1, y1):
+        ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                    arrowprops=dict(arrowstyle="-|>", color=arrow_color, lw=1.5, mutation_scale=12))
+
+    def _fmt(n):
+        return f"{n:,}" if isinstance(n, (int, float)) else str(n)
+
+    # Step 0
+    s0 = steps[0]
+    y0 = y_top
+    draw_box(main_x, y0, box_w, box_h,
+             f"{s0['description']}\n(n = {_fmt(s0.get('n_remaining', '?'))})",
+             start_color, start_edge, fontsize=9)
+    prev_y = y0
+
+    # Steps 1+
+    for i, s in enumerate(steps[1:], start=1):
+        y = y_top - i * y_spacing
+        draw_arrow(main_x, prev_y - box_h / 2, main_x, y + box_h / 2)
+
+        n_rem = s.get('n_remaining')
+        rem_label = f"\n(n = {_fmt(n_rem)})" if n_rem is not None else ""
+        draw_box(main_x, y, box_w, box_h,
+                 f"{s['description']}{rem_label}",
+                 main_color, main_edge)
+
+        n_excl = s.get('n_excluded', s.get('n_patient_days_excluded'))
+        reason = s.get('exclusion_reason', '')
+        if n_excl is not None:
+            excl_y = (prev_y + y) / 2
+            draw_arrow(main_x + box_w / 2, excl_y, excl_x - box_w / 2, excl_y)
+            excl_label = "patient-days" if 'n_patient_days_excluded' in s else ""
+            draw_box(excl_x, excl_y, box_w, box_h,
+                     f"Excluded: {reason}\n(n = {_fmt(n_excl)} {excl_label})",
+                     excl_color, excl_edge)
+
+        prev_y = y
+
+    site = consort_json.get("site", "")
+    if site:
+        ax.text(0.5, 0.99, f"CONSORT — {site}", ha="center", va="top",
+                fontsize=12, fontweight="bold", color=text_color, transform=ax.transAxes)
+
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight", facecolor="#000000")
+    plt.close(fig)

@@ -54,6 +54,7 @@ def _():
         CONFIG_PATH,
         apply_outlier_handling,
         convert_dose_units_by_med_category,
+        duckdb,
         get_config_or_params,
         pd,
         remove_meds_duplicates,
@@ -91,13 +92,10 @@ def _(cohort_hrly_grids):
 
 @app.cell
 def _(SITE_NAME, pd):
-    resp_processed_path = f"output/intermediate/{SITE_NAME}_resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}_resp_processed_bf.parquet"
     resp_p = pd.read_parquet(resp_processed_path)
     print(f"resp_p: {len(resp_p)} rows (from {resp_processed_path})")
     return (resp_p,)
-
-
-# ── pH ──────────────────────────────────────────────────────────────────
 
 
 @app.cell(hide_code=True)
@@ -163,11 +161,13 @@ def _(cohort_shift_change_grids, labs_w):
         ORDER BY g.hospitalization_id, g.event_dttm
         """
     )
-    assert len(ph_df) == len(cohort_shift_change_grids), 'ph_df length altered by ASOF join'
     return (ph_df,)
 
 
-# ── P/F Ratio ───────────────────────────────────────────────────────────
+@app.cell
+def _(cohort_shift_change_grids, ph_df):
+    assert len(ph_df) == len(cohort_shift_change_grids), 'ph_df length altered by ASOF join'
+    return
 
 
 @app.cell(hide_code=True)
@@ -232,9 +232,6 @@ def _(cohort_shift_change_grids, po2_w, resp_p):
         """
     )
     return (pf_df,)
-
-
-# ── Vasopressors ────────────────────────────────────────────────────────
 
 
 @app.cell(hide_code=True)
@@ -406,7 +403,91 @@ def _(cohort_shift_change_grids, cont_veso_converted):
     return (vaso_df,)
 
 
-# ── Merge Covariates ────────────────────────────────────────────────────
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Daily SOFA
+
+    Computes daily SOFA scores using `compute_sofa_polars` (local copy of pyCLIF).
+    Creates per-day observation windows from hourly grids, then aggregates
+    worst values within each window to produce 6 subscores + total.
+    """)
+    return
+
+
+@app.cell
+def _():
+    import polars as pl
+
+    _grids = pl.read_parquet("output/cohort_hrly_grids.parquet")
+    sofa_cohort = (
+        _grids
+        .group_by(['hospitalization_id', '_nth_day'])
+        .agg([
+            pl.col('event_dttm').min().alias('start_dttm'),
+            pl.col('event_dttm').max().alias('end_dttm'),
+        ])
+        .with_columns(
+            patient_day_id=pl.concat_str([
+                pl.col('hospitalization_id'),
+                pl.lit('__'),
+                pl.col('_nth_day').cast(pl.Utf8),
+            ])
+        )
+    )
+    print(f"SOFA cohort: {sofa_cohort.height} patient-days")
+    return (sofa_cohort,)
+
+
+@app.cell
+def _(CONFIG_PATH, get_config_or_params, sofa_cohort):
+    from _sofa import compute_sofa_polars
+
+    _cfg = get_config_or_params(CONFIG_PATH)
+    sofa_raw = compute_sofa_polars(
+        data_directory=_cfg['data_directory'],
+        cohort_df=sofa_cohort,
+        filetype=_cfg.get('filetype', 'parquet'),
+        id_name='patient_day_id',
+        timezone=_cfg.get('timezone'),
+    )
+    print(f"SOFA raw: {sofa_raw.height} rows, {sofa_raw.width} columns")
+    return (sofa_raw,)
+
+
+@app.cell
+def _(sofa_raw):
+    import polars as _pl
+
+    sofa_daily = sofa_raw.with_columns(
+        [
+            _pl.col("patient_day_id")
+            .str.split("__")
+            .list.get(0)
+            .alias("hospitalization_id"),
+            _pl.col("patient_day_id")
+            .str.split("__")
+            .list.get(1)
+            .cast(_pl.Float64)
+            .cast(_pl.Int64)
+            .alias("_nth_day"),
+        ]
+    ).select(
+        [
+            "hospitalization_id",
+            "_nth_day",
+            "sofa_total",
+            "sofa_cv_97",
+            "sofa_coag",
+            "sofa_liver",
+            "sofa_resp",
+            "sofa_cns",
+            "sofa_renal",
+        ]
+    )
+    sofa_daily.to_pandas().to_parquet("output/sofa_daily.parquet")
+    print(f"Saved: output/sofa_daily.parquet ({sofa_daily.height} patient-days)")
+    return
 
 
 @app.cell(hide_code=True)
@@ -463,7 +544,38 @@ def _(covs):
     return (covs_daily,)
 
 
-# ── Save ────────────────────────────────────────────────────────────────
+# ── Comorbidity Indices ────────────────────────────────────────────────
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Comorbidity Indices (CCI & Elixhauser)
+    """)
+    return
+
+
+@app.cell
+def _(CONFIG_PATH, cohort_hosp_ids):
+    from clifpy import HospitalDiagnosis
+    from clifpy.utils import calculate_cci
+    from clifpy.utils.comorbidity import calculate_elix
+
+    _dx = HospitalDiagnosis.from_file(
+        config_path=CONFIG_PATH,
+        filters={'hospitalization_id': cohort_hosp_ids},
+    )
+    cci_df = calculate_cci(_dx, hierarchy=True)
+    elix_df = calculate_elix(_dx, hierarchy=True)
+    print(f"CCI: {len(cci_df)} rows, Elixhauser: {len(elix_df)} rows")
+
+    cci_df.to_parquet("output/cci.parquet", index=False)
+    elix_df.to_parquet("output/elix.parquet", index=False)
+    print("Saved: output/cci.parquet, output/elix.parquet")
+    return
+
+
+# ── Save ───────────────────────────────────────────────────────────────
 
 
 @app.cell(hide_code=True)

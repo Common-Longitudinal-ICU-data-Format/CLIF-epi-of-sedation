@@ -4,7 +4,6 @@
 #     "marimo",
 #     "duckdb>=1.4.1",
 #     "pandas>=2.3.1",
-#     "statsmodels>=0.14.5",
 #     "scipy",
 #     "matplotlib",
 #     "seaborn",
@@ -28,9 +27,9 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    # 07 Analysis
+    # 07 Descriptive Analysis
 
-    GEE, logistic regression, correlation matrix, and visualizations.
+    Correlation matrix, day-vs-night t-tests, and hourly dose visualizations.
     """)
     return
 
@@ -76,7 +75,8 @@ def _(SITE_NAME, cohort_merged_final):
     import matplotlib.pyplot as _plt
     import seaborn as _sns
     continuous_vars = [
-        'age', 'propofol_diff', 'fentanyl_eq_diff', 'midazolam_eq_diff',
+        'age', '_nth_day', 'sofa_total', 'cci_score', 'elix_score',
+        'propofol_diff', 'fentanyl_eq_diff', 'midazolam_eq_diff',
         '_propofol_day', '_propofol_night', '_fentanyl_eq_day', '_fentanyl_eq_night',
         '_midazolam_eq_day', '_midazolam_eq_night', 'nee_7am', 'nee_7pm',
         '_ph_7am', '_ph_7pm', '_pf_7am', '_pf_7pm',
@@ -216,61 +216,6 @@ def _(SITE_NAME, sed_dose_by_hr_of_day):
     plt.savefig('output_to_share/figures/sed_dose_by_hr_of_day.png', bbox_inches='tight')
     print("Saved output_to_share/figures/sed_dose_by_hr_of_day.png")
     fig
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## GEE: SBT Done Next Day
-    """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_final, pd):
-    import statsmodels.formula.api as _smf
-    import statsmodels.api as _sm
-    sbt_done_formula = """sbt_done_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
-    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +
-    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age
-    """
-    gee_model = _smf.gee(formula=sbt_done_formula, groups='hospitalization_id', data=cohort_merged_final, family=_sm.families.Binomial())
-    gee_result = gee_model.fit()
-    print(gee_result.summary())
-    _summary_df = gee_result.summary().tables[1]
-    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv('output_to_share/gee_summary.csv', index=False)
-    _cov_matrix = gee_result.cov_params()
-    _cov_matrix.to_csv('output_to_share/gee_covmat.csv')
-    print("Saved output_to_share/gee_summary.csv, gee_covmat.csv")
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## Logistic Regression: Successful Extubation Next Day
-    """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_final, pd):
-    import statsmodels.formula.api as _smf
-    success_extub_formula = """success_extub_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
-    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +
-    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm + age
-    """
-    logit_model = _smf.logit(formula=success_extub_formula, data=cohort_merged_final)
-    logit_result = logit_model.fit(cov_type='cluster', cov_kwds={'groups': cohort_merged_final['hospitalization_id']})
-    print(logit_result.summary())
-    _summary_df = logit_result.summary().tables[1]
-    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv('output_to_share/logit_summary.csv', index=False)
-    _cov_matrix = logit_result.cov_params()
-    _cov_matrix.to_csv('output_to_share/logit_covmat.csv')
-    print("Saved output_to_share/logit_summary.csv, logit_covmat.csv")
     return
 
 

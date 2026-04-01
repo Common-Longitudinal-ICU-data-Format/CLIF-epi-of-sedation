@@ -156,8 +156,8 @@ def _(SITE_NAME, cohort_merged_for_t1, tableone):
     _df = cohort_merged_for_t1.df()
     outcome_vars = ['_sbt_done_today', '_success_extub_today']
     diff_doses = ['propofol_diff', 'fentanyl_eq_diff', 'midazolam_eq_diff']
-    _cont_vars = ['age'] + diff_doses
-    _cat_vars = outcome_vars
+    _cont_vars = ['age', 'sofa_total', 'cci_score'] + diff_doses
+    _cat_vars = outcome_vars + ['sex_category', 'icu_type']
     table1_overall = tableone.TableOne(data=_df, continuous=_cont_vars, categorical=_cat_vars)
     table1_overall.to_csv('output_to_share/table1.csv')
     print("Saved output_to_share/table1.csv")

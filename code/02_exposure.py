@@ -18,7 +18,7 @@ with app.setup:
     import os
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
+    # sys.path.insert(0, str(Path(__file__).parent))
 
 
 @app.cell(hide_code=True)
@@ -65,7 +65,7 @@ def _(CONFIG_PATH, get_config_or_params):
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     print(f"Site: {SITE_NAME}")
-    return (SITE_NAME,)
+    return
 
 
 @app.cell
@@ -80,9 +80,6 @@ def _(cohort_hrly_grids_f):
     cohort_hosp_ids = cohort_hrly_grids_f['hospitalization_id'].unique().tolist()
     print(f"Cohort hospitalizations: {len(cohort_hosp_ids)}")
     return (cohort_hosp_ids,)
-
-
-# --- Continuous Sedation ---
 
 
 @app.cell(hide_code=True)
@@ -186,7 +183,7 @@ def _(apply_outlier_handling, cont_sed):
 
 
 @app.cell
-def _(cont_sed_converted):
+def _(cont_sed_converted, t1, t2):
     cont_sed_w = mo.sql(
         f"""
         -- Pivot continuous sedation to wide format (one column per drug_unit)
@@ -294,9 +291,6 @@ def _(cont_sed_t3, duckdb):
     return (cont_sed_dose_by_hr,)
 
 
-# --- Intermittent Sedation ---
-
-
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -371,7 +365,7 @@ def _(
 
 
 @app.cell
-def _(intm_sed_converted):
+def _(intm_sed_converted, t1, t2):
     intm_sed_w = mo.sql(
         f"""
         -- Pivot intermittent sedation to wide format; zero out not_given doses
@@ -425,9 +419,6 @@ def _(duckdb, intm_sed_wg):
     return (intm_sed_dose_by_hr,)
 
 
-# --- Merge Continuous + Intermittent ---
-
-
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -465,9 +456,6 @@ def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
         """
     )
     return (sed_dose_by_hr,)
-
-
-# --- Daily Aggregation ---
 
 
 @app.cell(hide_code=True)
@@ -519,9 +507,6 @@ def _(sed_dose_agg):
     sed_dose_daily = sed_dose_daily.loc[:, [c for c in sed_dose_daily.columns if c is not None]]
     print(f"sed_dose_daily rows: {len(sed_dose_daily)}")
     return (sed_dose_daily,)
-
-
-# --- Save Outputs ---
 
 
 @app.cell(hide_code=True)

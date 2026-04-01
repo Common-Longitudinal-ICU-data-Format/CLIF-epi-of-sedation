@@ -35,7 +35,6 @@ def _():
 
 @app.cell
 def _():
-    from clifpy import ClifOrchestrator
     from clifpy.utils.config import get_config_or_params
     import pandas as pd
     import duckdb
@@ -44,10 +43,9 @@ def _():
     warnings.filterwarnings('ignore', category=FutureWarning)
 
     CONFIG_PATH = "config/config.json"
-    co = ClifOrchestrator(config_path=CONFIG_PATH)
 
     os.makedirs("output", exist_ok=True)
-    return CONFIG_PATH, co, get_config_or_params, pd
+    return CONFIG_PATH, get_config_or_params, pd
 
 
 @app.cell
@@ -68,7 +66,7 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    resp_processed_path = f"output/intermediate/{SITE_NAME}_resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}_resp_processed_bf.parquet"
     assert os.path.exists(resp_processed_path), (
         f"Missing {resp_processed_path} — run 01_cohort.py first"
     )
@@ -144,9 +142,10 @@ def _(CONFIG_PATH, hosp):
 
 
 @app.cell
-def _(co, pd):
+def _(CONFIG_PATH, get_config_or_params, pd):
     # Compute last vitals datetime per hospitalization
-    _vitals_path = co.tables_metadata['vitals']['path']
+    _cfg = get_config_or_params(CONFIG_PATH)
+    _vitals_path = f"{_cfg['data_directory']}/clif_vitals.{_cfg.get('filetype', 'parquet')}"
     _vitals = pd.read_parquet(
         _vitals_path,
         columns=['hospitalization_id', 'recorded_dttm'],

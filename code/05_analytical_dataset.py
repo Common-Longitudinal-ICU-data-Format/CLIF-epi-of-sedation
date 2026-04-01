@@ -44,7 +44,7 @@ def _():
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     print(f"Site: {SITE_NAME}")
-    return CONFIG_PATH, SITE_NAME, apply_outlier_handling, duckdb, pd
+    return CONFIG_PATH, apply_outlier_handling, pd
 
 
 @app.cell(hide_code=True)
@@ -96,6 +96,28 @@ def _(CONFIG_PATH, apply_outlier_handling):
     return (hosp_df,)
 
 
+@app.cell
+def _(CONFIG_PATH):
+    from clifpy import Patient
+    _patient = Patient.from_file(
+        config_path=CONFIG_PATH,
+        columns=['patient_id', 'sex_category'],
+    )
+    patient_df = _patient.df
+    print(f"patient_df: {len(patient_df)} rows")
+    return (patient_df,)
+
+
+@app.cell
+def _(pd):
+    sofa_daily = pd.read_parquet("output/sofa_daily.parquet")
+    icu_type_df = pd.read_parquet("output/icu_type.parquet")
+    cci_df = pd.read_parquet("output/cci.parquet")
+    elix_df = pd.read_parquet("output/elix.parquet")
+    print(f"sofa_daily: {len(sofa_daily)}, icu_type: {len(icu_type_df)}, cci: {len(cci_df)}, elix: {len(elix_df)}")
+    return cci_df, elix_df, icu_type_df, sofa_daily
+
+
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -105,7 +127,17 @@ def _():
 
 
 @app.cell
-def _(sbt_outcomes_daily, sed_dose_daily, covs_daily, hosp_df):
+def _(
+    cci_df,
+    covs_daily,
+    elix_df,
+    hosp_df,
+    icu_type_df,
+    patient_df,
+    sbt_outcomes_daily,
+    sed_dose_daily,
+    sofa_daily,
+):
     cohort_merged = mo.sql(
         f"""
         -- Merge all intermediate outputs into analytical dataset
@@ -113,13 +145,17 @@ def _(sbt_outcomes_daily, sed_dose_daily, covs_daily, hosp_df):
         LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
         LEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)
         LEFT JOIN hosp_df h USING (hospitalization_id)
+        LEFT JOIN patient_df p USING (patient_id)
+        LEFT JOIN icu_type_df i USING (hospitalization_id)
+        LEFT JOIN sofa_daily sf USING (hospitalization_id, _nth_day)
+        LEFT JOIN cci_df cc USING (hospitalization_id)
+        LEFT JOIN elix_df ex USING (hospitalization_id)
         SELECT o.hospitalization_id
         , o._nth_day
-        , o.n_hrs
         , _sbt_done_today: o.sbt_done
-        , _success_extub_today: o.success_extub
+        , _success_extub_today: o._success_extub
         , sbt_done_next_day: LEAD(o.sbt_done) OVER w
-        , success_extub_next_day: LEAD(o.success_extub) OVER w
+        , success_extub_next_day: LEAD(o._success_extub) OVER w
         , _propofol_day: COALESCE(s.propofol_day, 0)
         , _propofol_night: COALESCE(s.propofol_night, 0)
         , _fentanyl_eq_day: COALESCE(s.fentanyl_eq_day, 0)
@@ -131,6 +167,11 @@ def _(sbt_outcomes_daily, sed_dose_daily, covs_daily, hosp_df):
         , midazolam_eq_diff: COALESCE(s.midazolam_eq_night, 0) - COALESCE(s.midazolam_eq_day, 0)
         , COLUMNS('(7am)|(7pm)')
         , age: h.age_at_admission
+        , p.sex_category
+        , i.icu_type
+        , sofa_total: COALESCE(sf.sofa_total,0)
+        , cci_score: COALESCE(cc.cci_score, 0)                                               
+        , elix_score: COALESCE(ex.elix_score, 0)  
         WINDOW w AS (PARTITION BY o.hospitalization_id ORDER BY o._nth_day)
         ORDER BY o.hospitalization_id, o._nth_day
         """
@@ -151,9 +192,12 @@ def _(cohort_merged):
 def _(cohort_merged_clean, nmb_excluded):
     cohort_merged_final = mo.sql(
         f"""
-        -- Exclude patient-days with >1 hour NMB + filter to valid rows
+        -- NOTE: Hospitalization-level NMB exclusion (exclude entire hosp if any day had >1h NMB).
+        -- Original spec was patient-day level; changed per PI — NMB patients are a distinct population.
+        -- To revert to patient-day exclusion, replace the ANTI JOIN with:
+        --   ANTI JOIN nmb_excluded USING (hospitalization_id, _nth_day)
         FROM cohort_merged_clean
-        ANTI JOIN nmb_excluded USING (hospitalization_id, _nth_day)
+        ANTI JOIN (SELECT DISTINCT hospitalization_id FROM nmb_excluded) USING (hospitalization_id)
         SELECT *
         WHERE _nth_day > 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL
         """

@@ -18,7 +18,7 @@ with app.setup:
     import os
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
+    # sys.path.insert(0, str(Path(__file__).parent))
     RERUN_WATERFALL = False
 
 
@@ -75,15 +75,16 @@ def _():
 
     adt = Adt.from_file(
         config_path='config/config.json',
-        columns=['hospitalization_id', 'in_dttm', 'out_dttm', 'location_category'],
+        columns=['hospitalization_id', 'in_dttm', 'out_dttm', 'location_category', 'location_type'],
         filters={
             'location_category': ['icu']
         }
     )
 
-    hosp_ids_w_icu_stays = adt.df['hospitalization_id'].unique().tolist()
+    adt_df = adt.df
+    hosp_ids_w_icu_stays = adt_df['hospitalization_id'].unique().tolist()
     print(f"Hospitalizations with ICU stays: {len(hosp_ids_w_icu_stays)}")
-    return Adt, Hospitalization, hosp_ids_w_icu_stays
+    return Adt, Hospitalization, adt_df, hosp_ids_w_icu_stays
 
 
 @app.cell
@@ -130,7 +131,7 @@ def _(
 ):
     from clifpy import RespiratorySupport
 
-    resp_processed_path = f"output/intermediate/{SITE_NAME}_resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}_resp_processed_bf.parquet"
 
     if not os.path.exists(resp_processed_path) or RERUN_WATERFALL:
         cohort_resp = RespiratorySupport.from_file(
@@ -284,10 +285,52 @@ def _(all_streaks_w_lead):
 
 
 @app.cell
-def _(cohort_imv_streaks):
+def _(all_streaks_w_lead, cohort_imv_streaks, hosp_ids_w_icu_stays):
+    import duckdb as _ddb
+
     cohort_hosp_ids = cohort_imv_streaks.df()['hospitalization_id'].unique().tolist()
+
+    # Intermediate CONSORT counts from all_streaks_w_lead
+    _streaks_df = all_streaks_w_lead.df()
+
+    _n_with_any_imv = _streaks_df.loc[_streaks_df['_on_imv'] == 1, 'hospitalization_id'].nunique()
+    _first_imv = _streaks_df[(_streaks_df['_streak_id'] == 1) & (_streaks_df['_on_imv'] == 1)]
+    _n_first_imv_lt24 = len(_first_imv[_first_imv['_at_least_24h'] == 0])
+    _n_trach_truncated = len(_first_imv[_first_imv['_trach_dttm'].notna() & (_first_imv['_at_least_24h'] == 0)])
+
+    consort_counts = {
+        'n_icu': len(hosp_ids_w_icu_stays),
+        'n_any_imv': _n_with_any_imv,
+        'n_no_imv': len(hosp_ids_w_icu_stays) - _n_with_any_imv,
+        'n_first_imv_ge24': len(cohort_hosp_ids),
+        'n_first_imv_lt24': _n_first_imv_lt24,
+        'n_trach_truncated': _n_trach_truncated,
+    }
     print(f"Cohort hospitalizations (first IMV ≥24h): {len(cohort_hosp_ids)}")
-    return (cohort_hosp_ids,)
+    print(f"  Excluded — no IMV: {consort_counts['n_no_imv']}")
+    print(f"  Excluded — first IMV <24h: {consort_counts['n_first_imv_lt24']} (of which {consort_counts['n_trach_truncated']} tracheostomy-truncated)")
+    return cohort_hosp_ids, consort_counts
+
+
+@app.cell
+def _(adt_df, cohort_hosp_ids):
+    icu_type_df = mo.sql(
+        f"""
+        -- First ICU type per cohort hospitalization (earliest ADT record)
+        FROM adt_df
+        SELECT hospitalization_id
+            , icu_type: FIRST(location_type ORDER BY in_dttm)
+        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+        GROUP BY hospitalization_id
+        """
+    )
+    return (icu_type_df,)
+
+
+@app.cell
+def _(icu_type_df):
+    print(f"ICU types extracted: {len(icu_type_df)} hospitalizations")
+    return
 
 
 @app.cell(hide_code=True)
@@ -428,7 +471,8 @@ def _(
     cohort_hosp_ids,
     cohort_hrly_grids_f,
     cohort_imv_streaks,
-    hosp_ids_w_icu_stays,
+    consort_counts,
+    icu_type_df,
     nmb_excluded_patient_days,
 ):
     import json
@@ -437,6 +481,7 @@ def _(
     _nmb_excluded_df = nmb_excluded_patient_days.df()
     _n_nmb_patient_days = len(_nmb_excluded_df)
     _n_nmb_hosp_ids = _nmb_excluded_df['hospitalization_id'].nunique() if len(_nmb_excluded_df) > 0 else 0
+    _cc = consort_counts
 
     consort_flow = {
         "site": SITE_NAME,
@@ -444,21 +489,28 @@ def _(
             {
                 "step": 1,
                 "description": "Hospitalizations with ICU stays",
-                "n_remaining": len(hosp_ids_w_icu_stays),
+                "n_remaining": _cc['n_icu'],
             },
             {
                 "step": 2,
-                "description": "First IMV streak >= 24 hours",
-                "n_remaining": len(cohort_hosp_ids),
-                "n_excluded": len(hosp_ids_w_icu_stays) - len(cohort_hosp_ids),
-                "exclusion_reason": "No IMV streak >= 24 hours",
+                "description": "With any invasive mechanical ventilation",
+                "n_remaining": _cc['n_any_imv'],
+                "n_excluded": _cc['n_no_imv'],
+                "exclusion_reason": "No IMV recorded",
             },
             {
                 "step": 3,
-                "description": "NMB exclusion (patient-days with >1h NMB)",
-                "n_patient_days_excluded": _n_nmb_patient_days,
-                "n_hospitalizations_affected": _n_nmb_hosp_ids,
-                "exclusion_reason": "Neuromuscular blockade >1 hour on patient-day",
+                "description": "First IMV streak >= 24 hours",
+                "n_remaining": _cc['n_first_imv_ge24'],
+                "n_excluded": _cc['n_first_imv_lt24'],
+                "exclusion_reason": f"First IMV streak <24h ({_cc['n_trach_truncated']} tracheostomy-truncated)",
+            },
+            {
+                "step": 4,
+                "description": "Exclude hospitalizations with any NMB >1h",
+                "n_remaining": _cc['n_first_imv_ge24'] - _n_nmb_hosp_ids,
+                "n_excluded": _n_nmb_hosp_ids,
+                "exclusion_reason": f"Any patient-day with NMB >1h ({_n_nmb_patient_days:,} patient-days across {_n_nmb_hosp_ids:,} hosp)",
             },
         ],
     }
@@ -471,10 +523,28 @@ def _(
     cohort_imv_streaks.df().to_parquet("output/cohort_imv_streaks.parquet")
     cohort_hrly_grids_f.to_parquet("output/cohort_hrly_grids.parquet")
     _nmb_excluded_df.to_parquet("output/nmb_excluded.parquet")
+    icu_type_df.df().to_parquet("output/icu_type.parquet")
 
     print(f"Saved: output/cohort_imv_streaks.parquet ({len(cohort_hosp_ids)} hospitalizations)")
     print(f"Saved: output/cohort_hrly_grids.parquet ({len(cohort_hrly_grids_f)} rows)")
     print(f"Saved: output/nmb_excluded.parquet ({_n_nmb_patient_days} patient-days)")
+    print(f"Saved: output/icu_type.parquet ({len(icu_type_df)} hospitalizations)")
+
+    # CONSORT flowchart PNG
+    from _utils import plot_consort
+    plot_consort(consort_flow, "output_to_share/consort_inclusion.png")
+    print("Saved: output_to_share/consort_inclusion.png")
+    return (consort_flow,)
+
+
+@app.cell
+def _(consort_flow):
+    from _utils import consort_to_markdown
+    mo.md(f"""
+    ## CONSORT Flow
+
+    {consort_to_markdown(consort_flow)}
+    """)
     return
 
 
