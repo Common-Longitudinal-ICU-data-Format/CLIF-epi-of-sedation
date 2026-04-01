@@ -448,9 +448,9 @@ def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
             , hydromorphone_mg_total: hydromorphone_mg_intm + hydromorphone_mg_min_cont
             , lorazepam_mg_total: lorazepam_mg_intm + lorazepam_mg_min_cont
             , midazolam_mg_total: midazolam_mg_intm + midazolam_mg_min_cont
-            , propofol_mg_total: propofol_mg_intm + propofol_mg_min_cont
-            , _midazolam_eq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
-            , _fentanyl_eq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
+            , prop_mg_total: propofol_mg_intm + propofol_mg_min_cont
+            , _midazeq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
+            , _fenteq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
         )
         SELECT * FROM t2 ORDER BY hospitalization_id, _dh
         """
@@ -476,9 +476,9 @@ def _(duckdb, sed_dose_by_hr):
         -- Aggregate dose totals per hospitalization, day, shift
         FROM sed_dose_by_hr
         SELECT hospitalization_id, _nth_day, _shift
-            , SUM(propofol_mg_total) AS propofol_mg_total
-            , SUM(_fentanyl_eq_mcg_total) AS fentanyl_eq_mcg_total
-            , SUM(_midazolam_eq_mg_total) AS midazolam_eq_mg_total
+            , SUM(prop_mg_total) AS prop_mg_total
+            , SUM(_fenteq_mcg_total) AS fenteq_mcg_total
+            , SUM(_midazeq_mg_total) AS midazeq_mg_total
         GROUP BY hospitalization_id, _nth_day, _shift
         ORDER BY hospitalization_id, _nth_day, _shift
         """
@@ -493,15 +493,15 @@ def _(sed_dose_agg):
     sed_dose_daily = sed_dose_agg.pivot(
         index=['hospitalization_id', '_nth_day'],
         columns='_shift',
-        values=['propofol_mg_total', 'fentanyl_eq_mcg_total', 'midazolam_eq_mg_total'],
+        values=['prop_mg_total', 'fenteq_mcg_total', 'midazeq_mg_total'],
     ).reset_index()
 
     # Flatten MultiIndex columns to clean names
     sed_dose_daily.columns = [
         'hospitalization_id', '_nth_day',
-        'propofol_day', 'propofol_night',
-        'fentanyl_eq_day', 'fentanyl_eq_night',
-        'midazolam_eq_day', 'midazolam_eq_night',
+        'prop_day', 'prop_night',
+        'fenteq_day', 'fenteq_night',
+        'midazeq_day', 'midazeq_night',
     ]
     # Drop any columns that ended up as None (e.g. if a shift is missing)
     sed_dose_daily = sed_dose_daily.loc[:, [c for c in sed_dose_daily.columns if c is not None]]

@@ -115,9 +115,9 @@ def _(cohort_merged_for_t1, covs_shift, hosp_df, sed_dose_agg):
         LEFT JOIN hosp_df h USING (hospitalization_id)
         SELECT g.hospitalization_id, g._nth_day
             , s._shift
-            , s.propofol_mg_total
-            , s.fentanyl_eq_mcg_total
-            , s.midazolam_eq_mg_total
+            , s.prop_mg_total
+            , s.fenteq_mcg_total
+            , s.midazeq_mg_total
             , h.patient_id
         )
         , t2 AS (
@@ -155,7 +155,7 @@ def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, pd):
 def _(SITE_NAME, cohort_merged_for_t1, tableone):
     _df = cohort_merged_for_t1.df()
     outcome_vars = ['_sbt_done_today', '_success_extub_today']
-    diff_doses = ['propofol_diff', 'fentanyl_eq_diff', 'midazolam_eq_diff']
+    diff_doses = ['prop_dif', 'fenteq_dif', 'midazeq_dif']
     _cont_vars = ['age', 'sofa_total', 'cci_score'] + diff_doses
     _cat_vars = outcome_vars + ['sex_category', 'icu_type']
     table1_overall = tableone.TableOne(data=_df, continuous=_cont_vars, categorical=_cat_vars)
@@ -175,7 +175,7 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, tableone):
     _df = cohort_merged_for_t1_w_by_shift.df()
-    sed_vars = ['propofol_mg_total', 'fentanyl_eq_mcg_total', 'midazolam_eq_mg_total']
+    sed_vars = ['prop_mg_total', 'fenteq_mcg_total', 'midazeq_mg_total']
     _cont_vars = sed_vars + ['ph', 'pf', '_nee']
     _cat_vars = ['ph_level', 'pf_level']
     table1_by_shift = tableone.TableOne(

@@ -76,9 +76,9 @@ def _(SITE_NAME, cohort_merged_final):
     import seaborn as _sns
     continuous_vars = [
         'age', '_nth_day', 'sofa_total', 'cci_score', 'elix_score',
-        'propofol_diff', 'fentanyl_eq_diff', 'midazolam_eq_diff',
-        '_propofol_day', '_propofol_night', '_fentanyl_eq_day', '_fentanyl_eq_night',
-        '_midazolam_eq_day', '_midazolam_eq_night', 'nee_7am', 'nee_7pm',
+        'prop_dif', 'fenteq_dif', 'midazeq_dif',
+        '_prop_day', '_prop_night', '_fenteq_day', '_fenteq_night',
+        '_midazeq_day', '_midazeq_night', 'nee_7am', 'nee_7pm',
         '_ph_7am', '_ph_7pm', '_pf_7am', '_pf_7pm',
     ]
     continuous_vars_df = cohort_merged_final[[col for col in continuous_vars if col in cohort_merged_final.columns]]
@@ -104,7 +104,7 @@ def _():
 @app.cell
 def _(SITE_NAME, pd, sed_dose_by_hr):
     import scipy.stats as stats
-    test_cols = ['propofol_mg_total', '_fentanyl_eq_mcg_total', '_midazolam_eq_mg_total']
+    test_cols = ['prop_mg_total', '_fenteq_mcg_total', '_midazeq_mg_total']
     shift_day = sed_dose_by_hr[sed_dose_by_hr['_shift'] == 'day']
     shift_night = sed_dose_by_hr[sed_dose_by_hr['_shift'] == 'night']
     t_pvals = {}
@@ -136,9 +136,9 @@ def _(SITE_NAME, sed_dose_by_hr):
         -- Average dose by hour of day
         FROM sed_dose_by_hr
         SELECT _hr
-        , propofol_mg: AVG(propofol_mg_total)
-        , _fentanyl_eq_mcg: AVG(_fentanyl_eq_mcg_total)
-        , _midazolam_eq_mg: AVG(_midazolam_eq_mg_total)
+        , propofol_mg: AVG(prop_mg_total)
+        , _fenteq_mcg: AVG(_fenteq_mcg_total)
+        , _midazeq_mg: AVG(_midazeq_mg_total)
         GROUP BY _hr
         ORDER BY _hr
         """
@@ -157,28 +157,28 @@ def _(SITE_NAME, sed_dose_by_hr_of_day):
     _df = sed_dose_by_hr_of_day.df()
     hours = _df['_hr']
     propofol = _df['propofol_mg']
-    fentanyl_eq = _df['_fentanyl_eq_mcg']
-    midazolam_eq = _df['_midazolam_eq_mg']
+    fenteq = _df['_fenteq_mcg']
+    midazeq = _df['_midazeq_mg']
 
     # Reorder so that x-axis goes from 7,8,...,23,0,1,...,6
     desired_order = list(range(7, 24)) + list(range(0, 7))
     hours_ordered = []
     propofol_ordered = []
-    fentanyl_eq_ordered = []
-    midazolam_eq_ordered = []
+    fenteq_ordered = []
+    midazeq_ordered = []
 
     for h in desired_order:
         if h in list(hours):
             idx = list(hours).index(h)
             hours_ordered.append(hours.iloc[idx])
             propofol_ordered.append(propofol.iloc[idx])
-            fentanyl_eq_ordered.append(fentanyl_eq.iloc[idx])
-            midazolam_eq_ordered.append(midazolam_eq.iloc[idx])
+            fenteq_ordered.append(fenteq.iloc[idx])
+            midazeq_ordered.append(midazeq.iloc[idx])
 
     hours_ordered = np.array(hours_ordered)
     propofol_ordered = np.array(propofol_ordered)
-    fentanyl_eq_ordered = np.array(fentanyl_eq_ordered)
-    midazolam_eq_ordered = np.array(midazolam_eq_ordered)
+    fenteq_ordered = np.array(fenteq_ordered)
+    midazeq_ordered = np.array(midazeq_ordered)
 
     fig, axs = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
 
@@ -190,12 +190,12 @@ def _(SITE_NAME, sed_dose_by_hr_of_day):
     axs[0].set_title('Mean Total Propofol Dose by Hour of Day')
     axs[0].grid(True, axis='y')
 
-    axs[1].bar(x, fentanyl_eq_ordered, color='salmon', width=bar_width)
+    axs[1].bar(x, fenteq_ordered, color='salmon', width=bar_width)
     axs[1].set_ylabel('Fentanyl Eq (mcg)')
     axs[1].set_title('Mean Total Fentanyl Equivalent Dose by Hour of Day')
     axs[1].grid(True, axis='y')
 
-    axs[2].bar(x, midazolam_eq_ordered, color='mediumseagreen', width=bar_width)
+    axs[2].bar(x, midazeq_ordered, color='mediumseagreen', width=bar_width)
     axs[2].set_ylabel('Midazolam Eq (mg)')
     axs[2].set_title('Mean Total Midazolam Equivalent Dose by Hour of Day')
     axs[2].set_xlabel('Hour of Day')

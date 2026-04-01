@@ -70,8 +70,8 @@ def _():
 def _(cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
     import statsmodels.api as _sm
-    sbt_done_formula = """sbt_done_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
-    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +
+    sbt_done_formula = """sbt_done_next_day ~ prop_dif + fenteq_dif + midazeq_dif +
+    _prop_day + _midazeq_day + _fenteq_day +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
@@ -98,8 +98,8 @@ def _():
 @app.cell
 def _(cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
-    success_extub_formula = """success_extub_next_day ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
-    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +
+    success_extub_formula = """success_extub_next_day ~ prop_dif + fenteq_dif + midazeq_dif +
+    _prop_day + _midazeq_day + _fenteq_day +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
@@ -156,14 +156,14 @@ def _(cohort_merged_final, pd):
         return _df
 
     # ── Dimension 1: covariate sets ───────────────────────────────────
-    PRIMARY_FORMULA = """{{outcome}} ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
-    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day +
+    PRIMARY_FORMULA = """{{outcome}} ~ prop_dif + fenteq_dif + midazeq_dif +
+    _prop_day + _midazeq_day + _fenteq_day +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
 
-    BASE_FORMULA = """{{outcome}} ~ propofol_diff + fentanyl_eq_diff + midazolam_eq_diff +
-    _propofol_day + _midazolam_eq_day + _fentanyl_eq_day + age
+    BASE_FORMULA = """{{outcome}} ~ prop_dif + fenteq_dif + midazeq_dif +
+    _prop_day + _midazeq_day + _fenteq_day + age
     """
 
     COVARIATE_SPECS = [

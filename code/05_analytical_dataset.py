@@ -156,15 +156,15 @@ def _(
         , _success_extub_today: o._success_extub
         , sbt_done_next_day: LEAD(o.sbt_done) OVER w
         , success_extub_next_day: LEAD(o._success_extub) OVER w
-        , _propofol_day: COALESCE(s.propofol_day, 0)
-        , _propofol_night: COALESCE(s.propofol_night, 0)
-        , _fentanyl_eq_day: COALESCE(s.fentanyl_eq_day, 0)
-        , _fentanyl_eq_night: COALESCE(s.fentanyl_eq_night, 0)
-        , _midazolam_eq_day: COALESCE(s.midazolam_eq_day, 0)
-        , _midazolam_eq_night: COALESCE(s.midazolam_eq_night, 0)
-        , propofol_diff: COALESCE(s.propofol_night, 0) - COALESCE(s.propofol_day, 0)
-        , fentanyl_eq_diff: COALESCE(s.fentanyl_eq_night, 0) - COALESCE(s.fentanyl_eq_day, 0)
-        , midazolam_eq_diff: COALESCE(s.midazolam_eq_night, 0) - COALESCE(s.midazolam_eq_day, 0)
+        , _prop_day: COALESCE(s.prop_day, 0)
+        , _prop_night: COALESCE(s.prop_night, 0)
+        , _fenteq_day: COALESCE(s.fenteq_day, 0)
+        , _fenteq_night: COALESCE(s.fenteq_night, 0)
+        , _midazeq_day: COALESCE(s.midazeq_day, 0)
+        , _midazeq_night: COALESCE(s.midazeq_night, 0)
+        , prop_dif: COALESCE(s.prop_night, 0) - COALESCE(s.prop_day, 0)
+        , fenteq_dif: COALESCE(s.fenteq_night, 0) - COALESCE(s.fenteq_day, 0)
+        , midazeq_dif: COALESCE(s.midazeq_night, 0) - COALESCE(s.midazeq_day, 0)
         , COLUMNS('(7am)|(7pm)')
         , age: h.age_at_admission
         , p.sex_category
