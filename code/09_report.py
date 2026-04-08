@@ -147,10 +147,128 @@ def _():
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
+    def add_stargazer_table(pdf, df, title, notes=None, fontsize=9,
+                            label_col_width=0.42):
+        """Render a DataFrame as a publication-style (stargazer-like) table.
+
+        Features:
+        - Three horizontal rules: top (lw=1.2), mid below header (lw=0.5),
+          bottom (lw=1.2). Optional thin separator above the `N` row if present.
+        - Serif font throughout; italic bold column headers; left-aligned
+          row labels; center-aligned data cells.
+        - Dynamic font sizing: scales down to fit many rows on one page
+          (floor: 6pt).
+        - Notes line at bottom (e.g., significance legend), italic + smaller.
+        - White background; no vertical gridlines.
+
+        Args:
+            pdf: PdfPages instance
+            df: DataFrame with row labels as index; columns become table cols
+            title: Page title (bold serif, centered)
+            notes: Optional string for the footnote line
+            fontsize: Max font size (will scale down if needed)
+            label_col_width: Fraction of page width for the row-label column
+        """
+        fig, ax = plt.subplots(figsize=LETTER)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+
+        # Title (centered, serif, bold)
+        ax.text(0.5, 0.96, title, ha='center', va='top',
+                fontsize=14, fontweight='bold', family='serif')
+
+        # ── Column layout ─────────────────────────────────────────────
+        n_data_cols = len(df.columns)
+        data_col_width = (1.0 - label_col_width - 0.02) / n_data_cols  # 0.02 for right margin
+        left_margin = 0.01
+        col_lefts = [left_margin]
+        col_lefts.append(left_margin + label_col_width)
+        for _ in range(n_data_cols - 1):
+            col_lefts.append(col_lefts[-1] + data_col_width)
+        col_rights = [col_lefts[1]]
+        for i in range(n_data_cols):
+            col_rights.append(col_lefts[i + 1] + data_col_width)
+        col_centers = [(col_lefts[i] + col_rights[i]) / 2 for i in range(n_data_cols + 1)]
+        table_left = col_lefts[0]
+        table_right = col_rights[-1]
+
+        # ── Vertical layout ───────────────────────────────────────────
+        n_rows = len(df)
+        y_top_rule = 0.90
+        y_bottom_margin = 0.10  # reserve for bottom rule + notes
+        has_n_row = 'N' in df.index
+        # Rows needed: header + data rows (+ 1 for N separator if present)
+        effective_rows = n_rows + 1 + (1 if has_n_row else 0)
+        available_h = y_top_rule - y_bottom_margin
+        line_h = available_h / effective_rows
+        # Scale font down if rows are cramped (floor: 6pt)
+        # Heuristic: line_h in axes units * 170 ≈ readable pt for 8.5" height
+        fontsize_actual = max(6, min(fontsize, int(line_h * 170)))
+        notes_fontsize = max(5, int(fontsize_actual * 0.85))
+
+        # ── Top rule ──────────────────────────────────────────────────
+        ax.plot([table_left, table_right], [y_top_rule, y_top_rule],
+                color='black', lw=1.2)
+
+        # ── Header row ────────────────────────────────────────────────
+        y_header = y_top_rule - line_h * 0.55
+        # First column: index name (or blank), left-aligned
+        ax.text(col_lefts[0] + 0.003, y_header, df.index.name or '',
+                ha='left', va='center',
+                fontsize=fontsize_actual, fontweight='bold', family='serif')
+        # Data columns: italic bold, centered
+        for i, col in enumerate(df.columns):
+            ax.text(col_centers[i + 1], y_header, str(col),
+                    ha='center', va='center',
+                    fontsize=fontsize_actual, fontweight='bold',
+                    fontstyle='italic', family='serif')
+
+        # ── Mid rule ──────────────────────────────────────────────────
+        y_mid_rule = y_top_rule - line_h * 1.1
+        ax.plot([table_left, table_right], [y_mid_rule, y_mid_rule],
+                color='black', lw=0.5)
+
+        # ── Data rows ─────────────────────────────────────────────────
+        n_row_index = df.index.get_loc('N') if has_n_row else -1
+        row_y_start = y_mid_rule - line_h * 0.55
+        for j, (idx, row) in enumerate(df.iterrows()):
+            y = row_y_start - j * line_h
+            # If this is the N row, draw a thin separator just above it
+            if has_n_row and j == n_row_index:
+                sep_y = y + line_h * 0.5
+                ax.plot([table_left, table_right], [sep_y, sep_y],
+                        color='black', lw=0.5)
+            # Row label, left-aligned
+            ax.text(col_lefts[0] + 0.003, y, str(idx),
+                    ha='left', va='center',
+                    fontsize=fontsize_actual, family='serif')
+            # Data cells, center-aligned
+            for i, val in enumerate(row.values):
+                ax.text(col_centers[i + 1], y, str(val),
+                        ha='center', va='center',
+                        fontsize=fontsize_actual, family='serif')
+
+        # ── Bottom rule ───────────────────────────────────────────────
+        y_bottom_rule = row_y_start - (n_rows - 1) * line_h - line_h * 0.55
+        ax.plot([table_left, table_right], [y_bottom_rule, y_bottom_rule],
+                color='black', lw=1.2)
+
+        # ── Notes ─────────────────────────────────────────────────────
+        if notes:
+            y_notes = y_bottom_rule - 0.025
+            ax.text(table_left, y_notes, notes,
+                    ha='left', va='top',
+                    fontsize=notes_fontsize, fontstyle='italic', family='serif')
+
+        pdf.savefig(fig, bbox_inches='tight')
+        plt.close(fig)
+
     return (
         PdfPages,
         add_heatmap_page,
         add_image_page,
+        add_stargazer_table,
         add_table_page,
         add_text_page,
         plt,
@@ -218,7 +336,7 @@ def _(
     SITE_NAME,
     add_heatmap_page,
     add_image_page,
-    add_table_page,
+    add_stargazer_table,
     add_text_page,
     cohort_stats,
     corr_df,
@@ -257,6 +375,13 @@ def _(
         "  8. Model comparison — Successful Extubation (Logit)",
     ]
 
+    # Significance legend shown as footnote on every model comparison table
+    _model_notes = (
+        "Cells report odds ratios with 95% confidence intervals. "
+        "— indicates variable not included in model.  "
+        "* p < 0.05, ** p < 0.01, *** p < 0.001"
+    )
+
     with PdfPages(_pdf_path) as _pdf:
         # Page 1: Title page
         add_text_page(
@@ -274,9 +399,13 @@ def _(
                           [f"[Image not found: {_consort_png}]",
                            "Run 01_cohort.py to generate."])
 
-        # Page 3: Table 1
-        add_table_page(_pdf, table1_df.set_index(table1_df.columns[0]),
-                       "Table 1: Baseline Characteristics", fontsize=7)
+        # Page 3: Table 1 — tableone CSV has a 2-col structure (variable, value)
+        add_stargazer_table(
+            _pdf,
+            table1_df.set_index(table1_df.columns[0]),
+            "Table 1: Baseline Characteristics",
+            fontsize=9,
+        )
 
         # Page 4: Correlation matrix
         add_heatmap_page(_pdf, corr_df, "Pairwise Pearson Correlation Matrix")
@@ -289,13 +418,22 @@ def _(
                           [f"[Image not found: {_hourly_png}]",
                            "Run 07_descriptive.py to generate."])
 
-        # Pages 6-8: Model comparison tables
-        add_table_page(_pdf, sbt_gee_df,
-                       "Model Comparison: SBT Done Next Day (GEE)", fontsize=7)
-        add_table_page(_pdf, extub_gee_df,
-                       "Model Comparison: Successful Extubation Next Day (GEE)", fontsize=7)
-        add_table_page(_pdf, extub_logit_df,
-                       "Model Comparison: Successful Extubation Next Day (Logit + clustered SE)", fontsize=7)
+        # Pages 6-8: Model comparison tables (stargazer-style)
+        add_stargazer_table(
+            _pdf, sbt_gee_df,
+            "Model Comparison: SBT Done Next Day (GEE)",
+            notes=_model_notes, fontsize=9,
+        )
+        add_stargazer_table(
+            _pdf, extub_gee_df,
+            "Model Comparison: Successful Extubation Next Day (GEE)",
+            notes=_model_notes, fontsize=9,
+        )
+        add_stargazer_table(
+            _pdf, extub_logit_df,
+            "Model Comparison: Successful Extubation Next Day (Logit + clustered SE)",
+            notes=_model_notes, fontsize=9,
+        )
 
     print(f"Saved unified PDF report: {_pdf_path}")
     return

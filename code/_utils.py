@@ -113,8 +113,8 @@ def plot_consort(consort_json: dict, output_path: Path) -> None:
     n_steps = len(steps)
     fig_height = max(8, n_steps * 2.0)
     fig, ax = plt.subplots(figsize=(14, fig_height))
-    fig.patch.set_facecolor("#000000")
-    ax.set_facecolor("#000000")
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
@@ -127,30 +127,33 @@ def plot_consort(consort_json: dict, output_path: Path) -> None:
     y_bottom = 0.05
     y_spacing = (y_top - y_bottom) / max(n_steps - 1, 1)
 
-    main_color = "#2d6a4f"
-    main_edge = "#40916c"
-    excl_color = "#9b2226"
-    excl_edge = "#c1121f"
-    start_color = "#1d3557"
-    start_edge = "#457b9d"
-    arrow_color = "#aaaaaa"
-    text_color = "#ffffff"
+    # Light publication-friendly palette: pale fills, dark edges, serif text
+    main_color = "#e8f1fb"   # pale blue fill for main flow boxes
+    main_edge = "#2874a6"    # medium blue edge
+    excl_color = "#fdecea"   # pale red fill for exclusion boxes
+    excl_edge = "#922b21"    # dark red edge
+    start_color = "#eafaf1"  # pale green fill for starting box
+    start_edge = "#1e8449"   # dark green edge
+    arrow_color = "#424242"  # dark gray for arrows
+    text_color = "#212121"   # near-black text
 
-    def draw_box(x_center, y_center, w, h, text, facecolor, edgecolor, fontsize=8):
+    def draw_box(x_center, y_center, w, h, text, facecolor, edgecolor, fontsize=9):
         x0 = x_center - w / 2
         y0 = y_center - h / 2
         box = mpatches.FancyBboxPatch(
             (x0, y0), w, h,
             boxstyle="round,pad=0.008",
-            facecolor=facecolor, edgecolor=edgecolor, linewidth=1.5,
+            facecolor=facecolor, edgecolor=edgecolor, linewidth=1.2,
         )
         ax.add_patch(box)
         ax.text(x_center, y_center, text, ha="center", va="center",
-                fontsize=fontsize, fontweight="bold", color=text_color, wrap=True)
+                fontsize=fontsize, fontweight="normal", color=text_color,
+                family="serif", wrap=True)
 
     def draw_arrow(x0, y0, x1, y1):
         ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
-                    arrowprops=dict(arrowstyle="-|>", color=arrow_color, lw=1.5, mutation_scale=12))
+                    arrowprops=dict(arrowstyle="-|>", color=arrow_color,
+                                    lw=1.2, mutation_scale=12))
 
     def _fmt(n):
         return f"{n:,}" if isinstance(n, (int, float)) else str(n)
@@ -160,7 +163,7 @@ def plot_consort(consort_json: dict, output_path: Path) -> None:
     y0 = y_top
     draw_box(main_x, y0, box_w, box_h,
              f"{s0['description']}\n(n = {_fmt(s0.get('n_remaining', '?'))})",
-             start_color, start_edge, fontsize=9)
+             start_color, start_edge, fontsize=10)
     prev_y = y0
 
     # Steps 1+
@@ -188,8 +191,9 @@ def plot_consort(consort_json: dict, output_path: Path) -> None:
 
     site = consort_json.get("site", "")
     if site:
-        ax.text(0.5, 0.99, f"CONSORT — {site}", ha="center", va="top",
-                fontsize=12, fontweight="bold", color=text_color, transform=ax.transAxes)
+        ax.text(0.5, 0.985, f"CONSORT — {site}", ha="center", va="top",
+                fontsize=13, fontweight="bold", color=text_color, family="serif",
+                transform=ax.transAxes)
 
-    fig.savefig(str(output_path), dpi=150, bbox_inches="tight", facecolor="#000000")
+    fig.savefig(str(output_path), dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
