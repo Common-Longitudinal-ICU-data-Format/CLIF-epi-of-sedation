@@ -118,23 +118,73 @@ def _(cohort_merged_final, pd):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Sensitivity Analyses
+    ## Nested Model Comparison
 
-    Cross-products two dimensions:
+    Fits 4 nested models (progressively adding adjustment variables) for each
+    (outcome, model_type) combination.
 
-    - **COVARIATE_SPECS**: formula variants (primary, Elixhauser, no-SOFA, base)
+    **Model specs (all include exposures: prop_dif + fenteq_dif + midazeq_dif):**
 
-    - **MODEL_CONFIGS**: outcome x model type (SBT=GEE, extub=GEE+logit)
+    1. **baseline**: age + sex + ICU type + CCI
 
-    Adding a new SA = append to the relevant list.
+    2. **daydose**: baseline + daytime absolute doses (`_prop_day`, `_fenteq_day`, `_midazeq_day`)
+
+    3. **sofa**: daydose + `sofa_total`
+
+    4. **clinical**: daydose + pH/P/F levels + NEE at 7am/7pm
+
+    `sofa` and `clinical` are siblings (both extend `daydose`).
+
+    **Outputs:**
+
+    - Long CSV (`sensitivity_analysis.csv`) — one row per coefficient
+
+    - Wide CSVs (`model_comparison_*.csv`) — rows=covariates, cols=specs, cells=OR (95% CI)
+
+    **Variable scaling:** `VAR_DISPLAY` centralizes scaling and labels. Edit
+    `scale` to rescale; edit `label` to relabel.
     """)
     return
 
 
 @app.cell
-def _(cohort_merged_final, pd):
+def _():
+    # Central configuration for variable scaling + display labels.
+    # To change a scale (e.g., age per 10 yrs): edit the 'scale' divisor.
+    # To change a label: edit 'label'.
+    # To add a new scaled variable: add a new entry.
+    VAR_DISPLAY = {
+        # Exposures (day-night differences)
+        'prop_dif':     {'scale': 100, 'label': 'Δ propofol (per 100 mg)'},
+        'fenteq_dif':   {'scale': 100, 'label': 'Δ fentanyl eq (per 100 mcg)'},
+        'midazeq_dif':  {'scale': 1,   'label': 'Δ midazolam eq (per 1 mg)'},
+        # Daytime absolute doses
+        '_prop_day':    {'scale': 100, 'label': 'Daytime propofol (per 100 mg)'},
+        '_fenteq_day':  {'scale': 100, 'label': 'Daytime fentanyl eq (per 100 mcg)'},
+        '_midazeq_day': {'scale': 1,   'label': 'Daytime midazolam eq (per 1 mg)'},
+        # Other continuous covariates
+        'age':          {'scale': 1,   'label': 'Age (per year)'},
+        'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
+        'sofa_total':   {'scale': 1,   'label': 'SOFA total (per point)'},
+        'nee_7am':      {'scale': 0.1, 'label': 'NEE 7am (per 0.1 mcg/kg/min)'},
+        'nee_7pm':      {'scale': 0.1, 'label': 'NEE 7pm (per 0.1 mcg/kg/min)'},
+    }
+    return (VAR_DISPLAY,)
+
+
+@app.cell
+def _(VAR_DISPLAY, cohort_merged_final, pd):
     import statsmodels.formula.api as smf
     import statsmodels.api as sm
+    import numpy as np
+    import re
+
+    # ── Rescale on a COPY so we never mutate cohort_merged_final ──────
+    # Using copy() prevents accidental double-scaling if this cell re-runs.
+    _df_scaled = cohort_merged_final.copy()
+    for _col, _info in VAR_DISPLAY.items():
+        if _col in _df_scaled.columns and _info['scale'] != 1:
+            _df_scaled[_col] = _df_scaled[_col] / _info['scale']
 
     # ── Fit functions ──────────────────────────────────────────────────
     def _fit_gee(formula, data):
@@ -147,56 +197,110 @@ def _(cohort_merged_final, pd):
         return m.fit(cov_type='cluster',
                      cov_kwds={'groups': data['hospitalization_id']})
 
-    def _extract(result, label, outcome, model_type):
-        _tbl = result.summary().tables[1]
-        _df = pd.DataFrame(_tbl.data[1:], columns=_tbl.data[0])
-        _df['sensitivity'] = label
-        _df['outcome'] = outcome
-        _df['model_type'] = model_type
-        return _df
-
-    # ── Dimension 1: covariate sets ───────────────────────────────────
-    PRIMARY_FORMULA = """{{outcome}} ~ prop_dif + fenteq_dif + midazeq_dif +
-    _prop_day + _midazeq_day + _fenteq_day +
-    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
-    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
-    """
-
-    BASE_FORMULA = """{{outcome}} ~ prop_dif + fenteq_dif + midazeq_dif +
-    _prop_day + _midazeq_day + _fenteq_day + age
-    """
+    # ── Dimension 1: nested covariate sets (all include exposures) ────
+    BASELINE = ("{{outcome}} ~ prop_dif + fenteq_dif + midazeq_dif + "
+                "age + C(sex_category) + C(icu_type) + cci_score")
+    DAYDOSE = BASELINE + " + _prop_day + _midazeq_day + _fenteq_day"
+    SOFA = DAYDOSE + " + sofa_total"
+    CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
+                          "pf_level_7pm + nee_7am + nee_7pm")
 
     COVARIATE_SPECS = [
-        {'label': 'primary', 'formula': PRIMARY_FORMULA},
-        {'label': 'sa_elix', 'formula': PRIMARY_FORMULA.replace('cci_score', 'elix_score')},
-        {'label': 'sa_no_sofa', 'formula': PRIMARY_FORMULA.replace(' + sofa_total', '')},
-        {'label': 'sa_base', 'formula': BASE_FORMULA},
+        {'label': 'baseline', 'formula': BASELINE},
+        {'label': 'daydose',  'formula': DAYDOSE},
+        {'label': 'sofa',     'formula': SOFA},
+        {'label': 'clinical', 'formula': CLINICAL},
     ]
 
     # ── Dimension 2: outcome x model type ─────────────────────────────
     MODEL_CONFIGS = [
-        {'outcome': 'sbt_done_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_next_day',      'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'success_extub_next_day', 'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'success_extub_next_day', 'model_type': 'logit', 'fit_fn': _fit_logit},
     ]
 
-    # ── Cross-product loop ────────────────────────────────────────────
-    sa_results = []
-    for spec in COVARIATE_SPECS:
-        for config in MODEL_CONFIGS:
-            _formula = spec['formula'].replace('{{outcome}}', config['outcome'])
+    # ── Cross-product loop: keep fitted results for wide-table builder
+    fitted = {}  # {(outcome, model_type): {spec_label: result}}
+    for _config in MODEL_CONFIGS:
+        _key = (_config['outcome'], _config['model_type'])
+        fitted[_key] = {}
+        for _spec in COVARIATE_SPECS:
+            _formula = _spec['formula'].replace('{{outcome}}', _config['outcome'])
             try:
-                _result = config['fit_fn'](_formula, cohort_merged_final)
-                sa_results.append(
-                    _extract(_result, spec['label'], config['outcome'], config['model_type'])
-                )
-                print(f"  OK: {spec['label']} / {config['outcome']} / {config['model_type']}")
+                _result = _config['fit_fn'](_formula, _df_scaled)
+                fitted[_key][_spec['label']] = _result
+                print(f"  OK: {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
             except Exception as e:
-                print(f"  FAIL: {spec['label']} / {config['outcome']} / {config['model_type']}: {e}")
+                print(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
+    return MODEL_CONFIGS, fitted, np, re
 
+
+@app.cell
+def _(MODEL_CONFIGS, VAR_DISPLAY, fitted, np, pd, re):
+    # ── Long-format CSV (federated-friendly) ──────────────────────────
+    def _extract_long(result, label, outcome, model_type):
+        _tbl = result.summary().tables[1]
+        _row = pd.DataFrame(_tbl.data[1:], columns=_tbl.data[0])
+        _row['sensitivity'] = label
+        _row['outcome'] = outcome
+        _row['model_type'] = model_type
+        return _row
+
+    sa_results = []
+    for (_outcome, _mt), _spec_dict in fitted.items():
+        for _label, _result in _spec_dict.items():
+            sa_results.append(_extract_long(_result, _label, _outcome, _mt))
     sa_all = pd.concat(sa_results, ignore_index=True)
     sa_all.to_csv('output_to_share/sensitivity_analysis.csv', index=False)
-    print(f"\nSaved output_to_share/sensitivity_analysis.csv ({len(sa_all)} rows, {sa_all['sensitivity'].nunique()} specs)")
+    print(f"Saved output_to_share/sensitivity_analysis.csv ({len(sa_all)} rows)")
+
+    # ── Wide comparison tables per (outcome, model_type) ──────────────
+    def _pretty_label(varname):
+        """Map statsmodels parameter name -> human-readable label."""
+        if varname in VAR_DISPLAY:
+            return VAR_DISPLAY[varname]['label']
+        # Match both C(col)[T.level] and col[T.level] (patsy auto-categoricals)
+        m = re.match(r'(?:C\()?(\w+)(?:\))?\[T\.(.+)\]$', varname)
+        if m:
+            col, level = m.groups()
+            col_pretty = col.replace('_category', '').replace('_', ' ').title()
+            return f"{col_pretty}: {level}"
+        return varname
+
+    def build_wide_table(results_dict):
+        """results_dict: {spec_label: fitted_result} -> wide DataFrame with OR (95% CI)."""
+        all_vars = []
+        for r in results_dict.values():
+            for v in r.params.index:
+                if v not in all_vars:
+                    all_vars.append(v)
+        _tbl = pd.DataFrame(index=all_vars + ['N'], columns=list(results_dict.keys()))
+        for _label, r in results_dict.items():
+            for _var in all_vars:
+                if _var in r.params.index:
+                    _coef = r.params[_var]
+                    _ci = r.conf_int().loc[_var]
+                    _ci_lo, _ci_hi = _ci.iloc[0], _ci.iloc[1]
+                    _or_, _or_lo, _or_hi = np.exp(_coef), np.exp(_ci_lo), np.exp(_ci_hi)
+                    _p = r.pvalues[_var]
+                    _star = '***' if _p < 0.001 else '**' if _p < 0.01 else '*' if _p < 0.05 else ''
+                    _tbl.loc[_var, _label] = f"{_or_:.2f} ({_or_lo:.2f}, {_or_hi:.2f}){_star}"
+                else:
+                    _tbl.loc[_var, _label] = '—'
+            _tbl.loc['N', _label] = f"{int(r.nobs):,}"
+        _tbl = _tbl.rename(index={v: _pretty_label(v) for v in all_vars})
+        _tbl.index.name = 'Variable'
+        return _tbl
+
+    for _config in MODEL_CONFIGS:
+        _key = (_config['outcome'], _config['model_type'])
+        if _key not in fitted or not fitted[_key]:
+            continue
+        _outcome_short = 'sbt' if 'sbt' in _config['outcome'] else 'extub'
+        _fname = f"output_to_share/model_comparison_{_outcome_short}_{_config['model_type']}.csv"
+        _wide = build_wide_table(fitted[_key])
+        _wide.to_csv(_fname)
+        print(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
     return
 
 
