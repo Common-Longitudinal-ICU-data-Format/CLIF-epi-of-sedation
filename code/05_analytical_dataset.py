@@ -114,8 +114,13 @@ def _(pd):
     icu_type_df = pd.read_parquet("output/icu_type.parquet")
     cci_df = pd.read_parquet("output/cci.parquet")
     elix_df = pd.read_parquet("output/elix.parquet")
-    print(f"sofa_daily: {len(sofa_daily)}, icu_type: {len(icu_type_df)}, cci: {len(cci_df)}, elix: {len(elix_df)}")
-    return cci_df, elix_df, icu_type_df, sofa_daily
+    covariates_t1 = pd.read_parquet("output/covariates_t1.parquet")
+    print(
+        f"sofa_daily: {len(sofa_daily)}, icu_type: {len(icu_type_df)}, "
+        f"cci: {len(cci_df)}, elix: {len(elix_df)}, "
+        f"covariates_t1: {len(covariates_t1)}"
+    )
+    return cci_df, covariates_t1, elix_df, icu_type_df, sofa_daily
 
 
 @app.cell(hide_code=True)
@@ -129,6 +134,7 @@ def _():
 @app.cell
 def _(
     cci_df,
+    covariates_t1,
     covs_daily,
     elix_df,
     hosp_df,
@@ -140,7 +146,9 @@ def _(
 ):
     cohort_merged = mo.sql(
         f"""
-        -- Merge all intermediate outputs into analytical dataset
+        -- Merge all intermediate outputs into analytical dataset.
+        -- covariates_t1 is hospitalization-level (from 04_covariates Cell H) and broadcasts
+        -- its values across all patient-days for each hospitalization.
         FROM sbt_outcomes_daily o
         LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
         LEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)
@@ -150,6 +158,7 @@ def _(
         LEFT JOIN sofa_daily sf USING (hospitalization_id, _nth_day)
         LEFT JOIN cci_df cc USING (hospitalization_id)
         LEFT JOIN elix_df ex USING (hospitalization_id)
+        LEFT JOIN covariates_t1 t1 USING (hospitalization_id)
         SELECT o.hospitalization_id
         , o._nth_day
         , _sbt_done_today: o.sbt_done
@@ -170,8 +179,25 @@ def _(
         , p.sex_category
         , i.icu_type
         , sofa_total: COALESCE(sf.sofa_total,0)
-        , cci_score: COALESCE(cc.cci_score, 0)                                               
-        , elix_score: COALESCE(ex.elix_score, 0)  
+        , cci_score: COALESCE(cc.cci_score, 0)
+        , elix_score: COALESCE(ex.elix_score, 0)
+        -- Table 1 hospitalization-level covariates (from 04_covariates.py covariates_t1.parquet)
+        , t1.bmi
+        , t1.height_cm
+        , t1.weight_kg
+        , t1.sofa_1st24h
+        , t1.sofa_cv_97_1st24h
+        , t1.sofa_coag_1st24h
+        , t1.sofa_liver_1st24h
+        , t1.sofa_resp_1st24h
+        , t1.sofa_cns_1st24h
+        , t1.sofa_renal_1st24h
+        , ever_pressor: COALESCE(t1.ever_pressor, 0)
+        , t1.pf_1st24h_min
+        , t1.pf_1st24h_source
+        , t1.imv_duration_hrs
+        , sepsis_ase: COALESCE(t1.sepsis_ase, 0)
+        , t1._first_icu_dttm
         WINDOW w AS (PARTITION BY o.hospitalization_id ORDER BY o._nth_day)
         ORDER BY o.hospitalization_id, o._nth_day
         """

@@ -20,6 +20,10 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    # Cache-bypass flags for expensive Table 1 covariate recomputes
+    RERUN_SOFA_24H = False
+    RERUN_ASE = False
+
 
 @app.cell(hide_code=True)
 def _():
@@ -573,6 +577,350 @@ def _(CONFIG_PATH, cohort_hosp_ids):
     elix_df.to_parquet("output/elix.parquet", index=False)
     print("Saved: output/cci.parquet, output/elix.parquet")
     return
+
+
+# ── Table 1 Hospitalization-Level Covariates ──────────────────────────
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Table 1 Hospitalization-Level Covariates
+
+    Hospitalization-level variables for Table 1 (one row per hospitalization).
+    Anchored to the first 24 h of ICU admit per patient. Writes
+    `output/covariates_t1.parquet` which is joined into the analytical
+    dataset by `05_analytical_dataset.py`.
+    """)
+    return
+
+
+@app.cell
+def _(CONFIG_PATH, cohort_hosp_ids, duckdb):
+    # Cell A — first ICU admit dttm per cohort hospitalization.
+    # NOTE: For patients intubated in ED/OR then transferred to ICU,
+    # this 24 h window starts AFTER intubation. Per user spec (first 24 h of ICU admit).
+    from clifpy import Adt
+
+    _adt_icu = Adt.from_file(
+        config_path=CONFIG_PATH,
+        columns=['hospitalization_id', 'in_dttm', 'location_category'],
+        filters={
+            'hospitalization_id': cohort_hosp_ids,
+            'location_category': ['icu'],
+        },
+    )
+    adt_icu_df = _adt_icu.df
+
+    first_icu_admit = duckdb.sql("""
+        FROM adt_icu_df
+        SELECT hospitalization_id
+            , _first_icu_dttm: MIN(in_dttm)
+            , _first_icu_24h_end: MIN(in_dttm) + INTERVAL 24 HOUR
+        GROUP BY hospitalization_id
+        ORDER BY hospitalization_id
+    """).df()
+    print(f"first_icu_admit: {len(first_icu_admit)} hospitalizations")
+    return (first_icu_admit,)
+
+
+@app.cell
+def _(CONFIG_PATH, first_icu_admit, get_config_or_params):
+    # Cell B — SOFA over first 24 h of ICU admit (cached).
+    # Reuses the existing local _sofa.compute_sofa_polars but with a different cohort_df:
+    # one row per hospitalization with [start_dttm, end_dttm] = [first_icu, first_icu+24h]
+    # instead of the per-patient-day windows used by the existing sofa_daily computation.
+    # Imports aliased with `_` prefix to avoid marimo multi-cell definition collisions
+    # with the existing SOFA cell above.
+    import polars as _pl
+    from _sofa import compute_sofa_polars as _compute_sofa_polars
+
+    _sofa_24h_path = "output/sofa_first_24h.parquet"
+    if (not os.path.exists(_sofa_24h_path)) or RERUN_SOFA_24H:
+        _cfg = get_config_or_params(CONFIG_PATH)
+        _sofa_24h_cohort = _pl.from_pandas(
+            first_icu_admit.rename(columns={
+                '_first_icu_dttm': 'start_dttm',
+                '_first_icu_24h_end': 'end_dttm',
+            })[['hospitalization_id', 'start_dttm', 'end_dttm']]
+        )
+        _sofa_24h = _compute_sofa_polars(
+            data_directory=_cfg['data_directory'],
+            cohort_df=_sofa_24h_cohort,
+            filetype=_cfg.get('filetype', 'parquet'),
+            id_name='hospitalization_id',
+            timezone=_cfg.get('timezone'),
+        )
+        # Rename to avoid collision with existing per-day `sofa_total` in analytical_dataset
+        _sofa_24h = _sofa_24h.rename({
+            'sofa_total': 'sofa_1st24h',
+            'sofa_cv_97': 'sofa_cv_97_1st24h',
+            'sofa_coag': 'sofa_coag_1st24h',
+            'sofa_liver': 'sofa_liver_1st24h',
+            'sofa_resp': 'sofa_resp_1st24h',
+            'sofa_cns': 'sofa_cns_1st24h',
+            'sofa_renal': 'sofa_renal_1st24h',
+        })
+        _sofa_24h.write_parquet(_sofa_24h_path)
+        print(f"Computed + saved {_sofa_24h_path} ({_sofa_24h.height} rows)")
+    else:
+        _sofa_24h = _pl.read_parquet(_sofa_24h_path)
+        print(f"Loaded cached {_sofa_24h_path} ({_sofa_24h.height} rows)")
+
+    sofa_24h_pd = _sofa_24h.to_pandas()
+    return (sofa_24h_pd,)
+
+
+@app.cell
+def _(CONFIG_PATH, apply_outlier_handling, cohort_hosp_ids, duckdb):
+    # Cell C — Load vitals needed for BMI (height_cm + weight_kg) and P/F fallback (spo2).
+    # Single combined load for efficiency; kept separate from the existing weight-only
+    # `vitals_df` at the top of the Vasopressors section so we don't perturb the dose
+    # unit converter that depends on that DataFrame's exact shape.
+    # `_Vitals` alias avoids marimo multi-cell definition collision with the existing
+    # Vitals import in the vasopressor cell.
+    from clifpy import Vitals as _Vitals
+
+    _vitals_t1 = _Vitals.from_file(
+        config_path=CONFIG_PATH,
+        columns=['hospitalization_id', 'recorded_dttm', 'vital_category', 'vital_value'],
+        filters={
+            'vital_category': ['height_cm', 'weight_kg', 'spo2'],
+            'hospitalization_id': cohort_hosp_ids,
+        },
+    )
+    apply_outlier_handling(_vitals_t1, outlier_config_path='config/outlier_config.yaml')
+    vitals_t1_df = _vitals_t1.df
+
+    # First non-null height_cm and weight_kg per hospitalization → BMI.
+    # Height guarded to 50–250 cm (reject impossible values even post-outlier-handling).
+    bmi_df = duckdb.sql("""
+        WITH first_h AS (
+            FROM vitals_t1_df
+            SELECT hospitalization_id
+                , height_cm: vital_value
+            WHERE vital_category = 'height_cm'
+              AND vital_value IS NOT NULL
+              AND vital_value BETWEEN 50 AND 250
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY hospitalization_id ORDER BY recorded_dttm) = 1
+        )
+        , first_w AS (
+            FROM vitals_t1_df
+            SELECT hospitalization_id
+                , weight_kg: vital_value
+            WHERE vital_category = 'weight_kg'
+              AND vital_value IS NOT NULL
+              AND vital_value > 0
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY hospitalization_id ORDER BY recorded_dttm) = 1
+        )
+        FROM first_h h
+        FULL JOIN first_w w USING (hospitalization_id)
+        SELECT hospitalization_id
+            , h.height_cm
+            , w.weight_kg
+            , bmi: w.weight_kg / ((h.height_cm / 100.0) * (h.height_cm / 100.0))
+        ORDER BY hospitalization_id
+    """).df()
+    print(f"bmi_df: {len(bmi_df)} rows, {bmi_df['bmi'].notna().sum()} non-null BMIs")
+    return bmi_df, vitals_t1_df
+
+
+@app.cell
+def _(cont_veso_converted, duckdb):
+    # Cell D — 'ever on vasopressors' binary per hospitalization.
+    # DECISION POINT (revisit): Currently uses CONTINUOUS vasopressor infusions only
+    # (medication_admin_continuous via cont_veso_converted). Bolus / push-dose vasopressors
+    # from medication_admin_intermittent are NOT included. Standard ICU literature uses
+    # continuous-only for 'ever on pressors' because it reflects sustained shock;
+    # intermittent captures peri-intubation push doses that are less specific. To add
+    # intermittent later: load MedicationAdminIntermittent with the same vaso med_categories,
+    # dedupe + outlier-handle, compute the same MAX(med_dose > 0) per hosp, and OR the two
+    # flags together at the SELECT.
+    ever_pressor_df = duckdb.sql("""
+        FROM cont_veso_converted
+        SELECT hospitalization_id
+            , ever_pressor: MAX(CASE WHEN med_dose > 0 THEN 1 ELSE 0 END)
+        GROUP BY hospitalization_id
+        ORDER BY hospitalization_id
+    """).df()
+    _n_pressor = int(ever_pressor_df['ever_pressor'].sum())
+    print(
+        f"ever_pressor_df: {len(ever_pressor_df)} rows, {_n_pressor} with ever_pressor=1"
+    )
+    return (ever_pressor_df,)
+
+
+@app.cell
+def _(duckdb, first_icu_admit, po2_w, resp_p, vitals_t1_df):
+    # Cell E — Worst P/F (or S/F-imputed P/F via Rice equation) in first 24 h of ICU admit.
+    # Rice formula: PF_imputed = 64 + 0.84 * (SpO2 / FiO2 * 100), valid for SpO2 <= 97
+    # (above 97, the saturation curve flattens and S/F is unreliable).
+    # Event-driven: no fresh hourly grid — ASOF-join FiO2 from resp_p to the event times
+    # of PaO2 labs and SpO2 vitals that fall within the ICU-24h window.
+    pf_24h_df = duckdb.sql("""
+        WITH hosp_window AS (
+            FROM first_icu_admit
+            SELECT hospitalization_id, _first_icu_dttm, _first_icu_24h_end
+        )
+        , pao2_in_window AS (
+            FROM po2_w p
+            JOIN hosp_window h USING (hospitalization_id)
+            SELECT p.hospitalization_id
+                , event_dttm: p.lab_order_dttm
+                , pao2: p.po2_arterial
+            WHERE p.lab_order_dttm BETWEEN h._first_icu_dttm AND h._first_icu_24h_end
+              AND p.po2_arterial IS NOT NULL
+        )
+        , spo2_in_window AS (
+            FROM vitals_t1_df s
+            JOIN hosp_window h USING (hospitalization_id)
+            SELECT s.hospitalization_id
+                , event_dttm: s.recorded_dttm
+                , spo2: s.vital_value
+            WHERE s.vital_category = 'spo2'
+              AND s.recorded_dttm BETWEEN h._first_icu_dttm AND h._first_icu_24h_end
+              AND s.vital_value IS NOT NULL
+              AND s.vital_value <= 97  -- Rice valid range
+        )
+        , fio2_at_pao2 AS (
+            FROM pao2_in_window p
+            ASOF LEFT JOIN resp_p r
+                ON p.hospitalization_id = r.hospitalization_id
+                AND r.recorded_dttm <= p.event_dttm
+            SELECT p.hospitalization_id
+                , pf: p.pao2 / r.fio2_set
+                , source: 'pao2'
+            WHERE r.fio2_set IS NOT NULL AND r.fio2_set > 0
+        )
+        , fio2_at_spo2 AS (
+            FROM spo2_in_window s
+            ASOF LEFT JOIN resp_p r
+                ON s.hospitalization_id = r.hospitalization_id
+                AND r.recorded_dttm <= s.event_dttm
+            SELECT s.hospitalization_id
+                , pf: 64 + 0.84 * (s.spo2 / r.fio2_set * 100)
+                , source: 'spo2'
+            WHERE r.fio2_set IS NOT NULL AND r.fio2_set > 0
+        )
+        , combined AS (
+            FROM fio2_at_pao2 SELECT hospitalization_id, pf, source
+            UNION ALL
+            FROM fio2_at_spo2 SELECT hospitalization_id, pf, source
+        )
+        FROM combined
+        SELECT hospitalization_id
+            , pf_1st24h_min: MIN(pf)
+            , pf_1st24h_source: ANY_VALUE(source ORDER BY pf ASC)  -- source of the worst pf
+        WHERE pf > 0
+        GROUP BY hospitalization_id
+        ORDER BY hospitalization_id
+    """).df()
+    _med_pf = pf_24h_df['pf_1st24h_min'].median() if len(pf_24h_df) else float('nan')
+    print(f"pf_24h_df: {len(pf_24h_df)} rows, median pf_1st24h_min: {_med_pf:.1f}")
+    return (pf_24h_df,)
+
+
+@app.cell
+def _(pd):
+    # Cell F — IMV duration (already computed in 01_cohort.py).
+    # NOTE: This is the duration of the FIRST QUALIFYING IMV STREAK per hospitalization,
+    # which is also the cohort exposure window (per cohort definition in 01_cohort.py:272-283:
+    # "First IMV streak ≥24 hours"). _duration_hrs = (end - start) where start = intubation
+    # event and end = COALESCE(_trach_dttm, _next_start_dttm, _last_observed_dttm). Subsequent
+    # re-intubations after extubation are NOT included (those would be separate streaks
+    # not in the cohort).
+    _imv_streaks_t1 = pd.read_parquet("output/cohort_imv_streaks.parquet")
+    imv_dur_df = _imv_streaks_t1[['hospitalization_id', '_duration_hrs']].rename(
+        columns={'_duration_hrs': 'imv_duration_hrs'}
+    )
+    _med_imv = imv_dur_df['imv_duration_hrs'].median()
+    print(f"imv_dur_df: {len(imv_dur_df)} rows, median imv_duration_hrs: {_med_imv:.1f}")
+    return (imv_dur_df,)
+
+
+@app.cell
+def _(CONFIG_PATH, cohort_hosp_ids, duckdb, pd):
+    # Cell G — Sepsis CDC Adult Sepsis Event (ASE) via clifpy (cached).
+    # compute_ase independently loads many CLIF tables (Hospitalization, MedAdmin-cont,
+    # MedAdmin-intermittent, Labs, MicrobiologyCulture, Adt, RespiratorySupport) and can
+    # take 5–15 minutes for ~thousand hospitalizations. Cached to output/ase.parquet and
+    # re-used on subsequent notebook runs unless RERUN_ASE flag is True.
+    _ase_path = "output/ase.parquet"
+    if (not os.path.exists(_ase_path)) or RERUN_ASE:
+        from clifpy.utils import compute_ase
+        ase_full = compute_ase(
+            hospitalization_ids=cohort_hosp_ids,
+            config_path=CONFIG_PATH,
+            apply_rit=True,
+            rit_only_hospital_onset=True,
+            include_lactate=False,  # CDC strict definition (matches function default)
+            verbose=True,
+        )
+        ase_full.to_parquet(_ase_path, index=False)
+        print(f"Computed + saved {_ase_path} ({len(ase_full)} rows)")
+    else:
+        ase_full = pd.read_parquet(_ase_path)
+        print(f"Loaded cached {_ase_path} ({len(ase_full)} rows)")
+
+    # Aggregate to per-hospitalization binary: any ASE episode = sepsis_ase = 1
+    ase_df = duckdb.sql("""
+        FROM ase_full
+        SELECT hospitalization_id
+            , sepsis_ase: MAX(CAST(sepsis AS INTEGER))
+        GROUP BY hospitalization_id
+        ORDER BY hospitalization_id
+    """).df()
+    _n_sepsis = int(ase_df['sepsis_ase'].sum())
+    print(f"ase_df: {len(ase_df)} rows, {_n_sepsis} with sepsis_ase=1")
+    return (ase_df,)
+
+
+@app.cell
+def _(
+    ase_df,
+    bmi_df,
+    duckdb,
+    ever_pressor_df,
+    first_icu_admit,
+    imv_dur_df,
+    pf_24h_df,
+    sofa_24h_pd,
+):
+    # Cell H — Combine all T1 covariates into one row-per-hospitalization dataframe
+    # and save to output/covariates_t1.parquet for 05_analytical_dataset.py to join.
+    covariates_t1 = duckdb.sql("""
+        FROM first_icu_admit f
+        LEFT JOIN bmi_df USING (hospitalization_id)
+        LEFT JOIN sofa_24h_pd USING (hospitalization_id)
+        LEFT JOIN ever_pressor_df USING (hospitalization_id)
+        LEFT JOIN pf_24h_df USING (hospitalization_id)
+        LEFT JOIN imv_dur_df USING (hospitalization_id)
+        LEFT JOIN ase_df USING (hospitalization_id)
+        SELECT f.hospitalization_id
+            , f._first_icu_dttm
+            , bmi_df.height_cm
+            , bmi_df.weight_kg
+            , bmi_df.bmi
+            , sofa_24h_pd.sofa_1st24h
+            , sofa_24h_pd.sofa_cv_97_1st24h
+            , sofa_24h_pd.sofa_coag_1st24h
+            , sofa_24h_pd.sofa_liver_1st24h
+            , sofa_24h_pd.sofa_resp_1st24h
+            , sofa_24h_pd.sofa_cns_1st24h
+            , sofa_24h_pd.sofa_renal_1st24h
+            , ever_pressor: COALESCE(ever_pressor_df.ever_pressor, 0)
+            , pf_24h_df.pf_1st24h_min
+            , pf_24h_df.pf_1st24h_source
+            , imv_dur_df.imv_duration_hrs
+            , sepsis_ase: COALESCE(ase_df.sepsis_ase, 0)
+        ORDER BY f.hospitalization_id
+    """).df()
+    covariates_t1.to_parquet("output/covariates_t1.parquet", index=False)
+    print(
+        f"Saved: output/covariates_t1.parquet "
+        f"({len(covariates_t1)} hospitalizations, {covariates_t1.shape[1]} columns)"
+    )
+    return (covariates_t1,)
 
 
 # ── Save ───────────────────────────────────────────────────────────────

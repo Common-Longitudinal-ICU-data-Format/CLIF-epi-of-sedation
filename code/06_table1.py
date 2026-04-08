@@ -144,21 +144,77 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, pd):
     _df = cohort_merged_for_t1_w_by_shift.df()
+    n_hospitalizations = _df['hospitalization_id'].nunique()
     n_unique_patients = _df['patient_id'].nunique()
-    pd.DataFrame({'n_unique_patients': [n_unique_patients]})\
-        .to_csv('output_to_share/cohort_stats.csv', index=False)
-    print(f"Unique patients: {n_unique_patients}")
+    pd.DataFrame({
+        'site': [SITE_NAME],
+        'n_hospitalizations': [n_hospitalizations],
+        'n_unique_patients': [n_unique_patients],
+    }).to_csv('output_to_share/cohort_stats.csv', index=False)
+    print(f"Cohort: {n_hospitalizations} hospitalizations from {n_unique_patients} unique patients")
     return
 
 
 @app.cell
-def _(SITE_NAME, cohort_merged_for_t1, tableone):
-    _df = cohort_merged_for_t1.df()
-    outcome_vars = ['_sbt_done_today', '_success_extub_today']
-    diff_doses = ['prop_dif', 'fenteq_dif', 'midazeq_dif']
-    _cont_vars = ['age', 'sofa_total', 'cci_score'] + diff_doses
-    _cat_vars = outcome_vars + ['sex_category', 'icu_type']
-    table1_overall = tableone.TableOne(data=_df, continuous=_cont_vars, categorical=_cat_vars)
+def _(SITE_NAME, cohort_merged_for_t1, hosp_df, tableone):
+    # Pull patient_id from hosp_df so we can report unique-patient count alongside Table 1
+    _df = cohort_merged_for_t1.df().merge(
+        hosp_df[['hospitalization_id', 'patient_id']],
+        on='hospitalization_id',
+        how='left',
+    )
+    # Binary var relabeling: convert 0/1 to No/Yes so the row labels in Table 1 read like
+    # clinical paper conventions rather than "0" / "1". Combined with order+limit below,
+    # this collapses each binary var to a single "Yes" row (the 0 row is redundant).
+    _df['ever_pressor'] = _df['ever_pressor'].map({0: 'No', 1: 'Yes'})
+    _df['sepsis_ase'] = _df['sepsis_ase'].map({0: 'No', 1: 'Yes'})
+
+    n_hosp = _df['hospitalization_id'].nunique()
+    n_pat = _df['patient_id'].nunique()
+    print(f"Table 1 cohort: N={n_hosp} hospitalizations from {n_pat} unique patients")
+
+    # NEW Table 1: standard ICU epidemiology baseline characteristics
+    _cont_vars = [
+        'age',
+        'bmi',
+        'cci_score',
+        'sofa_1st24h',
+        'pf_1st24h_min',
+        'imv_duration_hrs',
+    ]
+    # Vars to display as median [Q1, Q3] instead of mean (SD).
+    # cci/sofa are integer + right-skewed; pf is heavily skewed (ARDS tail);
+    # imv duration has 24h floor + long right tail. age/bmi stay mean (SD).
+    _nonnormal_vars = [
+        'cci_score',
+        'sofa_1st24h',
+        'pf_1st24h_min',
+        'imv_duration_hrs',
+    ]
+    _cat_vars = [
+        'sex_category',
+        'icu_type',
+        'ever_pressor',
+        'sepsis_ase',
+    ]
+
+    # OLD Table 1 vars (kept for easy reactivation, do not delete):
+    # outcome_vars = ['_sbt_done_today', '_success_extub_today']
+    # diff_doses = ['prop_dif', 'fenteq_dif', 'midazeq_dif']
+    # _cont_vars = ['age', 'sofa_total', 'cci_score'] + diff_doses
+    # _cat_vars = outcome_vars + ['sex_category', 'icu_type']
+
+    table1_overall = tableone.TableOne(
+        data=_df,
+        continuous=_cont_vars,
+        categorical=_cat_vars,
+        nonnormal=_nonnormal_vars,
+        # Show only the "Yes" row for binary vars (the "No" row is redundant since
+        # it's simply total - yes). `order` puts Yes first, `limit=1` drops the rest.
+        # Verified via tableone/formatting.py:89-128 that apply_limits respects order.
+        order={'ever_pressor': ['Yes', 'No'], 'sepsis_ase': ['Yes', 'No']},
+        limit={'ever_pressor': 1, 'sepsis_ase': 1},
+    )
     table1_overall.to_csv('output_to_share/table1.csv')
     print("Saved output_to_share/table1.csv")
     return
