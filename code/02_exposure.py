@@ -474,12 +474,17 @@ def _():
 def _(duckdb, sed_dose_by_hr):
     sed_dose_agg = duckdb.sql(
         """
-        -- Aggregate dose totals per hospitalization, day, shift
+        -- Aggregate dose totals AND hour counts per hospitalization, day, shift.
+        -- n_hours is used downstream to convert totals to per-hour dose rates,
+        -- which avoids partial-shift bias in the Dose by Shift descriptive table
+        -- and makes model dose coefficients interpretable as rates (see
+        -- 05_analytical_dataset.py for the ÷12 rate conversion).
         FROM sed_dose_by_hr
         SELECT hospitalization_id, _nth_day, _shift
             , SUM(prop_mg_total) AS prop_mg_total
             , SUM(_fenteq_mcg_total) AS fenteq_mcg_total
             , SUM(_midazeq_mg_total) AS midazeq_mg_total
+            , COUNT(*) AS n_hours
         GROUP BY hospitalization_id, _nth_day, _shift
         ORDER BY hospitalization_id, _nth_day, _shift
         """
@@ -491,18 +496,23 @@ def _(duckdb, sed_dose_by_hr):
 @app.cell
 def _(sed_dose_agg):
     # NOTE: Pivot to wide day/night columns using pandas .pivot()
+    # n_hours_day/night flow through so downstream can compute per-hour dose rates
+    # that correctly handle partial shifts (intubation / extubation day edges).
     sed_dose_daily = sed_dose_agg.pivot(
         index=['hospitalization_id', '_nth_day'],
         columns='_shift',
-        values=['prop_mg_total', 'fenteq_mcg_total', 'midazeq_mg_total'],
+        values=['prop_mg_total', 'fenteq_mcg_total', 'midazeq_mg_total', 'n_hours'],
     ).reset_index()
 
-    # Flatten MultiIndex columns to clean names
+    # Flatten MultiIndex columns to clean names. The pivot preserves the
+    # order: value_col1×shifts, value_col2×shifts, ... so pairs are always
+    # (value_col, 'day') then (value_col, 'night').
     sed_dose_daily.columns = [
         'hospitalization_id', '_nth_day',
         'prop_day', 'prop_night',
         'fenteq_day', 'fenteq_night',
         'midazeq_day', 'midazeq_night',
+        'n_hours_day', 'n_hours_night',
     ]
     # Drop any columns that ended up as None (e.g. if a shift is missing)
     sed_dose_daily = sed_dose_daily.loc[:, [c for c in sed_dose_daily.columns if c is not None]]

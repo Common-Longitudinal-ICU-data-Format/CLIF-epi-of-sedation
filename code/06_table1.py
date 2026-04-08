@@ -237,8 +237,13 @@ def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, tableone):
     table1_by_shift = tableone.TableOne(
         data=_df, continuous=_cont_vars, groupby='_shift', categorical=_cat_vars, pval=True
     )
-    table1_by_shift.to_csv('output_to_share/table1_by_shift.csv')
-    print("Saved output_to_share/table1_by_shift.csv")
+    # ARCHIVED 2026-04-08: replaced by the paired+unpaired per-patient rate
+    # analysis in code/07_descriptive.py (outputs sed_dose_by_shift.csv).
+    # The tableone computation above is kept intact for git history / easy
+    # restore; only the CSV write is disabled so the outdated
+    # output_to_share/table1_by_shift.csv is no longer regenerated.
+    # table1_by_shift.to_csv('output_to_share/table1_by_shift.csv')
+    # print("Saved output_to_share/table1_by_shift.csv")
     return
 
 

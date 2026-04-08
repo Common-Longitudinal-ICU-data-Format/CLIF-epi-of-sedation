@@ -127,7 +127,7 @@ def _():
 
     1. **baseline**: age + sex + ICU type + CCI
 
-    2. **daydose**: baseline + daytime absolute doses (`_prop_day`, `_fenteq_day`, `_midazeq_day`)
+    2. **daydose**: baseline + daytime absolute dose rates (`_prop_day`, `_fenteq_day`, `_midazeq_day`, all in mg/hr or mcg/hr)
 
     3. **sofa**: daydose + `sofa_total`
 
@@ -153,16 +153,22 @@ def _():
     # To change a scale (e.g., age per 10 yrs): edit the 'scale' divisor.
     # To change a label: edit 'label'.
     # To add a new scaled variable: add a new entry.
+    #
+    # UNIT NOTE: Dose columns (prop_dif, fenteq_dif, midazeq_dif, _prop_day,
+    # _fenteq_day, _midazeq_day) are per-hour RATES (mg/hr or mcg/hr), not
+    # per-shift totals. The ÷12 conversion happens in 05_analytical_dataset.py.
+    # Scales below were retuned so "per N unit" stays clinically meaningful
+    # after the rate conversion (old totals-era scales were ~12x larger).
     VAR_DISPLAY = {
-        # Exposures (day-night differences)
-        'prop_dif':     {'scale': 100, 'label': 'Δ propofol (per 100 mg)'},
-        'fenteq_dif':   {'scale': 100, 'label': 'Δ fentanyl eq (per 100 mcg)'},
-        'midazeq_dif':  {'scale': 1,   'label': 'Δ midazolam eq (per 1 mg)'},
-        # Daytime absolute doses
-        '_prop_day':    {'scale': 100, 'label': 'Daytime propofol (per 100 mg)'},
-        '_fenteq_day':  {'scale': 100, 'label': 'Daytime fentanyl eq (per 100 mcg)'},
-        '_midazeq_day': {'scale': 1,   'label': 'Daytime midazolam eq (per 1 mg)'},
-        # Other continuous covariates
+        # Exposures (day-night rate differences)
+        'prop_dif':     {'scale': 10,  'label': 'Δ propofol (per 10 mg/hr)'},
+        'fenteq_dif':   {'scale': 10,  'label': 'Δ fentanyl eq (per 10 mcg/hr)'},
+        'midazeq_dif':  {'scale': 0.1, 'label': 'Δ midazolam eq (per 0.1 mg/hr)'},
+        # Daytime absolute rates
+        '_prop_day':    {'scale': 10,  'label': 'Daytime propofol (per 10 mg/hr)'},
+        '_fenteq_day':  {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
+        '_midazeq_day': {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
+        # Other continuous covariates (unchanged)
         'age':          {'scale': 1,   'label': 'Age (per year)'},
         'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
         'sofa_total':   {'scale': 1,   'label': 'SOFA total (per point)'},

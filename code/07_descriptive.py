@@ -62,6 +62,17 @@ def _(pd):
     return (sed_dose_by_hr,)
 
 
+@app.cell
+def _(pd):
+    # sed_dose_daily: one row per (hospitalization_id, _nth_day) with day/night
+    # shift totals AND n_hours_day/n_hours_night (added in 02_exposure.py).
+    # Used by the "Dose by Shift" cell below for per-patient hourly-rate
+    # computation that correctly handles partial-shift bias.
+    sed_dose_daily = pd.read_parquet("output/sed_dose_daily.parquet")
+    print(f"sed_dose_daily: {len(sed_dose_daily)} rows")
+    return (sed_dose_daily,)
+
+
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -102,22 +113,118 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, pd, sed_dose_by_hr):
-    import scipy.stats as stats
-    test_cols = ['prop_mg_total', '_fenteq_mcg_total', '_midazeq_mg_total']
-    shift_day = sed_dose_by_hr[sed_dose_by_hr['_shift'] == 'day']
-    shift_night = sed_dose_by_hr[sed_dose_by_hr['_shift'] == 'night']
-    t_pvals = {}
-    for col in test_cols:
-        tstat, pval = stats.ttest_ind(shift_day[col], shift_night[col], nan_policy='omit', equal_var=False)
-        t_pvals[col] = pval
+def _(cohort_merged_final, pd, sed_dose_daily):
+    # Dose by Shift — paired + unpaired day-vs-night sedation rates.
+    #
+    # Per-hospitalization weighted-mean hourly dose rate:
+    #     rate = sum(dose across all days) / sum(hours across all days)
+    # This correctly handles partial-shift bias (extubation day has <12h
+    # on the last shift) — totals would be artificially low for the partial
+    # side. Rates are directly comparable across patients regardless of
+    # IMV duration.
+    #
+    # Primary test: paired t-test (each patient contributes both night and
+    # day rates; paired removes between-patient variance). Unpaired Welch's
+    # t-test shown as a robustness check — it ignores the pairing and is
+    # therefore more conservative.
+    from scipy import stats as _stats
 
-    sed_dose_by_shift = sed_dose_by_hr.groupby('_shift')[test_cols].mean().reset_index()
-    sed_dose_by_shift.rename(columns={'_shift': 'shift'}, inplace=True)
-    pval_row = pd.Series({'shift': 'ttest_pval', **t_pvals})
-    out_df = pd.concat([sed_dose_by_shift, pd.DataFrame([pval_row])], ignore_index=True)
-    out_df.to_csv('output_to_share/sed_dose_by_shift.csv', index=False)
+    # Cohort hosp IDs from analytical_dataset (post-NMB exclusion)
+    _cohort_hosp_ids = cohort_merged_final['hospitalization_id'].unique()
+
+    # Aggregate per patient: sum totals AND hours across all days
+    _sed_filtered = sed_dose_daily[
+        sed_dose_daily['hospitalization_id'].isin(_cohort_hosp_ids)
+    ]
+    _per_pt = (
+        _sed_filtered.groupby('hospitalization_id')
+        .agg({
+            'fenteq_day': 'sum', 'fenteq_night': 'sum',
+            'midazeq_day': 'sum', 'midazeq_night': 'sum',
+            'prop_day': 'sum', 'prop_night': 'sum',
+            'n_hours_day': 'sum', 'n_hours_night': 'sum',
+        })
+        .reindex(_cohort_hosp_ids)
+        .fillna(0)
+    )
+
+    def _safe_rate(num, denom):
+        """num/denom with 0 for denom==0 (avoids NaN; shouldn't occur in practice)."""
+        return num.where(denom > 0, other=0) / denom.where(denom > 0, other=1)
+
+    _per_pt['fenteq_rate_night'] = _safe_rate(_per_pt['fenteq_night'], _per_pt['n_hours_night'])
+    _per_pt['fenteq_rate_day']   = _safe_rate(_per_pt['fenteq_day'],   _per_pt['n_hours_day'])
+    _per_pt['midazeq_rate_night'] = _safe_rate(_per_pt['midazeq_night'], _per_pt['n_hours_night'])
+    _per_pt['midazeq_rate_day']   = _safe_rate(_per_pt['midazeq_day'],   _per_pt['n_hours_day'])
+    _per_pt['prop_rate_night']   = _safe_rate(_per_pt['prop_night'], _per_pt['n_hours_night'])
+    _per_pt['prop_rate_day']     = _safe_rate(_per_pt['prop_day'],   _per_pt['n_hours_day'])
+
+    print(f"Per-patient rates: {len(_per_pt)} hospitalizations")
+
+    def _paired_stats(night, day):
+        diff = night - day
+        n = len(diff)
+        mean_diff = diff.mean()
+        se = diff.std(ddof=1) / (n ** 0.5)
+        t_crit = _stats.t.ppf(0.975, df=n - 1)
+        return (
+            mean_diff,
+            mean_diff - t_crit * se,
+            mean_diff + t_crit * se,
+            _stats.ttest_rel(night, day).pvalue,
+        )
+
+    def _unpaired_stats(night, day):
+        var_n, var_d = night.var(ddof=1), day.var(ddof=1)
+        n_n, n_d = len(night), len(day)
+        mean_diff = night.mean() - day.mean()
+        se = (var_n / n_n + var_d / n_d) ** 0.5
+        df_welch = (var_n / n_n + var_d / n_d) ** 2 / (
+            (var_n / n_n) ** 2 / (n_n - 1) + (var_d / n_d) ** 2 / (n_d - 1)
+        )
+        t_crit = _stats.t.ppf(0.975, df=df_welch)
+        return (
+            mean_diff,
+            mean_diff - t_crit * se,
+            mean_diff + t_crit * se,
+            _stats.ttest_ind(night, day, equal_var=False).pvalue,
+        )
+
+    def _fmt_mean_sd(m, s):
+        return f"{m:.2f} ({s:.2f})"
+
+    def _fmt_diff_ci(d, lo, hi):
+        return f"{d:.2f} ({lo:.2f} to {hi:.2f})"
+
+    def _fmt_p(p):
+        if pd.isna(p):
+            return "n/a"
+        if p < 0.001:
+            return "<0.001"
+        return f"{p:.3f}"
+
+    _rows = []
+    for _label, _night_col, _day_col in [
+        ('Fentanyl equivalents dose rate (mcg/hr)', 'fenteq_rate_night', 'fenteq_rate_day'),
+        ('Midazolam equivalents dose rate (mg/hr)', 'midazeq_rate_night', 'midazeq_rate_day'),
+        ('Propofol dose rate (mg/hr)',              'prop_rate_night',   'prop_rate_day'),
+    ]:
+        _night = _per_pt[_night_col]
+        _day = _per_pt[_day_col]
+        for _spec_name, _stat_fn in [('paired', _paired_stats), ('unpaired', _unpaired_stats)]:
+            _mean_diff, _lo, _hi, _p = _stat_fn(_night, _day)
+            _rows.append({
+                'Variable': _label,
+                'spec': _spec_name,
+                'Nighttime (7p-7a), mean (SD)': _fmt_mean_sd(_night.mean(), _night.std(ddof=1)),
+                'Daytime (7a-7p), mean (SD)':   _fmt_mean_sd(_day.mean(), _day.std(ddof=1)),
+                'mean difference (95% CI)':      _fmt_diff_ci(_mean_diff, _lo, _hi),
+                'p-value':                       _fmt_p(_p),
+            })
+    sed_dose_by_shift = pd.DataFrame(_rows)
+    sed_dose_by_shift.to_csv('output_to_share/sed_dose_by_shift.csv', index=False)
     print("Saved output_to_share/sed_dose_by_shift.csv")
+    print(sed_dose_by_shift.to_string(index=False))
     return
 
 

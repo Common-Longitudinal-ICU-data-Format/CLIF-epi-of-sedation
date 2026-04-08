@@ -39,15 +39,17 @@ def _():
 
     3. Table 1 (baseline characteristics)
 
-    4. Correlation matrix heatmap
+    4. Dose by Shift (paired + unpaired day-vs-night hourly rates)
 
-    5. Hourly dose visualization
+    5. Correlation matrix heatmap
 
-    6. Model comparison — SBT Done Next Day (GEE)
+    6. Hourly dose visualization
 
-    7. Model comparison — Successful Extubation (GEE)
+    7. Model comparison — SBT Done Next Day (GEE)
 
-    8. Model comparison — Successful Extubation (Logit)
+    8. Model comparison — Successful Extubation (GEE)
+
+    9. Model comparison — Successful Extubation (Logit)
     """)
     return
 
@@ -306,6 +308,15 @@ def _(pd):
 
 @app.cell
 def _(pd):
+    # Dose by Shift (from 07_descriptive.py) — paired + unpaired day-vs-night
+    # sedation rates, long/tidy format (6 rows × 6 columns).
+    dose_by_shift_df = pd.read_csv("output_to_share/sed_dose_by_shift.csv")
+    print(f"Dose by Shift: {dose_by_shift_df.shape}")
+    return (dose_by_shift_df,)
+
+
+@app.cell
+def _(pd):
     # Correlation matrix (from 07_descriptive.py)
     corr_df = pd.read_csv("output_to_share/pairwise_corr_matrix.csv", index_col=0)
     print(f"Correlation matrix: {corr_df.shape}")
@@ -341,6 +352,7 @@ def _(
     cohort_stats,
     corr_df,
     datetime,
+    dose_by_shift_df,
     extub_gee_df,
     extub_logit_df,
     plt,
@@ -368,11 +380,12 @@ def _(
         "  1. Title",
         "  2. CONSORT flow",
         "  3. Table 1: Baseline characteristics",
-        "  4. Correlation matrix",
-        "  5. Hourly dose distribution",
-        "  6. Model comparison — SBT Done Next Day (GEE)",
-        "  7. Model comparison — Successful Extubation (GEE)",
-        "  8. Model comparison — Successful Extubation (Logit)",
+        "  4. Dose by Shift: Day vs Night hourly sedation rates",
+        "  5. Correlation matrix",
+        "  6. Hourly dose distribution",
+        "  7. Model comparison — SBT Done Next Day (GEE)",
+        "  8. Model comparison — Successful Extubation (GEE)",
+        "  9. Model comparison — Successful Extubation (Logit)",
     ]
 
     # Significance legend shown as footnote on every model comparison table
@@ -407,7 +420,35 @@ def _(
             fontsize=9,
         )
 
-        # Page 4: Correlation matrix
+        # Page 4: Dose by Shift (NEW) — paired + unpaired day-vs-night rates.
+        # Compose compound row labels ("<variable> — paired/unpaired") to
+        # collapse the tidy 6-row × 6-col CSV into a 6-row × 4-col
+        # publication layout matching the user's original spec.
+        _dose_by_shift_display = dose_by_shift_df.copy()
+        _dose_by_shift_display['_row_label'] = (
+            _dose_by_shift_display['Variable'] + ' — ' + _dose_by_shift_display['spec']
+        )
+        _dose_by_shift_display = (
+            _dose_by_shift_display
+            .set_index('_row_label')
+            .drop(columns=['Variable', 'spec'])
+        )
+        _dose_by_shift_display.index.name = ''
+        add_stargazer_table(
+            _pdf,
+            _dose_by_shift_display,
+            "Dose by Shift: Day vs Night Hourly Sedation Rates",
+            notes=(
+                "Per-hospitalization weighted-mean hourly dose rate "
+                "(sum of dose / sum of hours on IMV within each shift). "
+                "Paired t-test is the primary analysis; unpaired Welch's "
+                "t-test shown as a robustness check. Two-sided p-values; "
+                "95% CI for mean difference."
+            ),
+            fontsize=9,
+        )
+
+        # Page 5: Correlation matrix
         add_heatmap_page(_pdf, corr_df, "Pairwise Pearson Correlation Matrix")
 
         # Page 5: Hourly dose distribution

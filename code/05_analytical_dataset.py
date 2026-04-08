@@ -165,15 +165,22 @@ def _(
         , _success_extub_today: o._success_extub
         , sbt_done_next_day: LEAD(o.sbt_done) OVER w
         , success_extub_next_day: LEAD(o._success_extub) OVER w
-        , _prop_day: COALESCE(s.prop_day, 0)
-        , _prop_night: COALESCE(s.prop_night, 0)
-        , _fenteq_day: COALESCE(s.fenteq_day, 0)
-        , _fenteq_night: COALESCE(s.fenteq_night, 0)
-        , _midazeq_day: COALESCE(s.midazeq_day, 0)
-        , _midazeq_night: COALESCE(s.midazeq_night, 0)
-        , prop_dif: COALESCE(s.prop_night, 0) - COALESCE(s.prop_day, 0)
-        , fenteq_dif: COALESCE(s.fenteq_night, 0) - COALESCE(s.fenteq_day, 0)
-        , midazeq_dif: COALESCE(s.midazeq_night, 0) - COALESCE(s.midazeq_day, 0)
+        -- NOTE: Dose columns below are per-hour RATES (mg/hr or mcg/hr), not
+        -- per-shift totals. Conversion: totals ÷ 12 (hours per shift). This is
+        -- valid because the filter below (`_nth_day > 0 AND ... IS NOT NULL`)
+        -- guarantees complete 24h 7am-anchored days — partial shifts at
+        -- intubation / extubation are already excluded. The rate unit makes
+        -- dose coefficients in 08_models.py directly comparable across
+        -- patients and avoids partial-shift bias in descriptives.
+        , _prop_day: COALESCE(s.prop_day, 0) / 12.0
+        , _prop_night: COALESCE(s.prop_night, 0) / 12.0
+        , _fenteq_day: COALESCE(s.fenteq_day, 0) / 12.0
+        , _fenteq_night: COALESCE(s.fenteq_night, 0) / 12.0
+        , _midazeq_day: COALESCE(s.midazeq_day, 0) / 12.0
+        , _midazeq_night: COALESCE(s.midazeq_night, 0) / 12.0
+        , prop_dif: (COALESCE(s.prop_night, 0) - COALESCE(s.prop_day, 0)) / 12.0
+        , fenteq_dif: (COALESCE(s.fenteq_night, 0) - COALESCE(s.fenteq_day, 0)) / 12.0
+        , midazeq_dif: (COALESCE(s.midazeq_night, 0) - COALESCE(s.midazeq_day, 0)) / 12.0
         , COLUMNS('(7am)|(7pm)')
         , age: h.age_at_admission
         , p.sex_category
