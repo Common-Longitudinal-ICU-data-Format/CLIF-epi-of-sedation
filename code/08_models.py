@@ -310,5 +310,196 @@ def _(MODEL_CONFIGS, VAR_DISPLAY, fitted, np, pd, re):
     return
 
 
+# ── Marginal Effect Plots ─────────────────────────────────────────────
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Marginal Effect Plots
+
+    2×3 figure per (outcome × model_type) showing predicted probability of the
+    outcome as each exposure varies over its 2.5–97.5 percentile range, with
+    all other covariates held at median (continuous) or mode (categorical).
+    Produced from the `sofa` spec (closest to the example paper's adjustment
+    set). Uses `result.get_prediction(new_data)` which handles link-scale
+    CI transformation internally.
+
+    **Rows**: [daytime rate, day-to-night Δ rate]
+    **Cols**: [propofol, fentanyl eq, midazolam eq]
+    **Style**: ggplot-like (gray panel bg, white grid, black line, gray CI ribbon)
+    """)
+    return
+
+
+@app.cell
+def _(VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
+    # `np` is inherited from the fitting cell (returned above) to avoid the
+    # marimo "multiple definitions" error. `_plt` is private (underscore
+    # prefix) so it doesn't collide with any future cell that imports plt.
+    import matplotlib.pyplot as _plt
+
+    # Focal variables + human-friendly x-axis labels (actual hourly-rate units).
+    # The 2×3 panel layout: row = {daytime rate, day-to-night Δ rate}, col = {prop, fenteq, midazeq}.
+    # IMPORTANT: dose columns in cohort_merged_final are already in mg/hr or mcg/hr
+    # (05_analytical_dataset.py divides shift totals by 12), so no extra conversion
+    # is needed before computing percentiles or constructing the grid.
+    FOCAL_VARS = [
+        [('_prop_day',    'Mean Daytime Propofol Rate (mg/hr)'),
+         ('_fenteq_day',  'Mean Daytime Fentanyl Eq Rate (mcg/hr)'),
+         ('_midazeq_day', 'Mean Daytime Midazolam Eq Rate (mg/hr)')],
+        [('prop_dif',     'Day-to-Night Δ Propofol Rate (mg/hr)'),
+         ('fenteq_dif',   'Day-to-Night Δ Fentanyl Eq Rate (mcg/hr)'),
+         ('midazeq_dif',  'Day-to-Night Δ Midazolam Eq Rate (mg/hr)')],
+    ]
+
+    Y_LABEL = {
+        'sbt_done_next_day': 'Probability of Passing SBT',
+        'success_extub_next_day': 'Probability of Successful Extubation',
+    }
+
+    def _build_reference_row(df_scaled):
+        """Median for numeric columns, mode for object/string columns.
+
+        `include=['object', 'str']` is explicit to silence Pandas 4 deprecation
+        warnings about object/str dtype overlap.
+        """
+        ref = df_scaled.median(numeric_only=True).to_dict()
+        for col in df_scaled.select_dtypes(include=['object', 'str']).columns:
+            ref[col] = df_scaled[col].mode().iloc[0]
+        return ref
+
+    def _marginal_prediction(result, ref_row, focal_col, scaled_grid):
+        """Run result.get_prediction for a grid holding everything else constant.
+
+        Returns (prob, ci_lo, ci_hi) all in probability space. statsmodels has
+        TWO different `summary_frame()` column schemes depending on the model
+        family — verified at statsmodels/base/_prediction_inference.py lines
+        118 and 326:
+
+        - `PredictionResultsMean` (GEE, GLM, OLS):
+          columns = ['mean', 'mean_se', 'mean_ci_lower', 'mean_ci_upper']
+        - `PredictionResultsBase` / `PredictionResultsMonotonic` (Logit, discrete):
+          columns = ['predicted', 'se', 'ci_lower', 'ci_upper']
+
+        We detect which scheme is present and use the appropriate keys.
+        """
+        new_data = pd.DataFrame([ref_row] * len(scaled_grid))
+        new_data[focal_col] = scaled_grid
+        pred = result.get_prediction(new_data)
+        sf = pred.summary_frame()
+        if 'mean' in sf.columns:
+            # GEE / GLM path
+            prob = np.asarray(sf['mean'])
+            ci_lo = np.asarray(sf['mean_ci_lower'])
+            ci_hi = np.asarray(sf['mean_ci_upper'])
+        elif 'predicted' in sf.columns:
+            # Logit / discrete path
+            prob = np.asarray(sf['predicted'])
+            ci_lo = np.asarray(sf['ci_lower'])
+            ci_hi = np.asarray(sf['ci_upper'])
+        else:
+            raise ValueError(
+                f"Unexpected summary_frame columns: {list(sf.columns)}. "
+                "Expected either ['mean', 'mean_ci_lower', 'mean_ci_upper'] "
+                "or ['predicted', 'ci_lower', 'ci_upper']."
+            )
+        return prob, ci_lo, ci_hi
+
+    def _ggplot_ax(ax):
+        """Style an axes to look like the ggplot default (gray bg, white grid)."""
+        ax.set_facecolor('#ebebeb')
+        ax.grid(color='white', linewidth=0.8, which='major', zorder=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(colors='#4d4d4d', labelsize=8)
+        ax.xaxis.label.set_color('#4d4d4d')
+        ax.yaxis.label.set_color('#4d4d4d')
+
+    def plot_marginal_effects(result, outcome, model_type, spec_label):
+        """Build and save a 2×3 figure of marginal-effect curves."""
+        # Rebuild scaled dataset (must match training-space units for prediction)
+        df_scaled = cohort_merged_final.copy()
+        for col, info in VAR_DISPLAY.items():
+            if col in df_scaled.columns and info['scale'] != 1:
+                df_scaled[col] = df_scaled[col] / info['scale']
+        ref_row = _build_reference_row(df_scaled)
+
+        fig, axes = _plt.subplots(2, 3, figsize=(12, 7.5))
+        fig.patch.set_facecolor('white')
+
+        panel_letters = ['A', 'B', 'C', 'D', 'E', 'F']
+        pidx = 0
+
+        for row_idx in range(2):
+            for col_idx in range(3):
+                focal, xlabel = FOCAL_VARS[row_idx][col_idx]
+                ax = axes[row_idx, col_idx]
+                _ggplot_ax(ax)
+
+                # Observed percentile range in ACTUAL hourly-rate units
+                raw = cohort_merged_final[focal].dropna()
+                q_lo, q_hi = np.percentile(raw, [2.5, 97.5])
+                actual_grid = np.linspace(q_lo, q_hi, 50)
+                # Convert to scaled-training-space units for prediction
+                scale = VAR_DISPLAY.get(focal, {}).get('scale', 1)
+                scaled_grid = actual_grid / scale
+
+                prob, ci_lo, ci_hi = _marginal_prediction(
+                    result, ref_row, focal, scaled_grid
+                )
+
+                ax.fill_between(
+                    actual_grid, ci_lo, ci_hi,
+                    color='#808080', alpha=0.35, zorder=2,
+                )
+                ax.plot(
+                    actual_grid, prob,
+                    color='black', linewidth=1.5, zorder=3,
+                )
+
+                ax.set_xlabel(xlabel, fontsize=9)
+                ax.set_ylabel(
+                    Y_LABEL.get(outcome, 'Predicted Probability'),
+                    fontsize=9,
+                )
+                ax.set_ylim(0, 1)
+                # Panel letter in the top-left corner
+                ax.text(
+                    -0.12, 1.08, panel_letters[pidx],
+                    transform=ax.transAxes,
+                    fontsize=14, fontweight='bold', va='top', ha='left',
+                )
+                pidx += 1
+
+        fig.suptitle(
+            f"{Y_LABEL.get(outcome, 'Probability')} by Sedative Exposure\n"
+            f"({spec_label} spec, {model_type.upper()})",
+            fontsize=11, y=1.00,
+        )
+        fig.tight_layout()
+
+        _outcome_short = 'sbt' if 'sbt' in outcome else 'extub'
+        out_path = (
+            f"output_to_share/figures/"
+            f"marginal_effects_{_outcome_short}_{model_type}_{spec_label}.png"
+        )
+        fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
+        _plt.close(fig)
+        print(f"Saved: {out_path}")
+        return out_path
+
+    # Generate one 2×3 figure per (outcome, model_type) using the sofa spec.
+    # To switch specs later, change SPEC_FOR_PLOT to 'baseline', 'daydose',
+    # 'clinical', or (if/when added) 'sofa_rcs' — see memory plan_rcs_exposures.md.
+    SPEC_FOR_PLOT = 'sofa'
+    for (_outcome, _mt), _spec_dict in fitted.items():
+        if SPEC_FOR_PLOT in _spec_dict:
+            plot_marginal_effects(
+                _spec_dict[SPEC_FOR_PLOT], _outcome, _mt, SPEC_FOR_PLOT
+            )
+    return
+
+
 if __name__ == "__main__":
     app.run()
