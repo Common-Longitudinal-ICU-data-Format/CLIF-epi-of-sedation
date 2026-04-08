@@ -211,11 +211,26 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
                           "pf_level_7pm + nee_7am + nee_7pm")
 
+    # RCS (restricted cubic splines) variant of the sofa spec.
+    # Wraps the 6 exposure variables in patsy's cr() transform for natural
+    # cubic regression splines with df=4 (→ 3 basis columns per variable).
+    # Non-exposure adjustment variables stay linear/categorical.
+    # Used for marginal-effect plots (curves can bend to reveal dose-response
+    # shape) but excluded from the wide comparison CSV — cr() basis coefficients
+    # aren't human-interpretable as OR-per-unit. See plan_rcs_exposures.md memory.
+    SOFA_RCS = (
+        "{{outcome}} ~ "
+        "cr(prop_dif, df=4) + cr(fenteq_dif, df=4) + cr(midazeq_dif, df=4) + "
+        "cr(_prop_day, df=4) + cr(_fenteq_day, df=4) + cr(_midazeq_day, df=4) + "
+        "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
+    )
+
     COVARIATE_SPECS = [
         {'label': 'baseline', 'formula': BASELINE},
         {'label': 'daydose',  'formula': DAYDOSE},
         {'label': 'sofa',     'formula': SOFA},
         {'label': 'clinical', 'formula': CLINICAL},
+        {'label': 'sofa_rcs', 'formula': SOFA_RCS},
     ]
 
     # ── Dimension 2: outcome x model type ─────────────────────────────
@@ -304,7 +319,13 @@ def _(MODEL_CONFIGS, VAR_DISPLAY, fitted, np, pd, re):
             continue
         _outcome_short = 'sbt' if 'sbt' in _config['outcome'] else 'extub'
         _fname = f"output_to_share/model_comparison_{_outcome_short}_{_config['model_type']}.csv"
-        _wide = build_wide_table(fitted[_key])
+        # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
+        # as OR-per-unit. The RCS results are still exported in the long-format
+        # sensitivity_analysis.csv above, and visualized via marginal-effect plots.
+        _results_for_table = {
+            _k: _v for _k, _v in fitted[_key].items() if _k != 'sofa_rcs'
+        }
+        _wide = build_wide_table(_results_for_table)
         _wide.to_csv(_fname)
         print(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
     return
@@ -489,15 +510,20 @@ def _(VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
         print(f"Saved: {out_path}")
         return out_path
 
-    # Generate one 2×3 figure per (outcome, model_type) using the sofa spec.
-    # To switch specs later, change SPEC_FOR_PLOT to 'baseline', 'daydose',
-    # 'clinical', or (if/when added) 'sofa_rcs' — see memory plan_rcs_exposures.md.
-    SPEC_FOR_PLOT = 'sofa'
+    # Generate one 2×3 figure per (outcome, model_type, spec).
+    # PLOT_SPECS controls which spec(s) to plot. We generate BOTH the linear
+    # `sofa` spec AND the RCS `sofa_rcs` spec so reviewers can visually compare
+    # them — if the RCS curve looks straight, that's a "no nonlinearity detected"
+    # signal without needing a formal p-value threshold. Plotting both specs
+    # also gives a stronger methods story than pre-specifying one.
+    # To add/remove specs, edit PLOT_SPECS. Filenames encode the spec label.
+    PLOT_SPECS = ['sofa', 'sofa_rcs']
     for (_outcome, _mt), _spec_dict in fitted.items():
-        if SPEC_FOR_PLOT in _spec_dict:
-            plot_marginal_effects(
-                _spec_dict[SPEC_FOR_PLOT], _outcome, _mt, SPEC_FOR_PLOT
-            )
+        for _spec_label in PLOT_SPECS:
+            if _spec_label in _spec_dict:
+                plot_marginal_effects(
+                    _spec_dict[_spec_label], _outcome, _mt, _spec_label
+                )
     return
 
 
