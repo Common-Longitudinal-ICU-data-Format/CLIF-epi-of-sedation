@@ -40,14 +40,15 @@ def _():
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
 
-    os.makedirs("output_to_share", exist_ok=True)
+    # Site-scoped output dirs (see Makefile SITE= flag).
+    os.makedirs(f"output_to_share/{SITE_NAME}/figures", exist_ok=True)
     print(f"Site: {SITE_NAME}")
-    return (pd,)
+    return SITE_NAME, pd
 
 
 @app.cell
-def _(pd):
-    cohort_merged_final = pd.read_parquet("output/analytical_dataset.parquet")
+def _(SITE_NAME, pd):
+    cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset.parquet")
     print(f"Analytical dataset: {len(cohort_merged_final)} rows")
     return (cohort_merged_final,)
 
@@ -67,7 +68,7 @@ def _():
 
 
 @app.cell
-def _(cohort_merged_final, pd):
+def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
     import statsmodels.api as _sm
     sbt_done_formula = """sbt_done_next_day ~ prop_dif + fenteq_dif + midazeq_dif +
@@ -80,10 +81,10 @@ def _(cohort_merged_final, pd):
     print(gee_result.summary())
     _summary_df = gee_result.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv('output_to_share/gee_summary.csv', index=False)
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/gee_summary.csv', index=False)
     _cov_matrix = gee_result.cov_params()
-    _cov_matrix.to_csv('output_to_share/gee_covmat.csv')
-    print("Saved output_to_share/gee_summary.csv, gee_covmat.csv")
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/gee_covmat.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/gee_summary.csv, gee_covmat.csv")
     return
 
 
@@ -96,7 +97,7 @@ def _():
 
 
 @app.cell
-def _(cohort_merged_final, pd):
+def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
     success_extub_formula = """success_extub_next_day ~ prop_dif + fenteq_dif + midazeq_dif +
     _prop_day + _midazeq_day + _fenteq_day +
@@ -108,10 +109,10 @@ def _(cohort_merged_final, pd):
     print(logit_result.summary())
     _summary_df = logit_result.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv('output_to_share/logit_summary.csv', index=False)
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/logit_summary.csv', index=False)
     _cov_matrix = logit_result.cov_params()
-    _cov_matrix.to_csv('output_to_share/logit_covmat.csv')
-    print("Saved output_to_share/logit_summary.csv, logit_covmat.csv")
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/logit_covmat.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/logit_summary.csv, logit_covmat.csv")
     return
 
 
@@ -257,7 +258,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
 
 
 @app.cell
-def _(MODEL_CONFIGS, VAR_DISPLAY, fitted, np, pd, re):
+def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
     # ── Long-format CSV (federated-friendly) ──────────────────────────
     def _extract_long(result, label, outcome, model_type):
         _tbl = result.summary().tables[1]
@@ -272,8 +273,9 @@ def _(MODEL_CONFIGS, VAR_DISPLAY, fitted, np, pd, re):
         for _label, _result in _spec_dict.items():
             sa_results.append(_extract_long(_result, _label, _outcome, _mt))
     sa_all = pd.concat(sa_results, ignore_index=True)
-    sa_all.to_csv('output_to_share/sensitivity_analysis.csv', index=False)
-    print(f"Saved output_to_share/sensitivity_analysis.csv ({len(sa_all)} rows)")
+    _sa_path = f'output_to_share/{SITE_NAME}/sensitivity_analysis.csv'
+    sa_all.to_csv(_sa_path, index=False)
+    print(f"Saved {_sa_path} ({len(sa_all)} rows)")
 
     # ── Wide comparison tables per (outcome, model_type) ──────────────
     def _pretty_label(varname):
@@ -318,7 +320,7 @@ def _(MODEL_CONFIGS, VAR_DISPLAY, fitted, np, pd, re):
         if _key not in fitted or not fitted[_key]:
             continue
         _outcome_short = 'sbt' if 'sbt' in _config['outcome'] else 'extub'
-        _fname = f"output_to_share/model_comparison_{_outcome_short}_{_config['model_type']}.csv"
+        _fname = f"output_to_share/{SITE_NAME}/model_comparison_{_outcome_short}_{_config['model_type']}.csv"
         # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
         # as OR-per-unit. The RCS results are still exported in the long-format
         # sensitivity_analysis.csv above, and visualized via marginal-effect plots.
@@ -354,7 +356,7 @@ def _():
 
 
 @app.cell
-def _(VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
+def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
     # `np` is inherited from the fitting cell (returned above) to avoid the
     # marimo "multiple definitions" error. `_plt` is private (underscore
     # prefix) so it doesn't collide with any future cell that imports plt.
@@ -502,10 +504,10 @@ def _(VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
 
         _outcome_short = 'sbt' if 'sbt' in outcome else 'extub'
         out_path = (
-            f"output_to_share/figures/"
+            f"output_to_share/{SITE_NAME}/figures/"
             f"marginal_effects_{_outcome_short}_{model_type}_{spec_label}.png"
         )
-        fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
+        fig.savefig(out_path, dpi=250, bbox_inches='tight', facecolor='white')
         _plt.close(fig)
         print(f"Saved: {out_path}")
         return out_path

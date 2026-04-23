@@ -52,8 +52,6 @@ def _():
 
     CONFIG_PATH = "config/config.json"
     co = ClifOrchestrator(config_path=CONFIG_PATH)
-
-    os.makedirs("output", exist_ok=True)
     return (
         CONFIG_PATH,
         apply_outlier_handling,
@@ -67,15 +65,17 @@ def _():
 
 @app.cell
 def _(CONFIG_PATH, get_config_or_params):
+    # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return (SITE_NAME,)
 
 
 @app.cell
-def _(pd):
-    cohort_hrly_grids = pd.read_parquet("output/cohort_hrly_grids.parquet")
+def _(SITE_NAME, pd):
+    cohort_hrly_grids = pd.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
     print(f"Hourly grid rows: {len(cohort_hrly_grids)}")
     return (cohort_hrly_grids,)
 
@@ -96,7 +96,7 @@ def _(cohort_hrly_grids):
 
 @app.cell
 def _(SITE_NAME, pd):
-    resp_processed_path = f"output/{SITE_NAME}_resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}/resp_processed_bf.parquet"
     resp_p = pd.read_parquet(resp_processed_path)
     print(f"resp_p: {len(resp_p)} rows (from {resp_processed_path})")
     return (resp_p,)
@@ -420,10 +420,10 @@ def _():
 
 
 @app.cell
-def _():
+def _(SITE_NAME):
     import polars as pl
 
-    _grids = pl.read_parquet("output/cohort_hrly_grids.parquet")
+    _grids = pl.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
     sofa_cohort = (
         _grids
         .group_by(['hospitalization_id', '_nth_day'])
@@ -460,7 +460,7 @@ def _(CONFIG_PATH, get_config_or_params, sofa_cohort):
 
 
 @app.cell
-def _(sofa_raw):
+def _(SITE_NAME, sofa_raw):
     import polars as _pl
 
     sofa_daily = sofa_raw.with_columns(
@@ -489,8 +489,9 @@ def _(sofa_raw):
             "sofa_renal",
         ]
     )
-    sofa_daily.to_pandas().to_parquet("output/sofa_daily.parquet")
-    print(f"Saved: output/sofa_daily.parquet ({sofa_daily.height} patient-days)")
+    _sofa_path = f"output/{SITE_NAME}/sofa_daily.parquet"
+    sofa_daily.to_pandas().to_parquet(_sofa_path)
+    print(f"Saved: {_sofa_path} ({sofa_daily.height} patient-days)")
     return
 
 
@@ -560,7 +561,7 @@ def _():
 
 
 @app.cell
-def _(CONFIG_PATH, cohort_hosp_ids):
+def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids):
     from clifpy import HospitalDiagnosis
     from clifpy.utils import calculate_cci
     from clifpy.utils.comorbidity import calculate_elix
@@ -573,9 +574,9 @@ def _(CONFIG_PATH, cohort_hosp_ids):
     elix_df = calculate_elix(_dx, hierarchy=True)
     print(f"CCI: {len(cci_df)} rows, Elixhauser: {len(elix_df)} rows")
 
-    cci_df.to_parquet("output/cci.parquet", index=False)
-    elix_df.to_parquet("output/elix.parquet", index=False)
-    print("Saved: output/cci.parquet, output/elix.parquet")
+    cci_df.to_parquet(f"output/{SITE_NAME}/cci.parquet", index=False)
+    elix_df.to_parquet(f"output/{SITE_NAME}/elix.parquet", index=False)
+    print(f"Saved: output/{SITE_NAME}/cci.parquet, output/{SITE_NAME}/elix.parquet")
     return
 
 
@@ -726,6 +727,47 @@ def _(CONFIG_PATH, apply_outlier_handling, cohort_hosp_ids, duckdb):
 
 
 @app.cell
+def _(bmi_df, cohort_shift_change_grids, vitals_t1_df):
+    # Cell C2 — Per-patient-day weight at start of each patient-day (7am anchor).
+    # ASOF backward-join most recent vitals weight_kg to each 7am grid row; coalesce
+    # with admission weight (bmi_df.weight_kg = first recorded weight per hospitalization)
+    # when no prior reading exists. Consumed by the mcg/kg/min propofol descriptives
+    # in code/descriptive/.
+    weight_daily = mo.sql(
+        f"""
+        WITH day_starts AS (
+            FROM cohort_shift_change_grids
+            SELECT hospitalization_id, _nth_day, event_dttm
+            WHERE _hr = 7 AND _nth_day > 0
+        )
+        , weight_events AS (
+            FROM vitals_t1_df
+            SELECT hospitalization_id
+                , recorded_dttm
+                , weight_kg: vital_value
+            WHERE vital_category = 'weight_kg' AND vital_value IS NOT NULL
+        )
+        , asof_weight AS (
+            FROM day_starts d
+            ASOF LEFT JOIN weight_events w ON
+                d.hospitalization_id = w.hospitalization_id
+                AND w.recorded_dttm <= d.event_dttm
+            SELECT d.hospitalization_id
+                , d._nth_day
+                , weight_asof: w.weight_kg
+        )
+        FROM asof_weight a
+        LEFT JOIN bmi_df b USING (hospitalization_id)
+        SELECT a.hospitalization_id
+            , a._nth_day
+            , weight_kg_asof_day_start: COALESCE(a.weight_asof, b.weight_kg)
+        ORDER BY a.hospitalization_id, a._nth_day
+        """
+    )
+    return (weight_daily,)
+
+
+@app.cell
 def _(cont_veso_converted, duckdb):
     # Cell D — 'ever on vasopressors' binary per hospitalization.
     # DECISION POINT (revisit): Currently uses CONTINUOUS vasopressor infusions only
@@ -821,7 +863,7 @@ def _(duckdb, first_icu_admit, po2_w, resp_p, vitals_t1_df):
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # Cell F — IMV duration (already computed in 01_cohort.py).
     # NOTE: This is the duration of the FIRST QUALIFYING IMV STREAK per hospitalization,
     # which is also the cohort exposure window (per cohort definition in 01_cohort.py:272-283:
@@ -829,7 +871,7 @@ def _(pd):
     # event and end = COALESCE(_trach_dttm, _next_start_dttm, _last_observed_dttm). Subsequent
     # re-intubations after extubation are NOT included (those would be separate streaks
     # not in the cohort).
-    _imv_streaks_t1 = pd.read_parquet("output/cohort_imv_streaks.parquet")
+    _imv_streaks_t1 = pd.read_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
     imv_dur_df = _imv_streaks_t1[['hospitalization_id', '_duration_hrs']].rename(
         columns={'_duration_hrs': 'imv_duration_hrs'}
     )
@@ -839,13 +881,13 @@ def _(pd):
 
 
 @app.cell
-def _(CONFIG_PATH, cohort_hosp_ids, duckdb, pd):
+def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
     # Cell G — Sepsis CDC Adult Sepsis Event (ASE) via clifpy (cached).
     # compute_ase independently loads many CLIF tables (Hospitalization, MedAdmin-cont,
     # MedAdmin-intermittent, Labs, MicrobiologyCulture, Adt, RespiratorySupport) and can
-    # take 5–15 minutes for ~thousand hospitalizations. Cached to output/ase.parquet and
-    # re-used on subsequent notebook runs unless RERUN_ASE flag is True.
-    _ase_path = "output/ase.parquet"
+    # take 5–15 minutes for ~thousand hospitalizations. Cached to output/{site}/ase.parquet
+    # and re-used on subsequent notebook runs unless RERUN_ASE flag is True.
+    _ase_path = f"output/{SITE_NAME}/ase.parquet"
     if (not os.path.exists(_ase_path)) or RERUN_ASE:
         from clifpy.utils import compute_ase
         ase_full = compute_ase(
@@ -877,6 +919,7 @@ def _(CONFIG_PATH, cohort_hosp_ids, duckdb, pd):
 
 @app.cell
 def _(
+    SITE_NAME,
     ase_df,
     bmi_df,
     duckdb,
@@ -887,7 +930,7 @@ def _(
     sofa_24h_pd,
 ):
     # Cell H — Combine all T1 covariates into one row-per-hospitalization dataframe
-    # and save to output/covariates_t1.parquet for 05_analytical_dataset.py to join.
+    # and save to output/{site}/covariates_t1.parquet for 05_analytical_dataset.py to join.
     covariates_t1 = duckdb.sql("""
         FROM first_icu_admit f
         LEFT JOIN bmi_df USING (hospitalization_id)
@@ -915,9 +958,10 @@ def _(
             , sepsis_ase: COALESCE(ase_df.sepsis_ase, 0)
         ORDER BY f.hospitalization_id
     """).df()
-    covariates_t1.to_parquet("output/covariates_t1.parquet", index=False)
+    _t1_path = f"output/{SITE_NAME}/covariates_t1.parquet"
+    covariates_t1.to_parquet(_t1_path, index=False)
     print(
-        f"Saved: output/covariates_t1.parquet "
+        f"Saved: {_t1_path} "
         f"({len(covariates_t1)} hospitalizations, {covariates_t1.shape[1]} columns)"
     )
     return (covariates_t1,)
@@ -935,14 +979,29 @@ def _():
 
 
 @app.cell
-def _(covs, covs_daily):
+def _(SITE_NAME, covs, covs_daily):
     _covs_shift_df = covs.df()
-    _covs_shift_df.to_parquet("output/covariates_shift.parquet")
-    print(f"Saved: output/covariates_shift.parquet ({len(_covs_shift_df)} rows)")
+    _covs_shift_path = f"output/{SITE_NAME}/covariates_shift.parquet"
+    _covs_shift_df.to_parquet(_covs_shift_path)
+    print(f"Saved: {_covs_shift_path} ({len(_covs_shift_df)} rows)")
 
     _covs_daily_df = covs_daily.df()
-    _covs_daily_df.to_parquet("output/covariates_daily.parquet")
-    print(f"Saved: output/covariates_daily.parquet ({len(_covs_daily_df)} rows)")
+    _covs_daily_path = f"output/{SITE_NAME}/covariates_daily.parquet"
+    _covs_daily_df.to_parquet(_covs_daily_path)
+    print(f"Saved: {_covs_daily_path} ({len(_covs_daily_df)} rows)")
+    return
+
+
+@app.cell
+def _(SITE_NAME, weight_daily):
+    _weight_daily_df = weight_daily.df()
+    _weight_path = f"output/{SITE_NAME}/weight_daily.parquet"
+    _weight_daily_df.to_parquet(_weight_path)
+    _n_nonnull = _weight_daily_df["weight_kg_asof_day_start"].notna().sum()
+    print(
+        f"Saved: {_weight_path} "
+        f"({len(_weight_daily_df)} rows, {_n_nonnull} non-null weights)"
+    )
     return
 
 

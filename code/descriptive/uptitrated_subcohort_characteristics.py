@@ -1,9 +1,9 @@
 """Table 1-style comparison: up-titrated vs stable patient-days.
 
 Defines an "up-titrated patient-day" as one where ANY of:
-  - prop_dif   >  10 mg/hr
-  - fenteq_dif >  25 mcg/hr
-  - midazeq_dif >  1 mg/hr
+  - prop_dif_kgmin > 10 mcg/kg/min   (weight-adjusted)
+  - fenteq_dif     > 25 mcg/hr
+  - midazeq_dif    >  1 mg/hr
 
 Everything else is "stable/decreased". Outputs a CSV comparing the two groups
 on demographics, severity, daytime sedation, and next-day outcomes.
@@ -28,6 +28,7 @@ from _shared import (  # noqa: E402
     THRESHOLDS,
     ensure_dirs,
     load_analytical,
+    prepare_diffs,
 )
 
 
@@ -35,7 +36,7 @@ GROUP_LABEL = {True: "Up-titrated", False: "Stable/decreased"}
 
 
 def main() -> None:
-    df = load_analytical().copy()
+    df = prepare_diffs(load_analytical())
 
     above_any = False
     for drug, col in DIFF_COLS.items():

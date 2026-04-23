@@ -43,32 +43,33 @@ def _():
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
 
-    os.makedirs("output_to_share/figures", exist_ok=True)
+    # Site-scoped output dirs (see Makefile SITE= flag).
+    os.makedirs(f"output_to_share/{SITE_NAME}/figures", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return CONFIG_PATH, SITE_NAME, pd
 
 
 @app.cell
-def _(pd):
-    cohort_merged_final = pd.read_parquet("output/analytical_dataset.parquet")
+def _(SITE_NAME, pd):
+    cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset.parquet")
     print(f"Analytical dataset: {len(cohort_merged_final)} rows")
     return (cohort_merged_final,)
 
 
 @app.cell
-def _(pd):
-    sed_dose_by_hr = pd.read_parquet("output/sed_dose_by_hr.parquet")
+def _(SITE_NAME, pd):
+    sed_dose_by_hr = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_by_hr.parquet")
     print(f"sed_dose_by_hr: {len(sed_dose_by_hr)} rows")
     return (sed_dose_by_hr,)
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # sed_dose_daily: one row per (hospitalization_id, _nth_day) with day/night
     # shift totals AND n_hours_day/n_hours_night (added in 02_exposure.py).
     # Used by the "Dose by Shift" cell below for per-patient hourly-rate
     # computation that correctly handles partial-shift bias.
-    sed_dose_daily = pd.read_parquet("output/sed_dose_daily.parquet")
+    sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet")
     print(f"sed_dose_daily: {len(sed_dose_daily)} rows")
     return (sed_dose_daily,)
 
@@ -98,8 +99,9 @@ def _(SITE_NAME, cohort_merged_final):
     _sns.heatmap(corr_matrix, annot=True, fmt='.2f', cmap='vlag', linewidths=0.5, cbar_kws={'label': 'Pearson Correlation'})
     _plt.title('Pairwise Pearson Correlation Matrix (Continuous Variables)')
     _plt.tight_layout()
-    corr_matrix.to_csv('output_to_share/pairwise_corr_matrix.csv')
-    print("Saved output_to_share/pairwise_corr_matrix.csv")
+    _corr_path = f'output_to_share/{SITE_NAME}/pairwise_corr_matrix.csv'
+    corr_matrix.to_csv(_corr_path)
+    print(f"Saved {_corr_path}")
     _plt.gcf()
     return
 
@@ -113,7 +115,7 @@ def _():
 
 
 @app.cell
-def _(cohort_merged_final, pd, sed_dose_daily):
+def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
     # Dose by Shift — paired + unpaired day-vs-night sedation rates.
     #
     # Per-hospitalization weighted-mean hourly dose rate:
@@ -222,8 +224,9 @@ def _(cohort_merged_final, pd, sed_dose_daily):
                 'p-value':                       _fmt_p(_p),
             })
     sed_dose_by_shift = pd.DataFrame(_rows)
-    sed_dose_by_shift.to_csv('output_to_share/sed_dose_by_shift.csv', index=False)
-    print("Saved output_to_share/sed_dose_by_shift.csv")
+    _shift_path = f'output_to_share/{SITE_NAME}/sed_dose_by_shift.csv'
+    sed_dose_by_shift.to_csv(_shift_path, index=False)
+    print(f"Saved {_shift_path}")
     print(sed_dose_by_shift.to_string(index=False))
     return
 
@@ -251,8 +254,9 @@ def _(SITE_NAME, sed_dose_by_hr):
         """
     )
     _df = sed_dose_by_hr_of_day.df()
-    _df.to_csv('output_to_share/sed_dose_by_hr_of_day.csv', index=False)
-    print("Saved output_to_share/sed_dose_by_hr_of_day.csv")
+    _hr_csv_path = f'output_to_share/{SITE_NAME}/sed_dose_by_hr_of_day.csv'
+    _df.to_csv(_hr_csv_path, index=False)
+    print(f"Saved {_hr_csv_path}")
     return (sed_dose_by_hr_of_day,)
 
 
@@ -320,8 +324,9 @@ def _(SITE_NAME, sed_dose_by_hr_of_day):
     plt.xticks(x, hours_ordered.astype(int))
     plt.tight_layout()
     plt.suptitle(f'Cumulative Sedative Doses by Hour of Day — {SITE_NAME}', fontsize=18, y=1.04)
-    plt.savefig('output_to_share/figures/sed_dose_by_hr_of_day.png', bbox_inches='tight')
-    print("Saved output_to_share/figures/sed_dose_by_hr_of_day.png")
+    _hr_png_path = f'output_to_share/{SITE_NAME}/figures/sed_dose_by_hr_of_day.png'
+    plt.savefig(_hr_png_path, bbox_inches='tight', dpi=250)
+    print(f"Saved {_hr_png_path}")
     fig
     return
 

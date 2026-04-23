@@ -50,8 +50,10 @@ def _():
 
 @app.cell
 def _(CONFIG_PATH, get_config_or_params):
+    # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return (SITE_NAME,)
 
@@ -66,7 +68,7 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    resp_processed_path = f"output/{SITE_NAME}_resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}/resp_processed_bf.parquet"
     assert os.path.exists(resp_processed_path), (
         f"Missing {resp_processed_path} — run 01_cohort.py first"
     )
@@ -85,8 +87,8 @@ def _():
 
 
 @app.cell
-def _(pd):
-    cohort_hrly_grids_f = pd.read_parquet("output/cohort_hrly_grids.parquet")
+def _(SITE_NAME, pd):
+    cohort_hrly_grids_f = pd.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
     print(f"cohort_hrly_grids_f: {len(cohort_hrly_grids_f)} rows")
     return (cohort_hrly_grids_f,)
 
@@ -427,10 +429,11 @@ def _():
 
 
 @app.cell
-def _(cohort_sbt_outcomes_daily):
+def _(SITE_NAME, cohort_sbt_outcomes_daily):
     _out = cohort_sbt_outcomes_daily.df()
-    _out.to_parquet("output/sbt_outcomes_daily.parquet")
-    print(f"Saved: output/sbt_outcomes_daily.parquet ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
+    _path = f"output/{SITE_NAME}/sbt_outcomes_daily.parquet"
+    _out.to_parquet(_path)
+    print(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
     return
 
 

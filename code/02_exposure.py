@@ -47,8 +47,6 @@ def _():
 
     CONFIG_PATH = "config/config.json"
     co = ClifOrchestrator(config_path=CONFIG_PATH)
-
-    os.makedirs("output", exist_ok=True)
     return (
         CONFIG_PATH,
         apply_outlier_handling,
@@ -62,15 +60,17 @@ def _():
 
 @app.cell
 def _(CONFIG_PATH, get_config_or_params):
+    # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     print(f"Site: {SITE_NAME}")
-    return
+    return (SITE_NAME,)
 
 
 @app.cell
-def _(pd):
-    cohort_hrly_grids_f = pd.read_parquet("output/cohort_hrly_grids.parquet")
+def _(SITE_NAME, pd):
+    cohort_hrly_grids_f = pd.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
     print(f"Hourly grid rows: {len(cohort_hrly_grids_f)}")
     return (cohort_hrly_grids_f,)
 
@@ -529,14 +529,14 @@ def _():
 
 
 @app.cell
-def _(sed_dose_agg, sed_dose_by_hr, sed_dose_daily):
-    sed_dose_daily.to_parquet("output/sed_dose_daily.parquet", index=False)
-    sed_dose_agg.to_parquet("output/sed_dose_agg.parquet", index=False)
-    sed_dose_by_hr.df().to_parquet("output/sed_dose_by_hr.parquet", index=False)
+def _(SITE_NAME, sed_dose_agg, sed_dose_by_hr, sed_dose_daily):
+    sed_dose_daily.to_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet", index=False)
+    sed_dose_agg.to_parquet(f"output/{SITE_NAME}/sed_dose_agg.parquet", index=False)
+    sed_dose_by_hr.df().to_parquet(f"output/{SITE_NAME}/sed_dose_by_hr.parquet", index=False)
 
-    print("Saved: output/sed_dose_daily.parquet")
-    print("Saved: output/sed_dose_agg.parquet")
-    print("Saved: output/sed_dose_by_hr.parquet")
+    print(f"Saved: output/{SITE_NAME}/sed_dose_daily.parquet")
+    print(f"Saved: output/{SITE_NAME}/sed_dose_agg.parquet")
+    print(f"Saved: output/{SITE_NAME}/sed_dose_by_hr.parquet")
     return
 
 

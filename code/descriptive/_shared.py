@@ -13,24 +13,49 @@ Edit here once to propagate across every figure.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 
+# ── Site selection ────────────────────────────────────────────────────────
+# Load site name from config/config.json once at import time so downstream
+# paths (output/{site}/..., output_to_share/{site}/...) are consistent across
+# every descriptive script. Lowercase convention matches the Makefile's
+# SITE=mimic/ucmc flag.
+def _load_site_name() -> str:
+    cfg_path = Path("config/config.json")
+    if not cfg_path.exists():
+        # Fallback keeps imports from crashing in environments without a config
+        # (e.g. docs build). Scripts will still fail gracefully at I/O time.
+        return "unknown"
+    with cfg_path.open() as f:
+        cfg = json.load(f)
+    return cfg.get("site_name", "unknown").lower()
+
+
+SITE_NAME = _load_site_name()
+
 # ── Paths (project root is CWD by convention; matches 07_descriptive.py) ──
-ANALYTICAL_PARQUET = "output/analytical_dataset.parquet"
-FIGURES_DIR = "output_to_share/figures"
-TABLES_DIR = "output_to_share"
+# All outputs are site-scoped so multiple sites coexist on disk (see the
+# Makefile's SITE= flag). Phase-2 cross-site aggregation reads these dirs.
+ANALYTICAL_PARQUET = f"output/{SITE_NAME}/analytical_dataset.parquet"
+FIGURES_DIR = f"output_to_share/{SITE_NAME}/figures"
+TABLES_DIR = f"output_to_share/{SITE_NAME}"
 
 
 # ── Drug-level constants ──────────────────────────────────────────────────
 DRUGS = ("prop", "fenteq", "midazeq")
 
+# Propofol uses the weight-adjusted diff column that prepare_diffs() computes
+# on load (mcg/kg/min). Fentanyl-eq and midazolam-eq use the raw hourly-rate
+# diffs from analytical_dataset.parquet directly.
 DIFF_COLS = {
-    "prop": "prop_dif",
+    "prop": "prop_dif_kgmin",
     "fenteq": "fenteq_dif",
     "midazeq": "midazeq_dif",
 }
@@ -47,13 +72,13 @@ NIGHT_COLS = {
     "midazeq": "_midazeq_night",
 }
 
-# User-specified clinical thresholds on the hourly night-minus-day rate.
-# Unit is mg/hr for prop + midazeq and mcg/hr for fenteq (matches the
-# raw per-hr rates produced by 05_analytical_dataset.py).
+# Clinically meaningful night-minus-day dose-rate cutoffs. Propofol uses a
+# weight-adjusted mcg/kg/min cutoff (matches bedside pump documentation);
+# the other two are absolute hourly rates.
 THRESHOLDS = {
-    "prop": 10,
-    "fenteq": 25,
-    "midazeq": 1,
+    "prop": 10,       # mcg/kg/min — weight-adjusted
+    "fenteq": 25,     # mcg/hr
+    "midazeq": 1,     # mg/hr
 }
 
 DRUG_LABELS = {
@@ -63,7 +88,7 @@ DRUG_LABELS = {
 }
 
 DRUG_UNITS = {
-    "prop": "mg/hr",
+    "prop": "mcg/kg/min",
     "fenteq": "mcg/hr",
     "midazeq": "mg/hr",
 }
@@ -74,6 +99,18 @@ DRUG_COLORS = {
     "fenteq": "salmon",
     "midazeq": "mediumseagreen",
 }
+
+# Sensitivity knob on the weight upper bound applied inside prepare_diffs().
+# outlier_config.yaml already caps weight at 300 kg at ingestion; this env
+# var additionally clips at use-time so tightening sensitivity analyses
+# (e.g., MAX_WEIGHT_KG=250) don't require rerunning 04/05. Loosening past
+# 300 requires editing the yaml and rerunning the upstream pipeline.
+MAX_WEIGHT_KG = float(os.getenv("MAX_WEIGHT_KG", "300"))
+
+# Diverging 4-color palette for the up-titration stacked bars.
+# Dark blue (big down) → light blue → light red → dark red (big up).
+# RdBu-inspired; keeps up-titrated tail in warm red for immediate reading.
+DIFF_BIN_COLORS = ["#2166ac", "#92c5de", "#f4a582", "#b2182b"]
 
 
 # ── Loaders + bucketing ───────────────────────────────────────────────────
@@ -98,12 +135,40 @@ def cap_day(df: pd.DataFrame, max_day: int = 7, col: str = "_nth_day") -> pd.Dat
     return out
 
 
-def threshold_flags(df: pd.DataFrame) -> pd.DataFrame:
-    """Add boolean `<drug>_above` columns based on THRESHOLDS and DIFF_COLS."""
+def prepare_diffs(df: pd.DataFrame) -> pd.DataFrame:
+    """Add `prop_dif_kgmin` to `df` and return it.
+
+    Converts the existing mg/hr night-minus-day propofol rate into the
+    weight-adjusted mcg/kg/min convention used clinically at the bedside:
+
+        mg/hr × 1000 mcg/mg / 60 min/hr / weight_kg  ≡  mcg/kg/min
+
+    Weight is clipped at MAX_WEIGHT_KG (env-var override; default 300) so
+    we can do tightening-direction sensitivity without re-running upstream.
+    Rows with missing weight propagate NaN, which downstream `.dropna()`
+    filters drop from the relevant analyses.
+    """
     out = df.copy()
-    for drug in DRUGS:
-        out[f"{drug}_above"] = out[DIFF_COLS[drug]] > THRESHOLDS[drug]
+    weight = out["weight_kg_asof_day_start"].clip(upper=MAX_WEIGHT_KG)
+    out["prop_dif_kgmin"] = out["prop_dif"] * 1000.0 / 60.0 / weight
     return out
+
+
+def categorize_diff(series: pd.Series, threshold: float) -> pd.Categorical:
+    """Return a 4-level ordered Categorical bucketing `series` around ±threshold.
+
+    Buckets (default pd.cut right-inclusive): `(-inf, -T]`, `(-T, 0]`, `(0, T]`, `(T, inf]`.
+    Exact zero (very common — patient-days with no propofol change) lands in
+    `(-T, 0]` ("small down / no change"). Labels kept short for legend use.
+    """
+    labels = [
+        f"< −{threshold}",
+        f"−{threshold} to 0",
+        f"0 to {threshold}",
+        f"> {threshold}",
+    ]
+    bins = [-np.inf, -threshold, 0, threshold, np.inf]
+    return pd.cut(series, bins=bins, labels=labels, ordered=True)
 
 
 # ── Plotting helpers ──────────────────────────────────────────────────────
@@ -111,7 +176,9 @@ def apply_style() -> None:
     """Set matplotlib rcParams for consistent styling across figures."""
     plt.rcParams.update({
         "figure.dpi": 120,
-        "savefig.dpi": 160,
+        # High savefig DPI so PNGs have enough pixels to stay crisp when
+        # re-rasterized into 09_report's image pages at 300 DPI.
+        "savefig.dpi": 250,
         "axes.titlesize": 12,
         "axes.labelsize": 10,
         "xtick.labelsize": 9,

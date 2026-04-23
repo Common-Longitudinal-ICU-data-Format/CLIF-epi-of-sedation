@@ -29,6 +29,7 @@ from _shared import (  # noqa: E402
     THRESHOLDS,
     apply_style,
     load_analytical,
+    prepare_diffs,
     save_fig,
     threshold_label,
 )
@@ -36,7 +37,7 @@ from _shared import (  # noqa: E402
 
 def main() -> None:
     apply_style()
-    df = load_analytical()
+    df = prepare_diffs(load_analytical())
     print(f"Loaded {len(df):,} patient-days from {df['hospitalization_id'].nunique():,} hospitalizations")
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))

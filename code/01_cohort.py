@@ -47,16 +47,20 @@ def _():
 
     CONFIG_PATH = "config/config.json"
     co = ClifOrchestrator(config_path=CONFIG_PATH)
-
-    os.makedirs("output", exist_ok=True)
-    os.makedirs("output_to_share", exist_ok=True)
     return CONFIG_PATH, apply_outlier_handling, get_config_or_params, pd
 
 
 @app.cell
 def _(CONFIG_PATH, get_config_or_params):
+    # Site-scoped output directories — every per-site run lives under
+    # output/{site}/ and output_to_share/{site}/ so multiple sites coexist
+    # on disk (see Makefile's SITE= flag and the "Multi-site support"
+    # section in .dev/CLAUDE.md).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
+    os.makedirs(f"output_to_share/{SITE_NAME}", exist_ok=True)
+    os.makedirs(f"output_to_share/{SITE_NAME}/figures", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return (SITE_NAME,)
 
@@ -131,7 +135,7 @@ def _(
 ):
     from clifpy import RespiratorySupport
 
-    resp_processed_path = f"output/{SITE_NAME}_resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}/resp_processed_bf.parquet"
 
     if not os.path.exists(resp_processed_path) or RERUN_WATERFALL:
         cohort_resp = RespiratorySupport.from_file(
@@ -515,25 +519,27 @@ def _(
         ],
     }
 
-    with open("output_to_share/consort_inclusion.json", "w") as f:
+    _consort_json_path = f"output_to_share/{SITE_NAME}/consort_inclusion.json"
+    with open(_consort_json_path, "w") as f:
         json.dump(consort_flow, f, indent=2)
-    print(f"CONSORT flow saved to output_to_share/consort_inclusion.json")
+    print(f"CONSORT flow saved to {_consort_json_path}")
 
-    # Save intermediate outputs
-    cohort_imv_streaks.df().to_parquet("output/cohort_imv_streaks.parquet")
-    cohort_hrly_grids_f.to_parquet("output/cohort_hrly_grids.parquet")
-    _nmb_excluded_df.to_parquet("output/nmb_excluded.parquet")
-    icu_type_df.df().to_parquet("output/icu_type.parquet")
+    # Save intermediate outputs (site-scoped: output/{site}/...)
+    cohort_imv_streaks.df().to_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
+    cohort_hrly_grids_f.to_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
+    _nmb_excluded_df.to_parquet(f"output/{SITE_NAME}/nmb_excluded.parquet")
+    icu_type_df.df().to_parquet(f"output/{SITE_NAME}/icu_type.parquet")
 
-    print(f"Saved: output/cohort_imv_streaks.parquet ({len(cohort_hosp_ids)} hospitalizations)")
-    print(f"Saved: output/cohort_hrly_grids.parquet ({len(cohort_hrly_grids_f)} rows)")
-    print(f"Saved: output/nmb_excluded.parquet ({_n_nmb_patient_days} patient-days)")
-    print(f"Saved: output/icu_type.parquet ({len(icu_type_df)} hospitalizations)")
+    print(f"Saved: output/{SITE_NAME}/cohort_imv_streaks.parquet ({len(cohort_hosp_ids)} hospitalizations)")
+    print(f"Saved: output/{SITE_NAME}/cohort_hrly_grids.parquet ({len(cohort_hrly_grids_f)} rows)")
+    print(f"Saved: output/{SITE_NAME}/nmb_excluded.parquet ({_n_nmb_patient_days} patient-days)")
+    print(f"Saved: output/{SITE_NAME}/icu_type.parquet ({len(icu_type_df)} hospitalizations)")
 
     # CONSORT flowchart PNG
     from _utils import plot_consort
-    plot_consort(consort_flow, "output_to_share/consort_inclusion.png")
-    print("Saved: output_to_share/consort_inclusion.png")
+    _consort_png_path = f"output_to_share/{SITE_NAME}/consort_inclusion.png"
+    plot_consort(consort_flow, _consort_png_path)
+    print(f"Saved: {_consort_png_path}")
     return (consort_flow,)
 
 

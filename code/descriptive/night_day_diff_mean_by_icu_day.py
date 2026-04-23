@@ -29,6 +29,7 @@ from _shared import (  # noqa: E402
     apply_style,
     cap_day,
     load_analytical,
+    prepare_diffs,
     save_fig,
 )
 
@@ -46,7 +47,7 @@ def _ci(values: np.ndarray, conf: float = 0.95) -> tuple[float, float, float]:
 
 def main() -> None:
     apply_style()
-    df = cap_day(load_analytical(), max_day=7)
+    df = cap_day(prepare_diffs(load_analytical()), max_day=7)
     bins = list(df["_nth_day_bin"].cat.categories)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True)

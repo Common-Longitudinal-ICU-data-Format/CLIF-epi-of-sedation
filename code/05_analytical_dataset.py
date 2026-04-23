@@ -43,8 +43,12 @@ def _():
     CONFIG_PATH = "config/config.json"
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    # Site-scoped output dir (see Makefile SITE= flag). `os` comes from the
+    # app.setup block at the top; re-importing here would raise marimo's
+    # MultipleDefinitionError.
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     print(f"Site: {SITE_NAME}")
-    return CONFIG_PATH, apply_outlier_handling, pd
+    return CONFIG_PATH, SITE_NAME, apply_outlier_handling, pd
 
 
 @app.cell(hide_code=True)
@@ -56,29 +60,29 @@ def _():
 
 
 @app.cell
-def _(pd):
-    sbt_outcomes_daily = pd.read_parquet("output/sbt_outcomes_daily.parquet")
+def _(SITE_NAME, pd):
+    sbt_outcomes_daily = pd.read_parquet(f"output/{SITE_NAME}/sbt_outcomes_daily.parquet")
     print(f"sbt_outcomes_daily: {len(sbt_outcomes_daily)} rows")
     return (sbt_outcomes_daily,)
 
 
 @app.cell
-def _(pd):
-    sed_dose_daily = pd.read_parquet("output/sed_dose_daily.parquet")
+def _(SITE_NAME, pd):
+    sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet")
     print(f"sed_dose_daily: {len(sed_dose_daily)} rows")
     return (sed_dose_daily,)
 
 
 @app.cell
-def _(pd):
-    covs_daily = pd.read_parquet("output/covariates_daily.parquet")
+def _(SITE_NAME, pd):
+    covs_daily = pd.read_parquet(f"output/{SITE_NAME}/covariates_daily.parquet")
     print(f"covs_daily: {len(covs_daily)} rows")
     return (covs_daily,)
 
 
 @app.cell
-def _(pd):
-    nmb_excluded = pd.read_parquet("output/nmb_excluded.parquet")
+def _(SITE_NAME, pd):
+    nmb_excluded = pd.read_parquet(f"output/{SITE_NAME}/nmb_excluded.parquet")
     print(f"nmb_excluded patient-days: {len(nmb_excluded)}")
     return (nmb_excluded,)
 
@@ -109,18 +113,19 @@ def _(CONFIG_PATH):
 
 
 @app.cell
-def _(pd):
-    sofa_daily = pd.read_parquet("output/sofa_daily.parquet")
-    icu_type_df = pd.read_parquet("output/icu_type.parquet")
-    cci_df = pd.read_parquet("output/cci.parquet")
-    elix_df = pd.read_parquet("output/elix.parquet")
-    covariates_t1 = pd.read_parquet("output/covariates_t1.parquet")
+def _(SITE_NAME, pd):
+    sofa_daily = pd.read_parquet(f"output/{SITE_NAME}/sofa_daily.parquet")
+    icu_type_df = pd.read_parquet(f"output/{SITE_NAME}/icu_type.parquet")
+    cci_df = pd.read_parquet(f"output/{SITE_NAME}/cci.parquet")
+    elix_df = pd.read_parquet(f"output/{SITE_NAME}/elix.parquet")
+    covariates_t1 = pd.read_parquet(f"output/{SITE_NAME}/covariates_t1.parquet")
+    weight_daily = pd.read_parquet(f"output/{SITE_NAME}/weight_daily.parquet")
     print(
         f"sofa_daily: {len(sofa_daily)}, icu_type: {len(icu_type_df)}, "
         f"cci: {len(cci_df)}, elix: {len(elix_df)}, "
-        f"covariates_t1: {len(covariates_t1)}"
+        f"covariates_t1: {len(covariates_t1)}, weight_daily: {len(weight_daily)}"
     )
-    return cci_df, covariates_t1, elix_df, icu_type_df, sofa_daily
+    return cci_df, covariates_t1, elix_df, icu_type_df, sofa_daily, weight_daily
 
 
 @app.cell(hide_code=True)
@@ -143,6 +148,7 @@ def _(
     sbt_outcomes_daily,
     sed_dose_daily,
     sofa_daily,
+    weight_daily,
 ):
     cohort_merged = mo.sql(
         f"""
@@ -159,6 +165,7 @@ def _(
         LEFT JOIN cci_df cc USING (hospitalization_id)
         LEFT JOIN elix_df ex USING (hospitalization_id)
         LEFT JOIN covariates_t1 t1 USING (hospitalization_id)
+        LEFT JOIN weight_daily wd USING (hospitalization_id, _nth_day)
         SELECT o.hospitalization_id
         , o._nth_day
         , _sbt_done_today: o.sbt_done
@@ -192,6 +199,7 @@ def _(
         , t1.bmi
         , t1.height_cm
         , t1.weight_kg
+        , wd.weight_kg_asof_day_start
         , t1.sofa_1st24h
         , t1.sofa_cv_97_1st24h
         , t1.sofa_coag_1st24h
@@ -247,10 +255,11 @@ def _():
 
 
 @app.cell
-def _(cohort_merged_final):
+def _(SITE_NAME, cohort_merged_final):
     _df = cohort_merged_final.df()
-    _df.to_parquet("output/analytical_dataset.parquet", index=False)
-    print(f"Saved output/analytical_dataset.parquet ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations)")
+    _path = f"output/{SITE_NAME}/analytical_dataset.parquet"
+    _df.to_parquet(_path, index=False)
+    print(f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations)")
     return
 
 

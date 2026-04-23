@@ -88,7 +88,8 @@ def _():
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
 
-    os.makedirs("output_to_share/figures", exist_ok=True)
+    # Site-scoped output dir (see Makefile SITE= flag).
+    os.makedirs(f"output_to_share/{SITE_NAME}/figures", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return SITE_NAME, datetime, pd
 
@@ -150,14 +151,21 @@ def _():
         pdf.savefig(fig, bbox_inches='tight')
         plt.close(fig)
 
-    def add_image_page(pdf, image_path, title):
-        """Embed a PNG as a page."""
-        fig, ax = plt.subplots(figsize=LETTER)
+    def add_image_page(pdf, image_path, title, dpi=300):
+        """Embed a PNG as a page at high resolution.
+
+        Matplotlib's default savefig DPI is 100, which downsamples upstream PNGs
+        (generated at ~160-200 DPI) and produces visibly blurry images in the PDF.
+        We set both the figure DPI and the pdf.savefig DPI to 300, and use
+        interpolation='none' so imshow doesn't add its own anti-aliasing blur
+        when the source PNG pixel grid doesn't align exactly with the axes.
+        """
+        fig, ax = plt.subplots(figsize=LETTER, dpi=dpi)
         img = imread(image_path)
-        ax.imshow(img)
+        ax.imshow(img, interpolation='none')
         ax.axis('off')
         ax.set_title(title, loc='left', fontweight='bold', fontsize=14, pad=20)
-        pdf.savefig(fig, bbox_inches='tight')
+        pdf.savefig(fig, bbox_inches='tight', dpi=dpi)
         plt.close(fig)
 
     def add_heatmap_page(pdf, corr_df, title):
@@ -310,10 +318,10 @@ def _():
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # Cohort stats (from 06_table1.py)
     try:
-        cohort_stats = pd.read_csv("output_to_share/cohort_stats.csv").iloc[0].to_dict()
+        cohort_stats = pd.read_csv(f"output_to_share/{SITE_NAME}/cohort_stats.csv").iloc[0].to_dict()
     except FileNotFoundError:
         cohort_stats = {'site': 'unknown', 'n_hospitalizations': 'n/a', 'n_unique_patients': 'n/a'}
     print(f"Cohort stats: {cohort_stats}")
@@ -321,9 +329,9 @@ def _(pd):
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # Table 1 (from 06_table1.py) — tableone CSV has hierarchical 2-col format
-    table1_df = pd.read_csv("output_to_share/table1.csv")
+    table1_df = pd.read_csv(f"output_to_share/{SITE_NAME}/table1.csv")
     # Replace NaN with empty string for cleaner display
     table1_df = table1_df.fillna('')
     print(f"Table 1: {len(table1_df)} rows, {len(table1_df.columns)} cols")
@@ -331,41 +339,41 @@ def _(pd):
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # Dose by Shift (from 07_descriptive.py) — paired + unpaired day-vs-night
     # sedation rates, long/tidy format (6 rows × 6 columns).
-    dose_by_shift_df = pd.read_csv("output_to_share/sed_dose_by_shift.csv")
+    dose_by_shift_df = pd.read_csv(f"output_to_share/{SITE_NAME}/sed_dose_by_shift.csv")
     print(f"Dose by Shift: {dose_by_shift_df.shape}")
     return (dose_by_shift_df,)
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # Correlation matrix (from 07_descriptive.py)
-    corr_df = pd.read_csv("output_to_share/pairwise_corr_matrix.csv", index_col=0)
+    corr_df = pd.read_csv(f"output_to_share/{SITE_NAME}/pairwise_corr_matrix.csv", index_col=0)
     print(f"Correlation matrix: {corr_df.shape}")
     return (corr_df,)
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # Model comparison tables (from 08_models.py)
-    sbt_gee_df = pd.read_csv("output_to_share/model_comparison_sbt_gee.csv", index_col=0)
-    extub_gee_df = pd.read_csv("output_to_share/model_comparison_extub_gee.csv", index_col=0)
-    extub_logit_df = pd.read_csv("output_to_share/model_comparison_extub_logit.csv", index_col=0)
+    sbt_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/model_comparison_sbt_gee.csv", index_col=0)
+    extub_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/model_comparison_extub_gee.csv", index_col=0)
+    extub_logit_df = pd.read_csv(f"output_to_share/{SITE_NAME}/model_comparison_extub_logit.csv", index_col=0)
     print(f"SBT GEE: {sbt_gee_df.shape}, Extub GEE: {extub_gee_df.shape}, Extub Logit: {extub_logit_df.shape}")
     return extub_gee_df, extub_logit_df, sbt_gee_df
 
 
 @app.cell
-def _(pd):
+def _(SITE_NAME, pd):
     # Up-titrated subcohort characteristics table (from
     # code/descriptive/uptitrated_subcohort_characteristics.py).
     # tableone writes a 2-col index (variable, level); MultiIndex header has
     # already been flattened upstream.
     try:
         subcohort_df = pd.read_csv(
-            "output_to_share/uptitrated_subcohort_characteristics.csv"
+            f"output_to_share/{SITE_NAME}/uptitrated_subcohort_characteristics.csv"
         ).fillna('')
     except FileNotFoundError:
         subcohort_df = None
@@ -401,11 +409,11 @@ def _(
     subcohort_df,
     table1_df,
 ):
-    _pdf_path = f"output_to_share/figures/sedation_report_{SITE_NAME}.pdf"
+    _pdf_path = f"output_to_share/{SITE_NAME}/figures/sedation_report.pdf"
 
     # Paths to pre-rendered images from earlier scripts
-    _consort_png = "output_to_share/consort_inclusion.png"
-    _hourly_png = "output_to_share/figures/sed_dose_by_hr_of_day.png"
+    _consort_png = f"output_to_share/{SITE_NAME}/consort_inclusion.png"
+    _hourly_png = f"output_to_share/{SITE_NAME}/figures/sed_dose_by_hr_of_day.png"
 
     # Build cohort summary lines (handle numeric vs string values gracefully)
     def _fmt_n(val):
@@ -519,15 +527,15 @@ def _(
         # live here (pre-models) because they motivate the exposure-of-interest
         # visually before the reader sees any coefficients.
         _uptitration_pages = [
-            ("output_to_share/figures/night_day_diff_distribution.png",
+            (f"output_to_share/{SITE_NAME}/figures/night_day_diff_distribution.png",
              "Night-minus-day Dose Rate: Distribution per Patient-day"),
-            ("output_to_share/figures/night_day_diff_mean_by_icu_day.png",
+            (f"output_to_share/{SITE_NAME}/figures/night_day_diff_mean_by_icu_day.png",
              "Mean Night-minus-day Dose Rate by ICU Day (±95% CI)"),
-            ("output_to_share/figures/night_day_diff_spread_by_icu_day.png",
+            (f"output_to_share/{SITE_NAME}/figures/night_day_diff_spread_by_icu_day.png",
              "Spread of Night-minus-day Dose Rate by ICU Day"),
-            ("output_to_share/figures/pct_uptitrated_overall.png",
+            (f"output_to_share/{SITE_NAME}/figures/pct_uptitrated_overall.png",
              "Overall Nocturnal Up-titration Prevalence"),
-            ("output_to_share/figures/pct_uptitrated_by_icu_day.png",
+            (f"output_to_share/{SITE_NAME}/figures/pct_uptitrated_by_icu_day.png",
              "Nocturnal Up-titration Prevalence by ICU Day"),
         ]
         for _path, _title in _uptitration_pages:
@@ -539,7 +547,7 @@ def _(
                                "Run the corresponding script under code/descriptive/ to generate."])
 
         # Page 12: Up-titrated vs stable subcohort characteristics (tableone).
-        # Thresholds: prop > 10 mg/hr, fenteq > 25 mcg/hr, midazeq > 1 mg/hr
+        # Thresholds: prop > 10 mcg/kg/min, fenteq > 25 mcg/hr, midazeq > 1 mg/hr
         # (a day is "up-titrated" if ANY drug crosses its threshold).
         if subcohort_df is not None:
             add_stargazer_table(
@@ -547,7 +555,7 @@ def _(
                 subcohort_df.set_index(subcohort_df.columns[0]),
                 "Up-titrated vs Stable Patient-days: Characteristics",
                 notes=(
-                    "Up-titrated = any of prop > 10 mg/hr, fenteq > 25 mcg/hr, "
+                    "Up-titrated = any of prop > 10 mcg/kg/min, fenteq > 25 mcg/hr, "
                     "midazeq > 1 mg/hr night-minus-day rate. Continuous vars "
                     "report median [Q1,Q3] unless otherwise noted. "
                     "P-values: Welch's t-test / chi-sq / Kruskal–Wallis."
@@ -558,7 +566,7 @@ def _(
             add_text_page(
                 _pdf,
                 "Up-titrated vs Stable Patient-days: Characteristics",
-                ["[CSV not found: output_to_share/uptitrated_subcohort_characteristics.csv]",
+                [f"[CSV not found: output_to_share/{SITE_NAME}/uptitrated_subcohort_characteristics.csv]",
                  "Run code/descriptive/uptitrated_subcohort_characteristics.py to generate."],
             )
 
@@ -588,7 +596,7 @@ def _(
             ('Successful Extubation Next Day (Logit)', 'extub', 'logit'),
         ]:
             _me_path = (
-                f"output_to_share/figures/"
+                f"output_to_share/{SITE_NAME}/figures/"
                 f"marginal_effects_{_outcome_short}_{_mt}_sofa.png"
             )
             if os.path.exists(_me_path):
@@ -613,7 +621,7 @@ def _(
             ('Successful Extubation Next Day (Logit)', 'extub', 'logit'),
         ]:
             _me_path = (
-                f"output_to_share/figures/"
+                f"output_to_share/{SITE_NAME}/figures/"
                 f"marginal_effects_{_outcome_short}_{_mt}_sofa_rcs.png"
             )
             if os.path.exists(_me_path):

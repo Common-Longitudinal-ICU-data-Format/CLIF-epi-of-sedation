@@ -1,9 +1,9 @@
-"""Up-titration prevalence by ICU day.
+"""Stacked-bar trajectory of night-day diff distribution by ICU day.
 
-Three panels (propofol / fent-eq / midaz-eq). X = ICU-day bin (1..7, '8+'),
-Y = fraction of patient-days in that bin with diff > per-drug threshold.
-This is the trajectory-meets-categorical figure: if the hypothesis holds,
-bars should step down as ICU day increases.
+Three panels (propofol / fent-eq / midaz-eq). X = day_n bin (1..7, '8+').
+Each bar is 100% tall, split into four diverging categories around the
+per-drug threshold T. Clinical hypothesis: the red ("> T") segment should
+shrink left-to-right as patients stabilize.
 
 Usage:
     uv run python code/descriptive/pct_uptitrated_by_icu_day.py
@@ -16,74 +16,99 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from statsmodels.stats.proportion import proportion_confint
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
+    DIFF_BIN_COLORS,
     DIFF_COLS,
-    DRUG_COLORS,
     DRUG_LABELS,
+    DRUG_UNITS,
     DRUGS,
     THRESHOLDS,
     apply_style,
     cap_day,
+    categorize_diff,
     load_analytical,
+    prepare_diffs,
     save_fig,
-    threshold_label,
 )
 
 
 def main() -> None:
     apply_style()
-    df = cap_day(load_analytical(), max_day=7)
+    df = cap_day(prepare_diffs(load_analytical()), max_day=7)
     bins = list(df["_nth_day_bin"].cat.categories)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), sharex=True)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.5), sharey=True)
+
+    category_order: list[str] = []
 
     for ax, drug in zip(axes, DRUGS):
         col = DIFF_COLS[drug]
-        pcts, los, his, ns = [], [], [], []
-        for b in bins:
-            series = df.loc[df["_nth_day_bin"] == b, col].dropna()
-            total = len(series)
-            above = int((series > THRESHOLDS[drug]).sum())
-            if total == 0:
-                pcts.append(0.0)
-                los.append(0.0)
-                his.append(0.0)
-                ns.append(0)
-                continue
-            lo, hi = proportion_confint(above, total, alpha=0.05, method="wilson")
-            pct = above / total
-            pcts.append(pct * 100)
-            los.append(pct * 100 - lo * 100)
-            his.append(hi * 100 - pct * 100)
-            ns.append(total)
-
+        thr = THRESHOLDS[drug]
         x = np.arange(len(bins))
-        color = DRUG_COLORS[drug]
-        bars = ax.bar(x, pcts, color=color, edgecolor="dimgray", linewidth=0.4, width=0.7)
-        ax.errorbar(x, pcts, yerr=[los, his], fmt="none", ecolor="black", capsize=3, linewidth=0.8)
+        ns = []
 
-        for xi, (bar, n, pct) in enumerate(zip(bars, ns, pcts)):
-            ax.annotate(
-                f"{pct:.1f}%\nn={n:,}",
-                xy=(xi, bar.get_height() + his[xi] + 0.4),
-                ha="center", va="bottom", fontsize=7.5,
-            )
+        # Pre-compute a matrix of (bin × category) → pct
+        pct_matrix = np.zeros((len(bins), 4))
+        for bi, b in enumerate(bins):
+            sub = df.loc[df["_nth_day_bin"] == b, col].dropna()
+            cat = categorize_diff(sub, thr)
+            counts = cat.value_counts().reindex(cat.cat.categories, fill_value=0)
+            total = int(counts.sum())
+            ns.append(total)
+            if not category_order:
+                category_order = list(counts.index)
+            if total > 0:
+                pct_matrix[bi, :] = (counts.to_numpy() / total) * 100.0
+
+        # Plot stacks segment-by-segment from bottom up.
+        cum = np.zeros(len(bins))
+        for seg_idx in range(4):
+            seg = pct_matrix[:, seg_idx]
+            ax.bar(x, seg, bottom=cum, width=0.7,
+                   color=DIFF_BIN_COLORS[seg_idx], edgecolor="white", linewidth=0.3,
+                   label=category_order[seg_idx] if drug == DRUGS[0] else None)
+            # Annotate segments that are tall enough to fit text
+            for xi, pct in enumerate(seg):
+                if pct >= 4.0:
+                    ax.text(
+                        xi, cum[xi] + pct / 2, f"{pct:.0f}",
+                        ha="center", va="center", fontsize=7.5,
+                        color="white" if seg_idx in (0, 3) else "black",
+                    )
+            cum += seg
+
+        # N-per-bin annotation below each bar
+        for xi, n in enumerate(ns):
+            ax.text(xi, -4, f"n={n:,}", ha="center", va="top",
+                    fontsize=7, color="dimgray")
 
         ax.set_xticks(x)
         ax.set_xticklabels(bins)
         ax.set_xlabel("ICU day")
-        ax.set_ylabel("% of patient-days above threshold")
-        ax.set_title(f"{DRUG_LABELS[drug]}   (threshold {threshold_label(drug)})")
-        # Leave headroom for the per-bar annotation
-        ymax = max(p + h for p, h in zip(pcts, his)) if pcts else 1.0
-        ax.set_ylim(0, ymax * 1.25 + 2)
+        ax.set_ylim(-8, 104)
+        ax.set_title(
+            f"{DRUG_LABELS[drug]}   (T = {THRESHOLDS[drug]} {DRUG_UNITS[drug]})"
+        )
+
+    axes[0].set_ylabel("% of patient-days")
+
+    # Legend on right of figure, order top-down to mirror the visual stack
+    handles, labels = axes[0].get_legend_handles_labels()
+    order_top_down = list(reversed(category_order))
+    h_by_label = dict(zip(labels, handles))
+    fig.legend(
+        [h_by_label[l] for l in order_top_down],
+        order_top_down,
+        title="Diff category (vs threshold T)",
+        loc="center left", bbox_to_anchor=(0.99, 0.5), frameon=False,
+    )
 
     fig.suptitle(
-        "Nocturnal up-titration prevalence by ICU day",
+        "Distribution of night-minus-day dose-rate diff by ICU day",
         fontsize=13, y=1.01,
     )
     fig.tight_layout()

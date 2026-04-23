@@ -46,28 +46,29 @@ def _():
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
 
-    os.makedirs("output_to_share", exist_ok=True)
+    # Site-scoped output dirs (see Makefile SITE= flag).
+    os.makedirs(f"output_to_share/{SITE_NAME}", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return CONFIG_PATH, SITE_NAME, apply_outlier_handling, duckdb, json, pd, tableone
 
 
 @app.cell
-def _(pd):
-    analytical_df = pd.read_parquet("output/analytical_dataset.parquet")
+def _(SITE_NAME, pd):
+    analytical_df = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset.parquet")
     print(f"Analytical dataset: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
     return (analytical_df,)
 
 
 @app.cell
-def _(pd):
-    sed_dose_agg = pd.read_parquet("output/sed_dose_agg.parquet")
+def _(SITE_NAME, pd):
+    sed_dose_agg = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_agg.parquet")
     print(f"sed_dose_agg: {len(sed_dose_agg)} rows")
     return (sed_dose_agg,)
 
 
 @app.cell
-def _(pd):
-    covs_shift = pd.read_parquet("output/covariates_shift.parquet")
+def _(SITE_NAME, pd):
+    covs_shift = pd.read_parquet(f"output/{SITE_NAME}/covariates_shift.parquet")
     print(f"covs_shift: {len(covs_shift)} rows")
     return (covs_shift,)
 
@@ -150,7 +151,7 @@ def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, pd):
         'site': [SITE_NAME],
         'n_hospitalizations': [n_hospitalizations],
         'n_unique_patients': [n_unique_patients],
-    }).to_csv('output_to_share/cohort_stats.csv', index=False)
+    }).to_csv(f'output_to_share/{SITE_NAME}/cohort_stats.csv', index=False)
     print(f"Cohort: {n_hospitalizations} hospitalizations from {n_unique_patients} unique patients")
     return
 
@@ -215,8 +216,9 @@ def _(SITE_NAME, cohort_merged_for_t1, hosp_df, tableone):
         order={'ever_pressor': ['Yes', 'No'], 'sepsis_ase': ['Yes', 'No']},
         limit={'ever_pressor': 1, 'sepsis_ase': 1},
     )
-    table1_overall.to_csv('output_to_share/table1.csv')
-    print("Saved output_to_share/table1.csv")
+    _t1_path = f'output_to_share/{SITE_NAME}/table1.csv'
+    table1_overall.to_csv(_t1_path)
+    print(f"Saved {_t1_path}")
     return
 
 
