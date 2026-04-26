@@ -200,11 +200,14 @@ app.layout = dbc.Container([
                     id="linked-table",
                     page_size=50,
                     page_action="native",
-                    virtualization=True,
-                    fixed_rows={"headers": True},
-                    style_table={"overflowX": "auto", "maxHeight": "45vh"},
+                    # NOTE: virtualization + fixed_rows render zero rows when
+                    # the parent dbc.Collapse is hidden on first paint (the
+                    # inner table measures height as 0 and never recovers).
+                    # Native pagination + vertical scroll is more robust.
+                    style_table={"overflowX": "auto", "overflowY": "auto", "maxHeight": "40vh"},
                     style_cell={"fontFamily": "monospace", "fontSize": "12px", "padding": "4px"},
-                    style_header={"fontWeight": "bold", "backgroundColor": "#f5f5f5"},
+                    style_header={"fontWeight": "bold", "backgroundColor": "#f5f5f5",
+                                  "position": "sticky", "top": 0, "zIndex": 1},
                 ),
                 style={"padding": "0 8px 8px 8px"},
             ),
