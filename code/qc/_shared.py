@@ -263,6 +263,7 @@ class PatientEnrichment:
     cohort_start: pd.Timestamp | None      # First qualifying streak's _start_dttm
     cohort_end: pd.Timestamp | None        # First qualifying streak's _end_dttm
     discharge: pd.Series | None            # 1-row Series: discharge_dttm + _category
+    intm: pd.DataFrame                     # Long-form medication_admin_intermittent
 
 
 def _read_filtered_parquet(path: Path, hosp_id: str) -> pd.DataFrame:
@@ -299,6 +300,7 @@ def get_enrichment(site: str, hosp_id: str) -> PatientEnrichment:
             cohort_end = pd.Timestamp(s["_end_dttm"])
 
     discharge = get_discharge_info(site, hosp_id)
+    intm = get_intm_med(site, hosp_id)
 
     return PatientEnrichment(
         analytical=analytical,
@@ -311,7 +313,38 @@ def get_enrichment(site: str, hosp_id: str) -> PatientEnrichment:
         cohort_start=cohort_start,
         cohort_end=cohort_end,
         discharge=discharge,
+        intm=intm,
     )
+
+
+# ── Intermittent-admin loader (DIY, bypasses create_wide_dataset) ─────
+
+@lru_cache(maxsize=32)
+def get_intm_med(site: str, hosp_id: str) -> pd.DataFrame:
+    """Long-format `medication_admin_intermittent` rows for one hosp_id.
+
+    Used for: (a) panel markers (one diamond/X per bolus event), and
+    (b) the linked audit table (raw bolus dose visible alongside cont
+    rates). Bypasses clifpy's `create_wide_dataset` since we want the
+    raw event stream, not a category-pivoted wide frame.
+    """
+    try:
+        co = _get_orchestrator(site)
+        co.load_table("medication_admin_intermittent",
+                      filters={"hospitalization_id": [hosp_id]})
+        df = co.medication_admin_intermittent.df
+    except Exception:  # noqa: BLE001 — table missing → return empty
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    keep_cats = ["propofol", "fentanyl", "midazolam", "lorazepam", "hydromorphone",
+                 "norepinephrine", "epinephrine", "vasopressin"]
+    sub = df[df["med_category"].isin(keep_cats)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    cols = [c for c in ("admin_dttm", "med_category", "med_dose", "med_dose_unit")
+            if c in sub.columns]
+    return sub[cols].sort_values("admin_dttm").reset_index(drop=True)
 
 
 # ── All-streaks (QC-only, on-the-fly) ──────────────────────────────────

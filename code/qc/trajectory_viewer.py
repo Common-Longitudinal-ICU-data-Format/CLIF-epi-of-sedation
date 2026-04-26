@@ -167,6 +167,14 @@ app.layout = dbc.Container([
         dbc.Col(_panel_checklist(), width=True),
     ], className="g-2 align-items-center"),
 
+    dbc.Row([
+        dbc.Col(html.Small(
+            id="pin-status",
+            children="Hover the plot to filter the table · click to pin a cursor",
+            className="text-muted",
+        ), width=True),
+    ], className="g-2 align-items-center mb-1"),
+
     dcc.Loading(
         id="plot-loading", type="default",
         children=dcc.Graph(
@@ -218,6 +226,10 @@ app.layout = dbc.Container([
 
     # Hidden state + clientside-callback plumbing
     dcc.Store(id="loaded-state"),
+    # Pinned-cursor state: when the user clicks the plot (or a table row),
+    # the vertical cursor "freezes" at that timestamp and the table stops
+    # updating on hover. None = unpinned, hover-driven (default).
+    dcc.Store(id="pinned-cursor", data=None),
     dcc.Store(id="keyboard-init-store"),
     html.Div(id="keyboard-init-output", style={"display": "none"}),
 ], fluid=True)
@@ -275,6 +287,7 @@ def pick_sampled_chip(n_clicks_list, chip_children):
     Output("linked-table", "columns"),
     Output("linked-table-collapse", "is_open"),
     Output("collapse-caret", "children"),
+    Output("pinned-cursor", "data"),
     Input("load-btn", "n_clicks"),
     Input("hosp-id-input", "n_submit"),
     Input("panel-checklist", "value"),
@@ -287,29 +300,29 @@ def load_patient(_n_load, _n_submit, visible_panels, site, hosp_id, prior_state)
     trigger = ctx.triggered_id
     if trigger == "panel-checklist":
         if not prior_state or not prior_state.get("hosp_id"):
-            return (no_update,) * 7
+            return (no_update,) * 8
         site = prior_state.get("site", site)
         hosp_id = prior_state.get("hosp_id", hosp_id)
 
     if not site or not hosp_id:
-        return _empty_fig("Select a site and enter a hospitalization_id."), None, None, [], [], False, "▸ "
+        return _empty_fig("Select a site and enter a hospitalization_id."), None, None, [], [], False, "▸ ", None
 
     hosp_id = str(hosp_id).strip()
     pool = cohort_ids_for_site(site)
     if hosp_id not in set(pool):
         msg = f"ID {hosp_id} is not in the {site} analytical cohort."
-        return _empty_fig(msg), dbc.Alert(msg, color="warning", className="py-1"), None, [], [], False, "▸ "
+        return _empty_fig(msg), dbc.Alert(msg, color="warning", className="py-1"), None, [], [], False, "▸ ", None
 
     enr = get_enrichment(site, hosp_id)
     try:
         wide_df = get_wide_df(site, hosp_id)
     except Exception as exc:  # noqa: BLE001
         msg = f"Failed to load wide dataset: {exc}"
-        return _empty_fig(msg), dbc.Alert(msg, color="danger", className="py-1"), None, [], [], False, "▸ "
+        return _empty_fig(msg), dbc.Alert(msg, color="danger", className="py-1"), None, [], [], False, "▸ ", None
 
     if wide_df.empty:
         msg = f"No wide-dataset rows returned for {hosp_id}."
-        return _empty_fig(msg), dbc.Alert(msg, color="warning", className="py-1"), None, [], [], False, "▸ "
+        return _empty_fig(msg), dbc.Alert(msg, color="warning", className="py-1"), None, [], [], False, "▸ ", None
 
     events = extract_events(enr)
     fig = build_timeline(wide_df, enr, events, visible_panels or [])
@@ -318,8 +331,8 @@ def load_patient(_n_load, _n_submit, visible_panels, site, hosp_id, prior_state)
     table_df = _linked_table_source(wide_df, enr)
     columns, records = _table_spec(table_df)
     state = {"site": site, "hosp_id": hosp_id}
-    # Collapse the drawer on a fresh patient load.
-    return fig, summary, state, records, columns, False, "▸ "
+    # Collapse the drawer + clear any pinned cursor on fresh patient load.
+    return fig, summary, state, records, columns, False, "▸ ", None
 
 
 # ── Drawer toggle (button click) + hover auto-expand ───────────────────
@@ -336,47 +349,181 @@ def toggle_collapse(_n, is_open):
     return new_state, ("▾ " if new_state else "▸ ")
 
 
+def _ts_to_naive(x: object) -> pd.Timestamp | None:
+    """Robustly parse an x-value (from hover/click/store) to a naive ts."""
+    if x is None:
+        return None
+    try:
+        ts = pd.Timestamp(x)
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts
+
+
+def _table_window_subset(table_df: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
+    """Return rows whose event_time is within ±HOVER_WINDOW_MIN of `ts`."""
+    if "event_time" not in table_df.columns or table_df.empty:
+        return table_df.iloc[0:0]
+    time_col = pd.to_datetime(table_df["event_time"])
+    if time_col.dt.tz is not None:
+        time_col = time_col.dt.tz_localize(None)
+    window = pd.Timedelta(minutes=HOVER_WINDOW_MIN)
+    mask = (time_col >= ts - window) & (time_col <= ts + window)
+    return table_df.loc[mask]
+
+
 @app.callback(
-    Output("linked-table", "data", allow_duplicate=True),
+    Output("linked-table", "style_data_conditional"),
+    Output("linked-table", "page_current"),
+    Output("pin-status", "children"),
+    Input("pinned-cursor", "data"),
+    State("linked-table", "data"),
+    State("linked-table", "page_size"),
+    prevent_initial_call=True,
+)
+def update_pin_state(pinned_ts, table_records, page_size):
+    """When the cursor is pinned, highlight the closest row in the
+    (always-full) table and jump the table to that row's page so it's
+    visible. When unpinned, clear styling.
+
+    The table data itself is rendered once at patient load and never
+    changes — this is an audit view. Hovering the plot only moves the
+    visual cursor; it doesn't filter rows anymore.
+    """
+    if not pinned_ts:
+        return [], no_update, "Hover the plot to read values · click to pin a cursor"
+
+    ts = _ts_to_naive(pinned_ts)
+    if ts is None or not table_records:
+        return [], no_update, no_update
+
+    # Find the table row whose event_time is closest to the pin.
+    diffs = []
+    for i, rec in enumerate(table_records):
+        et = rec.get("event_time")
+        if not et:
+            continue
+        try:
+            t = pd.Timestamp(et)
+            if t.tzinfo is not None:
+                t = t.tz_localize(None)
+            diffs.append((i, abs((t - ts).total_seconds())))
+        except (ValueError, TypeError):
+            continue
+    if not diffs:
+        return [], no_update, no_update
+    best_idx, _ = min(diffs, key=lambda x: x[1])
+
+    style_cond = [{
+        "if": {"row_index": best_idx},
+        "backgroundColor": "#fff3e0",
+        "fontWeight": "bold",
+    }]
+    page_current = best_idx // (page_size or 50)
+
+    status = html.Span([
+        html.Strong("📌 PINNED ", style={"color": "#e6550d"}),
+        f"at {ts.strftime('%Y-%m-%d %H:%M')} · ",
+        html.Span("click the plot again to unpin · table jumped to closest row",
+                  className="text-muted"),
+    ])
+    return style_cond, page_current, status
+
+
+@app.callback(
     Output("linked-table-collapse", "is_open", allow_duplicate=True),
     Output("collapse-caret", "children", allow_duplicate=True),
     Input("timeline-graph", "hoverData"),
-    State("loaded-state", "data"),
     State("linked-table-collapse", "is_open"),
     prevent_initial_call=True,
 )
-def filter_table_on_hover(hover_data, state, is_open):
-    if not hover_data or not state:
-        return no_update, no_update, no_update
-    try:
-        ts = pd.Timestamp(hover_data["points"][0]["x"])
-    except (KeyError, IndexError, ValueError):
-        return no_update, no_update, no_update
-    site, hosp_id = state["site"], state["hosp_id"]
-    enr = get_enrichment(site, hosp_id)
-    wide_df = get_wide_df(site, hosp_id)
-    window = pd.Timedelta(minutes=HOVER_WINDOW_MIN)
+def auto_open_drawer_on_first_hover(hover_data, is_open):
+    """Auto-expand the drawer the first time the user hovers — that's the
+    discoverability hook. After that, hover doesn't mutate any state.
+    """
+    if not hover_data or is_open:
+        return no_update, no_update
+    return True, "▾ "
 
-    table_df = _linked_table_source(wide_df, enr)
-    if "event_time" not in table_df.columns or table_df.empty:
-        return no_update, no_update, no_update
-    time_col = pd.to_datetime(table_df["event_time"])
-    # Reconcile tz state by *dropping* the tz on whichever side is aware
-    # — `tz_localize(None)` keeps wall-clock; `tz_convert(None)` would
-    # shift the wall-clock by the local UTC offset (the bug we're
-    # fixing), missing all rows.
-    if time_col.dt.tz is not None and ts.tzinfo is None:
-        time_col = time_col.dt.tz_localize(None)
-    elif time_col.dt.tz is None and ts.tzinfo is not None:
-        ts = ts.tz_localize(None)
-    elif time_col.dt.tz is not None and ts.tzinfo is not None:
-        # Both aware: align to a common naive frame to dodge tz-aware
-        # arithmetic surprises across pandas versions.
-        time_col = time_col.dt.tz_localize(None)
-        ts = ts.tz_localize(None)
-    mask = (time_col >= ts - window) & (time_col <= ts + window)
-    subset = table_df.loc[mask]
-    return _records_for_display(subset), True, "▾ "
+
+# ── Click-to-pin: clicking the plot freezes the cursor at that x ──────
+
+@app.callback(
+    Output("pinned-cursor", "data", allow_duplicate=True),
+    Input("timeline-graph", "clickData"),
+    State("pinned-cursor", "data"),
+    prevent_initial_call=True,
+)
+def toggle_pin_on_plot_click(click_data, current_pin):
+    """Click the plot to pin the cursor. Click again (or unpin via the
+    table-row click) to clear. If you click at the *same* x that's
+    already pinned, treat it as a toggle-off."""
+    if not click_data:
+        return no_update
+    try:
+        x = click_data["points"][0]["x"]
+    except (KeyError, IndexError):
+        return no_update
+    if current_pin == x:
+        return None
+    return x
+
+
+# ── Table-row click: pin the cursor at that row's event_time ──────────
+
+@app.callback(
+    Output("pinned-cursor", "data", allow_duplicate=True),
+    Input("linked-table", "active_cell"),
+    State("linked-table", "data"),
+    State("linked-table", "page_current"),
+    State("linked-table", "page_size"),
+    prevent_initial_call=True,
+)
+def pin_from_table_click(active_cell, table_data, page_current, page_size):
+    if not active_cell or not table_data:
+        return no_update
+    page_current = page_current or 0
+    page_size = page_size or 50
+    # Row-index from active_cell is page-relative when paginated
+    row_idx_local = active_cell.get("row", 0)
+    row_idx = row_idx_local + page_current * page_size
+    if row_idx >= len(table_data):
+        return no_update
+    et = table_data[row_idx].get("event_time")
+    return et or no_update
+
+
+# ── Pin marker: draw / remove the pinned vline on the figure ──────────
+
+@app.callback(
+    Output("timeline-graph", "figure", allow_duplicate=True),
+    Input("pinned-cursor", "data"),
+    State("timeline-graph", "figure"),
+    prevent_initial_call=True,
+)
+def update_pin_marker(pinned_ts, fig):
+    """Add or remove the pinned-cursor shape on the plot. We tag the
+    shape with `name='__pinned_cursor'` so it can be replaced atomically
+    without touching the other (~270) figure shapes."""
+    if not fig:
+        return no_update
+    layout = fig.setdefault("layout", {})
+    shapes = [s for s in (layout.get("shapes") or [])
+              if (s.get("name") if isinstance(s, dict) else None) != "__pinned_cursor"]
+    if pinned_ts:
+        shapes.append({
+            "type": "line",
+            "xref": "x", "yref": "paper",
+            "x0": pinned_ts, "x1": pinned_ts,
+            "y0": 0, "y1": 1,
+            "line": {"color": "#e6550d", "width": 2.5},
+            "layer": "above",
+            "name": "__pinned_cursor",
+        })
+    layout["shapes"] = shapes
+    return fig
 
 
 # ── Ctrl+` clientside hotkey ──────────────────────────────────────────
@@ -499,7 +646,7 @@ def build_timeline(
 
     # ── Panel traces ──────────────────────────────────────────────────
     if "sedatives" in panel_to_row:
-        _draw_sedatives(fig, enr, row=panel_to_row["sedatives"])
+        _draw_sedatives(fig, wide_df, enr, row=panel_to_row["sedatives"])
     if "resp" in panel_to_row:
         _draw_resp(fig, wide_df, row=panel_to_row["resp"])
     if "pressors" in panel_to_row:
@@ -602,6 +749,7 @@ def _add_normed_line(
     mode: str = "lines",
     step: bool = False,
     carry_forward: bool = False,
+    unit: str | None = None,
 ) -> None:
     """Add a line trace, normalized to [0, 1] in-panel.
 
@@ -629,14 +777,17 @@ def _add_normed_line(
         line_kwargs["dash"] = dash
     if step:
         line_kwargs["shape"] = "hv"
+    # Append unit to the hover label when one was supplied. The `name`
+    # itself stays clean for the legend; only the per-row tooltip carries
+    # the unit. With `hovermode="x unified"` the x-axis timestamp is
+    # printed once at the top, so we deliberately omit it from the
+    # per-trace template.
+    unit_suffix = f" {unit}" if unit else ""
     trace_kwargs: dict = {
         "x": x, "y": y_norm, "mode": mode,
         "name": name, "line": line_kwargs,
         "customdata": y_raw_kept,
-        # Bare value template — plotly's `hovermode="x unified"` already
-        # prints the x-axis timestamp once at the top of the tooltip. A
-        # per-trace timestamp here would repeat the header on every line.
-        "hovertemplate": f"{name}: %{{customdata:.3g}}<extra></extra>",
+        "hovertemplate": f"{name}: %{{customdata:.3g}}{unit_suffix}<extra></extra>",
         "legendgroup": legendgroup,
     }
     if legendtitle:
@@ -646,41 +797,103 @@ def _add_normed_line(
     fig.add_trace(go.Scatter(**trace_kwargs), row=row, col=1)
 
 
-def _draw_sedatives(fig: go.Figure, enr: PatientEnrichment, row: int) -> None:
-    """Sedatives panel.
+_SED_DRUGS = ("propofol", "fentanyl", "midazolam", "lorazepam", "hydromorphone")
+_SED_LABELS = {
+    "propofol": "prop", "fentanyl": "fent", "midazolam": "midaz",
+    "lorazepam": "loraz", "hydromorphone": "hydromorph",
+}
+# clifpy preferred raw units (set in 02_exposure.py). Cont rates carry
+# the time denominator; intm boluses are unit-less of time.
+_SED_CONT_UNIT = {
+    "propofol": "mg/min", "fentanyl": "mcg/min", "midazolam": "mg/min",
+    "lorazepam": "mg/min", "hydromorphone": "mg/min",
+}
+_SED_INTM_UNIT = {
+    "propofol": "mg", "fentanyl": "mcg", "midazolam": "mg",
+    "lorazepam": "mg", "hydromorphone": "mg",
+}
+# Marker palette for cont colors comes from existing DRUG_COLORS via
+# `code/descriptive/_shared.py`; rebuild a flat dict here for the panel.
+from _shared import DRUG_COLORS as _DRUG_COLORS  # noqa: E402
+_SED_COLOR = {
+    "propofol": _DRUG_COLORS["prop"],
+    "fentanyl": _DRUG_COLORS["fenteq"],
+    "midazolam": _DRUG_COLORS["midazeq"],
+    "lorazepam": "#9e9ac8",
+    "hydromorphone": "#bcbddc",
+}
 
-    Plots ONLY the continuous infusion rate columns (`_hr_cont`). The
-    intermittent (`_hr_intm`) columns are bolus events at single time
-    points — including them as lines would make the trace spike-and-
-    return on every bolus, distorting the step-function for the
-    continuous infusion (which is the dosing the trace is meant to
-    show). The hover-linked table below still surfaces the raw
-    intermittent doses for the chosen time window.
+
+def _draw_sedatives(
+    fig: go.Figure, wide_df: pd.DataFrame, enr: PatientEnrichment, row: int,
+) -> None:
+    """Sedatives panel — RAW data, audit-friendly.
+
+    Two trace types per drug:
+      - Continuous: step-function line from `wide_df[<drug>]` (raw
+        clifpy mg/min or mcg/min charted rate, persists until next change).
+      - Intermittent: marker-only trace from `enr.intm` (raw bolus dose
+        at admin_dttm). Each bolus drawn as a diamond at its raw value
+        normalized into [0, 1] of its own trace.
+
+    Per-trace normalization (unchanged) keeps both visible despite very
+    different magnitudes (cont 0.2–5 mg/min vs. intm 50–200 mg bolus).
     """
-    sed_h = enr.sed_hourly
-    if sed_h.empty or "event_dttm" not in sed_h.columns:
-        return
-    sed_t = pd.to_datetime(sed_h["event_dttm"])
-    seen = False
-    for col, color in SEDATIVE_COLORS.items():
-        if col not in sed_h.columns or not sed_h[col].notna().any():
-            continue
-        label = col.replace("_mg_hr_cont", "").replace("_mcg_hr_cont", "")
-        # Continuous infusion rates persist between charted changes →
-        # step-function; sed_dose_by_hr is a complete hourly grid so no
-        # carry-forward is needed.
-        _add_normed_line(
-            fig, sed_t, sed_h[col],
-            name=label, color=color, row=row,
-            legendgroup="sedatives",
-            legendtitle="Sedatives" if not seen else None,
-            step=True,
-        )
-        seen = True
+    t = wide_df["event_time"] if "event_time" in wide_df.columns else pd.Series(dtype="datetime64[ns]")
+    intm_df = enr.intm
+    seen_drugs: list[str] = []
+    seen_legend = False
+
+    for drug in _SED_DRUGS:
+        color = _SED_COLOR[drug]
+        label = _SED_LABELS[drug]
+
+        # CONT — step-function from wide_df
+        if drug in wide_df.columns and wide_df[drug].notna().any():
+            _add_normed_line(
+                fig, t, wide_df[drug],
+                name=f"{label} cont", color=color, row=row,
+                legendgroup="sedatives",
+                legendtitle="Sedatives" if not seen_legend else None,
+                width=1.5, step=True, carry_forward=True,
+                unit=_SED_CONT_UNIT[drug],
+            )
+            seen_legend = True
+            seen_drugs.append(drug)
+
+        # INTM — diamond markers per bolus event
+        if not intm_df.empty:
+            sub = intm_df[intm_df["med_category"] == drug]
+            if not sub.empty and sub["med_dose"].notna().any():
+                # Reuse the normalized-line helper but mode="markers" gives
+                # us no line; the helper computes its own normalization.
+                _add_normed_line(
+                    fig, sub["admin_dttm"], sub["med_dose"],
+                    name=f"{label} intm", color=color, row=row,
+                    legendgroup="sedatives",
+                    legendtitle="Sedatives" if not seen_legend else None,
+                    width=0, mode="markers",
+                    unit=_SED_INTM_UNIT[drug],
+                )
+                # Override the marker symbol → diamond, clearly distinct
+                # from the cont step line. Last trace just added.
+                fig.data[-1].marker = {"size": 8, "color": color, "symbol": "diamond",
+                                        "line": {"color": "#222", "width": 0.6}}
+                seen_legend = True
+
+
+_PRESSOR_UNITS = {
+    "norepinephrine": "mcg/kg/min",
+    "epinephrine": "mcg/kg/min",
+    "vasopressin": "units/min",
+    "nee": "mcg/kg/min",
+}
+_RESP_UNITS = {"fio2_set": "(fraction)", "peep_set": "cmH₂O"}
+_VITAL_UNITS = {"heart_rate": "bpm", "map": "mmHg", "spo2": "%", "respiratory_rate": "/min"}
+_ASSESS_UNITS = {"rass": "(score)", "gcs_total": "(score)"}
 
 
 def _draw_pressors(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
-    """Pressors panel — continuous infusions; carry-forward + step-function."""
     t = wide_df["event_time"] if "event_time" in wide_df.columns else pd.Series(dtype="datetime64[ns]")
     nee = compute_nee(wide_df)
     seen = False
@@ -690,6 +903,7 @@ def _draw_pressors(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
             name="NEE", color=PRESSOR_COLORS["nee"], row=row,
             legendgroup="pressors", legendtitle="Pressors",
             width=2.2, step=True, carry_forward=True,
+            unit=_PRESSOR_UNITS["nee"],
         )
         seen = True
     for col, color in PRESSOR_COLORS.items():
@@ -703,12 +917,12 @@ def _draw_pressors(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
                 legendtitle="Pressors" if not seen else None,
                 width=1.0, dash="dot",
                 step=True, carry_forward=True,
+                unit=_PRESSOR_UNITS.get(col, ""),
             )
             seen = True
 
 
 def _draw_assessments(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
-    """Assessments — point-in-time scores; no carry-forward, markers visible."""
     t = wide_df["event_time"] if "event_time" in wide_df.columns else pd.Series(dtype="datetime64[ns]")
     seen = False
     for col, color in ASSESSMENT_COLORS.items():
@@ -719,19 +933,12 @@ def _draw_assessments(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
                 legendgroup="assessments",
                 legendtitle="Assessments" if not seen else None,
                 width=1.0, mode="lines+markers",
+                unit=_ASSESS_UNITS.get(col, ""),
             )
             seen = True
 
 
 def _draw_resp(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
-    """Resp panel: FiO2/PEEP step lines + device ribbon (mode-encoded in IMV).
-
-    fio2_set / peep_set / device_category / mode_category are "set values
-    that persist until changed" — the upstream resp_processed_bf parquet
-    has them already waterfall-ffilled, but the wide-dataset join with
-    vitals/meds re-introduces NaN gaps. Carry-forward + step rendering
-    restore the clinical semantic.
-    """
     t = wide_df["event_time"] if "event_time" in wide_df.columns else pd.Series(dtype="datetime64[ns]")
     _draw_device_ribbon(fig, wide_df, row=row)
     seen = False
@@ -744,12 +951,12 @@ def _draw_resp(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
                 legendtitle="Resp" if not seen else None,
                 width=1.4,
                 step=True, carry_forward=True,
+                unit=_RESP_UNITS.get(col, ""),
             )
             seen = True
 
 
 def _draw_vitals(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
-    """Vitals — continuous measurements; no carry-forward (each row is real)."""
     t = wide_df["event_time"] if "event_time" in wide_df.columns else pd.Series(dtype="datetime64[ns]")
     seen = False
     for col, color in VITAL_COLORS.items():
@@ -760,6 +967,7 @@ def _draw_vitals(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None:
                 legendgroup="vitals",
                 legendtitle="Vitals" if not seen else None,
                 width=1.1, mode="lines+markers",
+                unit=_VITAL_UNITS.get(col, ""),
             )
             seen = True
 
@@ -962,23 +1170,115 @@ def build_summary_strip(enr: PatientEnrichment, wide_df: pd.DataFrame) -> dbc.Al
     )
 
 
-def _linked_table_source(wide_df: pd.DataFrame, enr: PatientEnrichment) -> pd.DataFrame:
-    """Compact rollup of the wide dataset for the linked-table view.
+# Column rename → snake_case with units only on meds (rates use time-
+# denominator suffix; boluses don't). Vitals/resp get bare names since
+# their units are universal in clinical context.
+_TABLE_COLUMN_LABELS = {
+    "propofol":            "prop_mg_min",
+    "propofol_intm":       "prop_mg",
+    "fentanyl":            "fent_mcg_min",
+    "fentanyl_intm":       "fent_mcg",
+    "midazolam":           "midaz_mg_min",
+    "midazolam_intm":      "midaz_mg",
+    "lorazepam":           "loraz_mg_min",
+    "lorazepam_intm":      "loraz_mg",
+    "hydromorphone":       "hydromorph_mg_min",
+    "hydromorphone_intm":  "hydromorph_mg",
+    "fio2_set":            "fio2",
+    "peep_set":            "peep",
+    "mode_category":       "mode",
+    "device_category":     "device",
+    "norepinephrine":      "norepi_mcg_kg_min",
+    "epinephrine":         "epi_mcg_kg_min",
+    "vasopressin":         "vaso_units_min",
+    "heart_rate":          "hr",
+    "map":                 "map",
+    "spo2":                "spo2",
+    "respiratory_rate":    "rr",
+}
 
-    Keeps `event_time` as a tz-aware datetime so callers can apply time-
-    window masks directly. Stringification + float-rounding happen later
-    in `_records_for_display`, just before the dict goes to DataTable.
+# Final L→R column order in the linked table (matches panel order:
+# sedatives → resp → pressors → vitals; assessments dropped).
+_TABLE_COLUMN_ORDER = [
+    "event_time",
+    # Sedatives (cont/intm pairs per drug)
+    "prop_mg_min", "prop_mg",
+    "fent_mcg_min", "fent_mcg",
+    "midaz_mg_min", "midaz_mg",
+    "loraz_mg_min", "loraz_mg",
+    "hydromorph_mg_min", "hydromorph_mg",
+    # Resp
+    "fio2", "peep", "mode", "device",
+    # Pressors
+    "norepi_mcg_kg_min", "epi_mcg_kg_min", "vaso_units_min",
+    # Vitals
+    "hr", "map", "spo2", "rr",
+]
+
+
+def _linked_table_source(wide_df: pd.DataFrame, enr: PatientEnrichment) -> pd.DataFrame:
+    """Raw-data audit table.
+
+    Pulls cont sedatives + pressors + vitals + resp settings from
+    `wide_df` (clifpy-pivoted raw events) and outer-merges intermittent
+    boluses from `enr.intm` (DIY-loaded raw `medication_admin_intermittent`)
+    so each bolus appears as its own row with cont columns NaN at that
+    timestamp and an intm column populated.
+
+    Reads RAW values exclusively — no aggregation, no time-window
+    filtering. The whole point is to spot-check downstream processing
+    against the source data.
     """
-    keep = [
+    keep_from_wide = [
         "event_time",
-        "heart_rate", "map", "spo2", "respiratory_rate",
-        "propofol", "fentanyl", "midazolam",
-        "norepinephrine", "epinephrine", "vasopressin",
-        "rass", "gcs_total",
+        "propofol", "fentanyl", "midazolam", "lorazepam", "hydromorphone",
         "fio2_set", "peep_set", "mode_category", "device_category",
+        "norepinephrine", "epinephrine", "vasopressin",
+        "heart_rate", "map", "spo2", "respiratory_rate",
     ]
-    cols = [c for c in keep if c in wide_df.columns]
-    return wide_df[cols].copy()
+    cols = [c for c in keep_from_wide if c in wide_df.columns]
+    out = wide_df[cols].copy()
+
+    # Outer-merge the long-form intm events as new rows. Pivot intm
+    # long-form to wide-form keyed on admin_dttm, then concat.
+    intm_df = enr.intm
+    if not intm_df.empty:
+        intm_pivot = (
+            intm_df.pivot_table(
+                index="admin_dttm",
+                columns="med_category",
+                values="med_dose",
+                aggfunc="first",
+            )
+            .reset_index()
+            .rename(columns={"admin_dttm": "event_time"})
+        )
+        # Tag every intm-derived column with `_intm` suffix so it doesn't
+        # collide with cont columns of the same name in `wide_df`.
+        intm_pivot.columns = [
+            "event_time" if c == "event_time" else f"{c}_intm"
+            for c in intm_pivot.columns
+        ]
+        # Align dtypes for the concat (event_time tz). Use the wide_df's
+        # tz so the merge is timezone-consistent.
+        if pd.api.types.is_datetime64_any_dtype(out["event_time"]):
+            target_tz = out["event_time"].dt.tz
+            it = pd.to_datetime(intm_pivot["event_time"])
+            if target_tz is not None and it.dt.tz is None:
+                it = it.dt.tz_localize(target_tz)
+            elif target_tz is None and it.dt.tz is not None:
+                it = it.dt.tz_localize(None)
+            intm_pivot["event_time"] = it
+        out = pd.concat([out, intm_pivot], ignore_index=True, sort=False)
+        out = out.sort_values("event_time").reset_index(drop=True)
+
+    # Apply rename → snake_case with unit suffixes.
+    out = out.rename(columns={k: v for k, v in _TABLE_COLUMN_LABELS.items()
+                              if k in out.columns})
+
+    # Reorder columns to canonical L→R; drop anything not in the spec.
+    final_cols = [c for c in _TABLE_COLUMN_ORDER if c in out.columns]
+    return out[final_cols]
 
 
 def _records_for_display(df: pd.DataFrame) -> list[dict]:
