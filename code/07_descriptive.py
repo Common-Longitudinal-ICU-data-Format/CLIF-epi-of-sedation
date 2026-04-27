@@ -88,9 +88,9 @@ def _(SITE_NAME, cohort_merged_final):
     import seaborn as _sns
     continuous_vars = [
         'age', '_nth_day', 'sofa_total', 'cci_score', 'elix_score',
-        'prop_dif', 'fenteq_dif', 'midazeq_dif',
-        '_prop_day', '_prop_night', '_fenteq_day', '_fenteq_night',
-        '_midazeq_day', '_midazeq_night', 'nee_7am', 'nee_7pm',
+        'prop_dif_mg_hr', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
+        '_prop_day_mg_hr', '_prop_night_mg_hr', '_fenteq_day_mcg_hr', '_fenteq_night_mcg_hr',
+        '_midazeq_day_mg_hr', '_midazeq_night_mg_hr', 'nee_7am', 'nee_7pm',
         '_ph_7am', '_ph_7pm', '_pf_7am', '_pf_7pm',
     ]
     continuous_vars_df = cohort_merged_final[[col for col in continuous_vars if col in cohort_merged_final.columns]]
@@ -141,9 +141,9 @@ def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
     _per_pt = (
         _sed_filtered.groupby('hospitalization_id')
         .agg({
-            'fenteq_day': 'sum', 'fenteq_night': 'sum',
-            'midazeq_day': 'sum', 'midazeq_night': 'sum',
-            'prop_day': 'sum', 'prop_night': 'sum',
+            'fenteq_day_mcg': 'sum', 'fenteq_night_mcg': 'sum',
+            'midazeq_day_mg': 'sum', 'midazeq_night_mg': 'sum',
+            'prop_day_mg': 'sum', 'prop_night_mg': 'sum',
             'n_hours_day': 'sum', 'n_hours_night': 'sum',
         })
         .reindex(_cohort_hosp_ids)
@@ -154,12 +154,12 @@ def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
         """num/denom with 0 for denom==0 (avoids NaN; shouldn't occur in practice)."""
         return num.where(denom > 0, other=0) / denom.where(denom > 0, other=1)
 
-    _per_pt['fenteq_rate_night'] = _safe_rate(_per_pt['fenteq_night'], _per_pt['n_hours_night'])
-    _per_pt['fenteq_rate_day']   = _safe_rate(_per_pt['fenteq_day'],   _per_pt['n_hours_day'])
-    _per_pt['midazeq_rate_night'] = _safe_rate(_per_pt['midazeq_night'], _per_pt['n_hours_night'])
-    _per_pt['midazeq_rate_day']   = _safe_rate(_per_pt['midazeq_day'],   _per_pt['n_hours_day'])
-    _per_pt['prop_rate_night']   = _safe_rate(_per_pt['prop_night'], _per_pt['n_hours_night'])
-    _per_pt['prop_rate_day']     = _safe_rate(_per_pt['prop_day'],   _per_pt['n_hours_day'])
+    _per_pt['fenteq_rate_night'] = _safe_rate(_per_pt['fenteq_night_mcg'], _per_pt['n_hours_night'])
+    _per_pt['fenteq_rate_day']   = _safe_rate(_per_pt['fenteq_day_mcg'],   _per_pt['n_hours_day'])
+    _per_pt['midazeq_rate_night'] = _safe_rate(_per_pt['midazeq_night_mg'], _per_pt['n_hours_night'])
+    _per_pt['midazeq_rate_day']   = _safe_rate(_per_pt['midazeq_day_mg'],   _per_pt['n_hours_day'])
+    _per_pt['prop_rate_night']   = _safe_rate(_per_pt['prop_night_mg'], _per_pt['n_hours_night'])
+    _per_pt['prop_rate_day']     = _safe_rate(_per_pt['prop_day_mg'],   _per_pt['n_hours_day'])
 
     print(f"Per-patient rates: {len(_per_pt)} hospitalizations")
 

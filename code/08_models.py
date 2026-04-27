@@ -71,8 +71,8 @@ def _():
 def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
     import statsmodels.api as _sm
-    sbt_done_formula = """sbt_done_next_day ~ prop_dif + fenteq_dif + midazeq_dif +
-    _prop_day + _midazeq_day + _fenteq_day +
+    sbt_done_formula = """sbt_done_next_day ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
+    _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
@@ -99,8 +99,8 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
-    success_extub_formula = """success_extub_next_day ~ prop_dif + fenteq_dif + midazeq_dif +
-    _prop_day + _midazeq_day + _fenteq_day +
+    success_extub_formula = """success_extub_next_day ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
+    _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
@@ -124,11 +124,11 @@ def _():
     Fits 4 nested models (progressively adding adjustment variables) for each
     (outcome, model_type) combination.
 
-    **Model specs (all include exposures: prop_dif + fenteq_dif + midazeq_dif):**
+    **Model specs (all include exposures: prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr):**
 
     1. **baseline**: age + sex + ICU type + CCI
 
-    2. **daydose**: baseline + daytime absolute dose rates (`_prop_day`, `_fenteq_day`, `_midazeq_day`, all in mg/hr or mcg/hr)
+    2. **daydose**: baseline + daytime absolute dose rates (`_prop_day_mg_hr`, `_fenteq_day_mcg_hr`, `_midazeq_day_mg_hr`)
 
     3. **sofa**: daydose + `sofa_total`
 
@@ -155,20 +155,21 @@ def _():
     # To change a label: edit 'label'.
     # To add a new scaled variable: add a new entry.
     #
-    # UNIT NOTE: Dose columns (prop_dif, fenteq_dif, midazeq_dif, _prop_day,
-    # _fenteq_day, _midazeq_day) are per-hour RATES (mg/hr or mcg/hr), not
-    # per-shift totals. The ÷12 conversion happens in 05_analytical_dataset.py.
+    # UNIT NOTE: Dose columns (prop_dif_mg_hr, fenteq_dif_mcg_hr, midazeq_dif_mg_hr,
+    # _prop_day_mg_hr, _fenteq_day_mcg_hr, _midazeq_day_mg_hr) are per-hour RATES
+    # (mg/hr or mcg/hr), explicit in their column-name suffixes.
+    # The ÷12 conversion from shift-totals happens in 05_analytical_dataset.py.
     # Scales below were retuned so "per N unit" stays clinically meaningful
     # after the rate conversion (old totals-era scales were ~12x larger).
     VAR_DISPLAY = {
         # Exposures (day-night rate differences)
-        'prop_dif':     {'scale': 10,  'label': 'Δ propofol (per 10 mg/hr)'},
-        'fenteq_dif':   {'scale': 10,  'label': 'Δ fentanyl eq (per 10 mcg/hr)'},
-        'midazeq_dif':  {'scale': 0.1, 'label': 'Δ midazolam eq (per 0.1 mg/hr)'},
+        'prop_dif_mg_hr':    {'scale': 10,  'label': 'Δ propofol (per 10 mg/hr)'},
+        'fenteq_dif_mcg_hr': {'scale': 10,  'label': 'Δ fentanyl eq (per 10 mcg/hr)'},
+        'midazeq_dif_mg_hr': {'scale': 0.1, 'label': 'Δ midazolam eq (per 0.1 mg/hr)'},
         # Daytime absolute rates
-        '_prop_day':    {'scale': 10,  'label': 'Daytime propofol (per 10 mg/hr)'},
-        '_fenteq_day':  {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
-        '_midazeq_day': {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
+        '_prop_day_mg_hr':    {'scale': 10,  'label': 'Daytime propofol (per 10 mg/hr)'},
+        '_fenteq_day_mcg_hr': {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
+        '_midazeq_day_mg_hr': {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
         # Other continuous covariates (unchanged)
         'age':          {'scale': 1,   'label': 'Age (per year)'},
         'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
@@ -205,9 +206,9 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
                      cov_kwds={'groups': data['hospitalization_id']})
 
     # ── Dimension 1: nested covariate sets (all include exposures) ────
-    BASELINE = ("{{outcome}} ~ prop_dif + fenteq_dif + midazeq_dif + "
+    BASELINE = ("{{outcome}} ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
                 "age + C(sex_category) + C(icu_type) + cci_score")
-    DAYDOSE = BASELINE + " + _prop_day + _midazeq_day + _fenteq_day"
+    DAYDOSE = BASELINE + " + _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
     SOFA = DAYDOSE + " + sofa_total"
     CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
                           "pf_level_7pm + nee_7am + nee_7pm")
@@ -221,8 +222,8 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # aren't human-interpretable as OR-per-unit. See plan_rcs_exposures.md memory.
     SOFA_RCS = (
         "{{outcome}} ~ "
-        "cr(prop_dif, df=4) + cr(fenteq_dif, df=4) + cr(midazeq_dif, df=4) + "
-        "cr(_prop_day, df=4) + cr(_fenteq_day, df=4) + cr(_midazeq_day, df=4) + "
+        "cr(prop_dif_mg_hr, df=4) + cr(fenteq_dif_mcg_hr, df=4) + cr(midazeq_dif_mg_hr, df=4) + "
+        "cr(_prop_day_mg_hr, df=4) + cr(_fenteq_day_mcg_hr, df=4) + cr(_midazeq_day_mg_hr, df=4) + "
         "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
@@ -368,12 +369,12 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
     # (05_analytical_dataset.py divides shift totals by 12), so no extra conversion
     # is needed before computing percentiles or constructing the grid.
     FOCAL_VARS = [
-        [('_prop_day',    'Mean Daytime Propofol Rate (mg/hr)'),
-         ('_fenteq_day',  'Mean Daytime Fentanyl Eq Rate (mcg/hr)'),
-         ('_midazeq_day', 'Mean Daytime Midazolam Eq Rate (mg/hr)')],
-        [('prop_dif',     'Day-to-Night Δ Propofol Rate (mg/hr)'),
-         ('fenteq_dif',   'Day-to-Night Δ Fentanyl Eq Rate (mcg/hr)'),
-         ('midazeq_dif',  'Day-to-Night Δ Midazolam Eq Rate (mg/hr)')],
+        [('_prop_day_mg_hr',    'Mean Daytime Propofol Rate (mg/hr)'),
+         ('_fenteq_day_mcg_hr', 'Mean Daytime Fentanyl Eq Rate (mcg/hr)'),
+         ('_midazeq_day_mg_hr', 'Mean Daytime Midazolam Eq Rate (mg/hr)')],
+        [('prop_dif_mg_hr',     'Day-to-Night Δ Propofol Rate (mg/hr)'),
+         ('fenteq_dif_mcg_hr',  'Day-to-Night Δ Fentanyl Eq Rate (mcg/hr)'),
+         ('midazeq_dif_mg_hr',  'Day-to-Night Δ Midazolam Eq Rate (mg/hr)')],
     ]
 
     Y_LABEL = {

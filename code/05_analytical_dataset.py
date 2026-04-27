@@ -172,22 +172,26 @@ def _(
         , _success_extub_today: o._success_extub
         , sbt_done_next_day: LEAD(o.sbt_done) OVER w
         , success_extub_next_day: LEAD(o._success_extub) OVER w
-        -- NOTE: Dose columns below are per-hour RATES (mg/hr or mcg/hr), not
-        -- per-shift totals. Conversion: totals ÷ 12 (hours per shift). This is
-        -- valid because the filter below (`_nth_day > 0 AND ... IS NOT NULL`)
-        -- guarantees complete 24h 7am-anchored days — partial shifts at
-        -- intubation / extubation are already excluded. The rate unit makes
-        -- dose coefficients in 08_models.py directly comparable across
-        -- patients and avoids partial-shift bias in descriptives.
-        , _prop_day: COALESCE(s.prop_day, 0) / 12.0
-        , _prop_night: COALESCE(s.prop_night, 0) / 12.0
-        , _fenteq_day: COALESCE(s.fenteq_day, 0) / 12.0
-        , _fenteq_night: COALESCE(s.fenteq_night, 0) / 12.0
-        , _midazeq_day: COALESCE(s.midazeq_day, 0) / 12.0
-        , _midazeq_night: COALESCE(s.midazeq_night, 0) / 12.0
-        , prop_dif: (COALESCE(s.prop_night, 0) - COALESCE(s.prop_day, 0)) / 12.0
-        , fenteq_dif: (COALESCE(s.fenteq_night, 0) - COALESCE(s.fenteq_day, 0)) / 12.0
-        , midazeq_dif: (COALESCE(s.midazeq_night, 0) - COALESCE(s.midazeq_day, 0)) / 12.0
+        -- NOTE: Dose columns below are per-hour RATES (mg/hr or mcg/hr),
+        -- computed as shift totals ÷ 12 (hours per shift). Valid because the
+        -- filter (_nth_day > 0 AND outcome-columns non-null) guarantees
+        -- complete 24h 7am-anchored days — partial shifts at intubation /
+        -- extubation are already excluded. See
+        -- docs/uptitration_paradox_investigation.md §0 for why this filter
+        -- matters when characterizing *exposure* (vs predicting outcomes).
+        -- Column-name convention (2026-04-24): every dose column has its unit
+        -- encoded as a suffix. `_mg_hr` = per-hour rate in mg; `_mcg_hr` = per-
+        -- hour rate in mcg. Source shift totals in sed_dose_daily.parquet
+        -- likewise carry `_mg` / `_mcg` suffixes (total dose over 12-hour shift).
+        , _prop_day_mg_hr:      COALESCE(s.prop_day_mg, 0) / 12.0
+        , _prop_night_mg_hr:    COALESCE(s.prop_night_mg, 0) / 12.0
+        , _fenteq_day_mcg_hr:   COALESCE(s.fenteq_day_mcg, 0) / 12.0
+        , _fenteq_night_mcg_hr: COALESCE(s.fenteq_night_mcg, 0) / 12.0
+        , _midazeq_day_mg_hr:   COALESCE(s.midazeq_day_mg, 0) / 12.0
+        , _midazeq_night_mg_hr: COALESCE(s.midazeq_night_mg, 0) / 12.0
+        , prop_dif_mg_hr:     (COALESCE(s.prop_night_mg, 0)    - COALESCE(s.prop_day_mg, 0))    / 12.0
+        , fenteq_dif_mcg_hr:  (COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)) / 12.0
+        , midazeq_dif_mg_hr:  (COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)) / 12.0
         , COLUMNS('(7am)|(7pm)')
         , age: h.age_at_admission
         , p.sex_category

@@ -279,16 +279,27 @@ def _(cont_sed_t2, duckdb):
 
 @app.cell
 def _(cont_sed_t3, duckdb):
+    # Aggregate continuous dose by hour, then rename cols to reflect the
+    # post-aggregation unit. Rates are mg/min (or mcg/min) pre-sum, but after
+    # SUM-per-hour the values represent total mg (or mcg) delivered in that
+    # hour — so `_mg_min_cont` → `_mg_hr_cont` (2026-04-24 unit convention).
+    # pandas.rename silently skips keys absent from the frame, so it is safe
+    # even when the cohort has no records for a given drug.
     cont_sed_dose_by_hr = duckdb.sql(
         """
-        -- Aggregate continuous dose by hour
         FROM cont_sed_t3
         SELECT hospitalization_id, _dh, _hr
             , SUM(COLUMNS('_cont'))
         GROUP BY hospitalization_id, _dh, _hr
         ORDER BY hospitalization_id, _dh
         """
-    )
+    ).df().rename(columns={
+        'propofol_mg_min_cont':      'propofol_mg_hr_cont',
+        'fentanyl_mcg_min_cont':     'fentanyl_mcg_hr_cont',
+        'midazolam_mg_min_cont':     'midazolam_mg_hr_cont',
+        'hydromorphone_mg_min_cont': 'hydromorphone_mg_hr_cont',
+        'lorazepam_mg_min_cont':     'lorazepam_mg_hr_cont',
+    })
     return (cont_sed_dose_by_hr,)
 
 
@@ -407,16 +418,26 @@ def _(cohort_hrly_grids_f, intm_sed_w):
 
 @app.cell
 def _(duckdb, intm_sed_wg):
+    # Aggregate intermittent dose by hour, then rename cols to match the
+    # post-aggregation "per hour" unit (2026-04-24 unit convention). After
+    # SUM-per-hour, `propofol_mg_intm` represents total mg delivered that
+    # hour from intermittent admin, so the column name gains the `_hr_`
+    # segment. pandas.rename silently skips keys that aren't present.
     intm_sed_dose_by_hr = duckdb.sql(
         """
-        -- Aggregate intermittent dose by hour
         FROM intm_sed_wg
         SELECT hospitalization_id, _dh
             , SUM(COALESCE(COLUMNS('_intm'), 0))
         GROUP BY hospitalization_id, _dh
         ORDER BY hospitalization_id, _dh
         """
-    )
+    ).df().rename(columns={
+        'propofol_mg_intm':      'propofol_mg_hr_intm',
+        'fentanyl_mcg_intm':     'fentanyl_mcg_hr_intm',
+        'midazolam_mg_intm':     'midazolam_mg_hr_intm',
+        'hydromorphone_mg_intm': 'hydromorphone_mg_hr_intm',
+        'lorazepam_mg_intm':     'lorazepam_mg_hr_intm',
+    })
     return (intm_sed_dose_by_hr,)
 
 
@@ -445,11 +466,11 @@ def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
         , t2 AS (
         FROM t1
         SELECT *
-            , fentanyl_mcg_total: fentanyl_mcg_intm + fentanyl_mcg_min_cont
-            , hydromorphone_mg_total: hydromorphone_mg_intm + hydromorphone_mg_min_cont
-            , lorazepam_mg_total: lorazepam_mg_intm + lorazepam_mg_min_cont
-            , midazolam_mg_total: midazolam_mg_intm + midazolam_mg_min_cont
-            , prop_mg_total: propofol_mg_intm + propofol_mg_min_cont
+            , fentanyl_mcg_total: fentanyl_mcg_hr_intm + fentanyl_mcg_hr_cont
+            , hydromorphone_mg_total: hydromorphone_mg_hr_intm + hydromorphone_mg_hr_cont
+            , lorazepam_mg_total: lorazepam_mg_hr_intm + lorazepam_mg_hr_cont
+            , midazolam_mg_total: midazolam_mg_hr_intm + midazolam_mg_hr_cont
+            , prop_mg_total: propofol_mg_hr_intm + propofol_mg_hr_cont
             , _midazeq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
             , _fenteq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
         )
@@ -479,11 +500,14 @@ def _(duckdb, sed_dose_by_hr):
         -- which avoids partial-shift bias in the Dose by Shift descriptive table
         -- and makes model dose coefficients interpretable as rates (see
         -- 05_analytical_dataset.py for the ÷12 rate conversion).
+        -- Column-name convention (2026-04-24): totals carry their unit as
+        -- suffix (`_mg` for propofol+midaz totals, `_mcg` for fentanyl totals);
+        -- per-hour rates downstream carry `_mg_hr` / `_mcg_hr`.
         FROM sed_dose_by_hr
         SELECT hospitalization_id, _nth_day, _shift
-            , SUM(prop_mg_total) AS prop_mg_total
-            , SUM(_fenteq_mcg_total) AS fenteq_mcg_total
-            , SUM(_midazeq_mg_total) AS midazeq_mg_total
+            , SUM(prop_mg_total) AS prop_mg
+            , SUM(_fenteq_mcg_total) AS fenteq_mcg
+            , SUM(_midazeq_mg_total) AS midazeq_mg
             , COUNT(*) AS n_hours
         GROUP BY hospitalization_id, _nth_day, _shift
         ORDER BY hospitalization_id, _nth_day, _shift
@@ -498,10 +522,12 @@ def _(sed_dose_agg):
     # NOTE: Pivot to wide day/night columns using pandas .pivot()
     # n_hours_day/night flow through so downstream can compute per-hour dose rates
     # that correctly handle partial shifts (intubation / extubation day edges).
+    # Unit-suffixed column names (e.g. prop_day_mg = total mg over 12h day shift)
+    # match the 2026-04-24 naming convention; see 05_analytical_dataset.py.
     sed_dose_daily = sed_dose_agg.pivot(
         index=['hospitalization_id', '_nth_day'],
         columns='_shift',
-        values=['prop_mg_total', 'fenteq_mcg_total', 'midazeq_mg_total', 'n_hours'],
+        values=['prop_mg', 'fenteq_mcg', 'midazeq_mg', 'n_hours'],
     ).reset_index()
 
     # Flatten MultiIndex columns to clean names. The pivot preserves the
@@ -509,9 +535,9 @@ def _(sed_dose_agg):
     # (value_col, 'day') then (value_col, 'night').
     sed_dose_daily.columns = [
         'hospitalization_id', '_nth_day',
-        'prop_day', 'prop_night',
-        'fenteq_day', 'fenteq_night',
-        'midazeq_day', 'midazeq_night',
+        'prop_day_mg', 'prop_night_mg',
+        'fenteq_day_mcg', 'fenteq_night_mcg',
+        'midazeq_day_mg', 'midazeq_night_mg',
         'n_hours_day', 'n_hours_night',
     ]
     # Drop any columns that ended up as None (e.g. if a shift is missing)
