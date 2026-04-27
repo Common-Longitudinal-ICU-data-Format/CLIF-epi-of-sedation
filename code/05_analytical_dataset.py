@@ -186,6 +186,10 @@ def _(
         , sbt_done_prefix_next_day: LEAD(o.sbt_done_prefix) OVER w
         , _sbt_done_2min_today: o.sbt_done_2min
         , sbt_done_2min_next_day: LEAD(o.sbt_done_2min) OVER w
+        , _sbt_done_subira_today: o.sbt_done_subira
+        , sbt_done_subira_next_day: LEAD(o.sbt_done_subira) OVER w
+        , _sbt_done_abc_today: o.sbt_done_abc
+        , sbt_done_abc_next_day: LEAD(o.sbt_done_abc) OVER w
         -- NOTE: Dose columns below are per-hour RATES (mg/hr or mcg/hr),
         -- computed as shift totals ÷ 12 (hours per shift). Valid because the
         -- filter (_nth_day > 0 AND outcome-columns non-null) guarantees
@@ -366,6 +370,10 @@ def _(
         , sbt_done_prefix_next_day: LEAD(o.sbt_done_prefix) OVER w
         , _sbt_done_2min_today: o.sbt_done_2min
         , sbt_done_2min_next_day: LEAD(o.sbt_done_2min) OVER w
+        , _sbt_done_subira_today: o.sbt_done_subira
+        , sbt_done_subira_next_day: LEAD(o.sbt_done_subira) OVER w
+        , _sbt_done_abc_today: o.sbt_done_abc
+        , sbt_done_abc_next_day: LEAD(o.sbt_done_abc) OVER w
         -- N-hours-aware rate columns. NULLIF(n_hours_*, 0) yields NULL when
         -- the patient had zero hours on that shift (e.g., extubation occurred
         -- exactly at 7am), which then propagates through the arithmetic to a

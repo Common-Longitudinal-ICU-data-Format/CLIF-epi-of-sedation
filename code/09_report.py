@@ -71,21 +71,25 @@ def _():
 
     19. Model comparison — SBT Done Next Day, variant `2min` (GEE)
 
-    20. Model comparison — Successful Extubation (GEE)
+    20. Model comparison — SBT Done Next Day, variant `subira` (GEE)
 
-    21. Model comparison — Successful Extubation (Logit)
+    21. Model comparison — SBT Done Next Day, variant `abc` (GEE)
 
-    22. Marginal effects (Linear) — SBT Done Next Day (GEE)
+    22. Model comparison — Successful Extubation (GEE)
 
-    23. Marginal effects (Linear) — Successful Extubation (GEE)
+    23. Model comparison — Successful Extubation (Logit)
 
-    24. Marginal effects (Linear) — Successful Extubation (Logit)
+    24. Marginal effects (Linear) — SBT Done Next Day (GEE)
 
-    25. Marginal effects (RCS) — SBT Done Next Day (GEE)
+    25. Marginal effects (Linear) — Successful Extubation (GEE)
 
-    26. Marginal effects (RCS) — Successful Extubation (GEE)
+    26. Marginal effects (Linear) — Successful Extubation (Logit)
 
-    27. Marginal effects (RCS) — Successful Extubation (Logit)
+    27. Marginal effects (RCS) — SBT Done Next Day (GEE)
+
+    28. Marginal effects (RCS) — Successful Extubation (GEE)
+
+    29. Marginal effects (RCS) — Successful Extubation (Logit)
     """)
     return
 
@@ -383,7 +387,7 @@ def _(SITE_NAME, pd):
     # Each carries the same structure as `sbt_gee_df` above; the variant
     # differs only in how `sbt_done_<variant>_next_day` is operationalized
     # upstream in `code/03_outcomes.py`.
-    _variants = ['anyprior', 'imv6h', 'prefix', '2min']
+    _variants = ['anyprior', 'imv6h', 'prefix', '2min', 'subira', 'abc']
     sbt_variant_dfs = {}
     for _v in _variants:
         _path = f"output_to_share/{SITE_NAME}/model_comparison_sbt_{_v}_gee.csv"
@@ -536,14 +540,16 @@ def _(
         " 17. Model comparison — SBT Done Next Day, variant `imv6h` (GEE)",
         " 18. Model comparison — SBT Done Next Day, variant `prefix` (GEE)",
         " 19. Model comparison — SBT Done Next Day, variant `2min` (GEE)",
-        " 20. Model comparison — Successful Extubation (GEE)",
-        " 21. Model comparison — Successful Extubation (Logit)",
-        " 22. Marginal effects (Linear) — SBT Done Next Day (GEE)",
-        " 23. Marginal effects (Linear) — Successful Extubation (GEE)",
-        " 24. Marginal effects (Linear) — Successful Extubation (Logit)",
-        " 25. Marginal effects (RCS) — SBT Done Next Day (GEE)",
-        " 26. Marginal effects (RCS) — Successful Extubation (GEE)",
-        " 27. Marginal effects (RCS) — Successful Extubation (Logit)",
+        " 20. Model comparison — SBT Done Next Day, variant `subira` (GEE)",
+        " 21. Model comparison — SBT Done Next Day, variant `abc` (GEE)",
+        " 22. Model comparison — Successful Extubation (GEE)",
+        " 23. Model comparison — Successful Extubation (Logit)",
+        " 24. Marginal effects (Linear) — SBT Done Next Day (GEE)",
+        " 25. Marginal effects (Linear) — Successful Extubation (GEE)",
+        " 26. Marginal effects (Linear) — Successful Extubation (Logit)",
+        " 27. Marginal effects (RCS) — SBT Done Next Day (GEE)",
+        " 28. Marginal effects (RCS) — Successful Extubation (GEE)",
+        " 29. Marginal effects (RCS) — Successful Extubation (Logit)",
     ]
 
     # Significance legend shown as footnote on every model comparison table
@@ -739,8 +745,10 @@ def _(
             'imv6h':    "imv6h — pySBT-style, ≥6h continuous IMV before flip",
             'prefix':   "prefix — pre-fix every-row baseline reproduction (no LAG checks)",
             '2min':     "2min — 2-minute sustained-duration variant of spec literal",
+            'subira':   "subira — Subira et al.: T-piece OR CPAP ≤8 OR (PS ≤8 AND PEEP ≤8) ≥30 min",
+            'abc':      "abc — Girard et al. (Lancet 2008): T-piece OR CPAP=5 OR PS<7, ≥30 min (no-PEEP/FiO2-change clause dropped)",
         }
-        for _v in ['anyprior', 'imv6h', 'prefix', '2min']:
+        for _v in ['anyprior', 'imv6h', 'prefix', '2min', 'subira', 'abc']:
             _df_v = sbt_variant_dfs.get(_v)
             _title_v = (
                 f"Model Comparison: SBT Done Next Day, variant `{_v}` (GEE)"

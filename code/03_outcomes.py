@@ -168,6 +168,39 @@ def _(resp_p):
                       AND peep_set <= 8 AND pressure_support_set <= 8)
                     OR regexp_matches(device_name, 't[\\s_-]?piece', 'i')
                     THEN 1 ELSE 0 END
+            -- ── Subira-trial-style SBT-state (Subira et al.) ─────────────
+            -- Per the published spec: T-piece OR CPAP ≤ 8 cmH2O OR
+            -- (PS ≤ 8 AND PEEP ≤ 8). Broader than the primary because
+            -- COALESCE(pressure_support_set, 0) catches pure-CPAP rows
+            -- (where pressure_support_set IS NULL) — the primary's
+            -- non-coalesced check fails on those rows due to NULL→FALSE
+            -- semantics in DuckDB CASE.
+            , _sbt_state_subira: CASE
+                WHEN regexp_matches(device_name, 't[\\s_-]?piece', 'i') THEN 1
+                WHEN mode_category = 'pressure support/cpap'
+                    AND COALESCE(peep_set, 999) <= 8
+                    AND COALESCE(pressure_support_set, 0) <= 8
+                THEN 1 ELSE 0 END
+            -- ── ABC-trial-style SBT-state (Girard et al. Lancet 2008) ────
+            -- Per the published spec: T-piece OR CPAP at 5 cmH2O OR PS < 7
+            -- cmH2O. Strictly more conservative than Subira on the PS arm
+            -- (< 7 vs ≤ 8) and on the CPAP arm (= 5 exactly vs ≤ 8).
+            -- SIMPLIFICATION: the original ABC criterion also requires "no
+            -- change in PEEP or FiO2 during SBT" — operationally hard in
+            -- row-level SQL (would need a 30-min lookback window comparing
+            -- against the prior block's values). Dropped for this
+            -- implementation; flag captures the mode-criterion only. See
+            -- docs/intub_extub_specs.md for the simplification note.
+            , _sbt_state_abc: CASE
+                WHEN regexp_matches(device_name, 't[\\s_-]?piece', 'i') THEN 1
+                WHEN mode_category = 'pressure support/cpap'
+                    AND pressure_support_set IS NULL
+                    AND peep_set = 5
+                THEN 1
+                WHEN mode_category = 'pressure support/cpap'
+                    AND pressure_support_set < 7
+                THEN 1
+                ELSE 0 END
             , _intub: CASE
                 WHEN LAG(device_category) OVER w IS DISTINCT FROM 'imv'
                     AND device_category = 'imv' THEN 1 ELSE 0 END
@@ -225,6 +258,19 @@ def _(sbt_t1):
             -- window nesting if both are in the same SELECT via reusable alias.
             , _on_imv: CASE WHEN device_category = 'imv' THEN 1 ELSE 0 END
             , _imv_chg: CASE WHEN _on_imv IS DISTINCT FROM LAG(_on_imv) OVER w THEN 1 ELSE 0 END
+            -- Per-variant chg/lag flags for the Subira and ABC operationalizations.
+            -- Each variant has its own SBT-state definition (see sbt_t1) and
+            -- therefore its own block partition + LAG predicate. The chg flags
+            -- are stable FROM columns here so the SUM(...) OVER window in sbt_t3
+            -- can use them without nested-window errors.
+            , _chg_sbt_state_subira: CASE
+                WHEN _sbt_state_subira IS DISTINCT FROM LAG(_sbt_state_subira) OVER w
+                THEN 1 ELSE 0 END
+            , _lag_sbt_state_subira: LAG(_sbt_state_subira) OVER w
+            , _chg_sbt_state_abc: CASE
+                WHEN _sbt_state_abc IS DISTINCT FROM LAG(_sbt_state_abc) OVER w
+                THEN 1 ELSE 0 END
+            , _lag_sbt_state_abc: LAG(_sbt_state_abc) OVER w
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
         """
     )
@@ -243,6 +289,8 @@ def _(sbt_t1, sbt_t2):
         FROM sbt_t2
         SELECT *
             , _block_id: SUM(_chg_sbt_state) OVER w
+            , _block_id_subira: SUM(_chg_sbt_state_subira) OVER w
+            , _block_id_abc:    SUM(_chg_sbt_state_abc)    OVER w
             , _imv_streak_id: SUM(_imv_chg) OVER w
             , _fail_extub: CASE
                 WHEN sbt_t2._extub_1st = 1 AND EXISTS (
@@ -287,6 +335,25 @@ def _(sbt_t3):
                     WHEN _on_imv = 1
                     THEN date_diff('minute', _imv_streak_start_dttm, recorded_dttm)
                     ELSE NULL END
+                -- ── Per-variant SBT-block boundaries (Subira / ABC) ──────────
+                -- Block start/last-record per `_block_id_<variant>`, broadcast
+                -- to every row of the block. Used downstream by sbt_outcomes
+                -- to compute per-variant block durations without an extra
+                -- aggregation cell. NOTE: this approximates true block end as
+                -- the LAST recorded_dttm WITHIN the block, which slightly
+                -- under-estimates duration relative to the primary's
+                -- "next block start as effective end" trick (see
+                -- sbt_all_blocks_w_duration). The under-estimate is bounded by
+                -- the resp-record sampling interval (~1h typical), well below
+                -- the 30-min variant threshold's noise floor.
+                , _block_subira_start_dttm: MIN(recorded_dttm)
+                    OVER (PARTITION BY hospitalization_id, _block_id_subira)
+                , _block_subira_last_dttm: MAX(recorded_dttm)
+                    OVER (PARTITION BY hospitalization_id, _block_id_subira)
+                , _block_abc_start_dttm: MIN(recorded_dttm)
+                    OVER (PARTITION BY hospitalization_id, _block_id_abc)
+                , _block_abc_last_dttm: MAX(recorded_dttm)
+                    OVER (PARTITION BY hospitalization_id, _block_id_abc)
         )
         FROM streak
         SELECT *
@@ -297,6 +364,14 @@ def _(sbt_t3):
             -- on IMV), the streak hasn't broken, so LAG gives the duration up
             -- to the prior row.
             , _lag_imv_streak_minutes: LAG(_imv_streak_minutes) OVER w
+            -- Per-variant block durations (computed from the broadcast
+            -- start/last timestamps in the WITH cell above). Date_diff isn't a
+            -- window function so this can live in the outer SELECT alongside
+            -- the LAG without nested-window errors.
+            , _block_duration_mins_subira: date_diff(
+                'minute', _block_subira_start_dttm, _block_subira_last_dttm)
+            , _block_duration_mins_abc: date_diff(
+                'minute', _block_abc_start_dttm, _block_abc_last_dttm)
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
         """
     )
@@ -348,26 +423,41 @@ def _():
 
 
 @app.cell
-def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t3):
+def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t4):
+    # NOTE: this cell reads from `sbt_t4` (NOT `sbt_t3`) so it has access to
+    # the IMV-streak duration columns (`_lag_imv_streak_minutes`) needed by
+    # the imv6h variant AND the per-variant block-duration columns
+    # (`_block_duration_mins_subira`, `_block_duration_mins_abc`) needed by
+    # the new Subira/ABC variants. sbt_t4 includes all of sbt_t3's columns
+    # via `FROM sbt_t3 SELECT *` so all existing references still resolve.
     sbt_outcomes = mo.sql(
         f"""
         -- Final SBT outcomes with code status and discharge info
-        FROM sbt_t3
+        FROM sbt_t4
         LEFT JOIN sbt_all_blocks_w_duration AS b
-            ON sbt_t3.hospitalization_id = b.hospitalization_id
-            AND sbt_t3._block_id = b._block_id
+            ON sbt_t4.hospitalization_id = b.hospitalization_id
+            AND sbt_t4._block_id = b._block_id
         ASOF LEFT JOIN cs_df AS c
-            ON c.hospitalization_id = sbt_t3.hospitalization_id
-            AND c.start_dttm <= sbt_t3.recorded_dttm
+            ON c.hospitalization_id = sbt_t4.hospitalization_id
+            AND c.start_dttm <= sbt_t4.recorded_dttm
         ASOF LEFT JOIN hosp_df AS h
-            ON sbt_t3.hospitalization_id = h.hospitalization_id
-            AND sbt_t3.recorded_dttm <= h.discharge_dttm
-        SELECT sbt_t3.fio2_set, sbt_t3.peep_set, sbt_t3.pressure_support_set, sbt_t3.tracheostomy
+            ON sbt_t4.hospitalization_id = h.hospitalization_id
+            AND sbt_t4.recorded_dttm <= h.discharge_dttm
+        SELECT sbt_t4.fio2_set, sbt_t4.peep_set, sbt_t4.pressure_support_set, sbt_t4.tracheostomy
             , _block_duration_mins: COALESCE(b._duration_mins, 0)
-            , sbt_t3.device_category, sbt_t3.device_name, sbt_t3.mode_category, sbt_t3.mode_name
-            , sbt_t3.hospitalization_id, event_dttm: sbt_t3.recorded_dttm
-            , sbt_t3._block_id
-            , sbt_t3._lag_sbt_state, sbt_t3._prior_mode_controlled
+            , sbt_t4.device_category, sbt_t4.device_name, sbt_t4.mode_category, sbt_t4.mode_name
+            , sbt_t4.hospitalization_id, event_dttm: sbt_t4.recorded_dttm
+            , sbt_t4._block_id
+            , sbt_t4._lag_sbt_state, sbt_t4._prior_mode_controlled
+            -- Audit columns for the QC dashboard's linked-table view.
+            -- Persisting them at the row level lets the auditor verify *why*
+            -- each variant flag fired (e.g., `_lag_imv_streak_minutes ≥ 360`
+            -- for `sbt_done_imv6h`).
+            , sbt_t4._imv_streak_minutes, sbt_t4._lag_imv_streak_minutes
+            , sbt_t4._sbt_state_subira, sbt_t4._sbt_state_abc
+            , sbt_t4._lag_sbt_state_subira, sbt_t4._lag_sbt_state_abc
+            , sbt_t4._block_id_subira, sbt_t4._block_id_abc
+            , sbt_t4._block_duration_mins_subira, sbt_t4._block_duration_mins_abc
             -- Spec-literal SBT onset (see docs/intub_extub_specs.md). Fires only
             -- on the legitimate transition row of a qualifying block:
             --   (a) sustained ≥30 min via _block_duration_mins
@@ -382,9 +472,9 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t3):
             -- trials (no spillover into subsequent rows or days).
             , sbt_done: CASE
                 WHEN _block_duration_mins >= 30
-                    AND sbt_t3._sbt_state = 1
-                    AND sbt_t3._lag_sbt_state = 0
-                    AND sbt_t3._prior_mode_controlled = 1
+                    AND sbt_t4._sbt_state = 1
+                    AND sbt_t4._lag_sbt_state = 0
+                    AND sbt_t4._prior_mode_controlled = 1
                 THEN 1 ELSE 0 END
             -- ── Sensitivity variants (see docs/intub_extub_specs.md §
             --    "SBT Detection (current implementation) > Sensitivity siblings")
@@ -392,32 +482,52 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t3):
             --     the prior row was non-SBT. Most permissive prior-mode check.
             , sbt_done_anyprior: CASE
                 WHEN _block_duration_mins >= 30
-                    AND sbt_t3._sbt_state = 1
-                    AND sbt_t3._lag_sbt_state = 0
+                    AND sbt_t4._sbt_state = 1
+                    AND sbt_t4._lag_sbt_state = 0
                 THEN 1 ELSE 0 END
             -- (b) imv6h: pySBT.py-style — patient has been continuously on IMV
             --     for ≥6h before the candidate flip. Simplified vs spec by
             --     dropping the explicit 10pm-6am window.
             , sbt_done_imv6h: CASE
                 WHEN _block_duration_mins >= 30
-                    AND sbt_t3._sbt_state = 1
-                    AND sbt_t3._lag_sbt_state = 0
-                    AND sbt_t3._lag_imv_streak_minutes >= 360
+                    AND sbt_t4._sbt_state = 1
+                    AND sbt_t4._lag_sbt_state = 0
+                    AND sbt_t4._lag_imv_streak_minutes >= 360
                 THEN 1 ELSE 0 END
             -- (c) prefix: pre-fix sanity check — the original definition before
             --     this plan. Should reproduce the baseline 52.9% event rate.
             , sbt_done_prefix: CASE
                 WHEN _block_duration_mins >= 30
-                    AND sbt_t3._sbt_state = 1
+                    AND sbt_t4._sbt_state = 1
                 THEN 1 ELSE 0 END
             -- (d) 2min: spec-literal prior conditions but ≥2 min duration.
             , sbt_done_2min: CASE
                 WHEN _block_duration_mins >= 2
-                    AND sbt_t3._sbt_state = 1
-                    AND sbt_t3._lag_sbt_state = 0
-                    AND sbt_t3._prior_mode_controlled = 1
+                    AND sbt_t4._sbt_state = 1
+                    AND sbt_t4._lag_sbt_state = 0
+                    AND sbt_t4._prior_mode_controlled = 1
                 THEN 1 ELSE 0 END
-            , _extub_1st, _intub, sbt_t3._trach_1st, _fail_extub
+            -- (e) Subira-trial-style operationalization (Subira et al.):
+            --     T-piece OR CPAP ≤8 OR (PS ≤8 AND PEEP ≤8), sustained ≥30 min.
+            --     Uses its own block partition (`_block_id_subira`) since the
+            --     Subira-state set is broader than the primary's (it catches
+            --     pure-CPAP rows the primary's non-coalesced AND misses).
+            , sbt_done_subira: CASE
+                WHEN sbt_t4._block_duration_mins_subira >= 30
+                    AND sbt_t4._sbt_state_subira = 1
+                    AND sbt_t4._lag_sbt_state_subira = 0
+                THEN 1 ELSE 0 END
+            -- (f) ABC-trial-style operationalization (Girard et al. 2008):
+            --     T-piece OR CPAP=5 OR PS<7, sustained ≥30 min. Strictly more
+            --     conservative than Subira on PS arm. Drops the original ABC
+            --     "no change in PEEP/FiO2 during SBT" clause as a known
+            --     simplification (see docs/intub_extub_specs.md).
+            , sbt_done_abc: CASE
+                WHEN sbt_t4._block_duration_mins_abc >= 30
+                    AND sbt_t4._sbt_state_abc = 1
+                    AND sbt_t4._lag_sbt_state_abc = 0
+                THEN 1 ELSE 0 END
+            , _extub_1st, _intub, sbt_t4._trach_1st, _fail_extub
             , c.code_status_category, cs_start_dttm: c.start_dttm
             , h.discharge_category, discharge_dttm: h.discharge_dttm
             , _withdrawl_lst: CASE
@@ -428,8 +538,8 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t3):
             , _success_extub: CASE
                 WHEN _extub_1st = 1 AND _withdrawl_lst = 0 AND _fail_extub = 0
                 THEN 1 ELSE 0 END
-        WHERE (sbt_t3.tracheostomy = 0 OR sbt_t3._trach_1st = 1)
-        ORDER BY sbt_t3.hospitalization_id, event_dttm
+        WHERE (sbt_t4.tracheostomy = 0 OR sbt_t4._trach_1st = 1)
+        ORDER BY sbt_t4.hospitalization_id, event_dttm
         """
     )
     return (sbt_outcomes,)
@@ -471,6 +581,8 @@ def _(sbt_outcomes):
             , sbt_done_imv6h: MAX(sbt_done_imv6h)
             , sbt_done_prefix: MAX(sbt_done_prefix)
             , sbt_done_2min: MAX(sbt_done_2min)
+            , sbt_done_subira: MAX(sbt_done_subira)
+            , sbt_done_abc: MAX(sbt_done_abc)
             , _success_extub: MAX(_success_extub)
             , _trach_1st: MAX(_trach_1st)
             , _fail_extub: MAX(_fail_extub)
@@ -497,6 +609,8 @@ def _(cohort_hrly_grids_f, sbt_outcomes_hrly):
             , sbt_done_imv6h: COALESCE(s.sbt_done_imv6h, 0)
             , sbt_done_prefix: COALESCE(s.sbt_done_prefix, 0)
             , sbt_done_2min: COALESCE(s.sbt_done_2min, 0)
+            , sbt_done_subira: COALESCE(s.sbt_done_subira, 0)
+            , sbt_done_abc: COALESCE(s.sbt_done_abc, 0)
             , _success_extub: COALESCE(s._success_extub, 0)
             , _trach_1st: COALESCE(s._trach_1st, 0)
             , _fail_extub: COALESCE(s._fail_extub, 0)
@@ -520,6 +634,8 @@ def _(cohort_sbt_outcomes_hrly):
             , sbt_done_imv6h: MAX(sbt_done_imv6h)
             , sbt_done_prefix: MAX(sbt_done_prefix)
             , sbt_done_2min: MAX(sbt_done_2min)
+            , sbt_done_subira: MAX(sbt_done_subira)
+            , sbt_done_abc: MAX(sbt_done_abc)
             , _success_extub: MAX(_success_extub)
             , _trach_1st: MAX(_trach_1st)
             , _fail_extub: MAX(_fail_extub)

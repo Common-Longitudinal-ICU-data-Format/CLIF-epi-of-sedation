@@ -450,6 +450,8 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         {'outcome': 'sbt_done_imv6h_next_day',    'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'sbt_done_prefix_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'sbt_done_2min_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_subira_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_abc_next_day',      'model_type': 'gee',   'fit_fn': _fit_gee},
     ]
 
     # Outcomes restricted to rate parameterization only (skip amount fit).
@@ -458,6 +460,8 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         'sbt_done_imv6h_next_day',
         'sbt_done_prefix_next_day',
         'sbt_done_2min_next_day',
+        'sbt_done_subira_next_day',
+        'sbt_done_abc_next_day',
     }
 
     # ── Cross-product loop: now also iterates over parameterization
@@ -553,6 +557,8 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
         'sbt_done_imv6h_next_day':    'sbt_imv6h',
         'sbt_done_prefix_next_day':   'sbt_prefix',
         'sbt_done_2min_next_day':     'sbt_2min',
+        'sbt_done_subira_next_day':   'sbt_subira',
+        'sbt_done_abc_next_day':      'sbt_abc',
         'success_extub_next_day':     'extub',
     }
     for _config in MODEL_CONFIGS:
