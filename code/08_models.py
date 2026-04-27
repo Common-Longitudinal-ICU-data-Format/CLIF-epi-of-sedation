@@ -91,6 +91,41 @@ def _(SITE_NAME, cohort_merged_final, pd):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
+    ### Sensitivity (absolute amounts, per 12-h shift) — `gee_summary_amount.csv`
+
+    Same GEE structure as the rate-based production model above, but exposures
+    are total mg / mcg over each 12-hour shift (the pre-2026-04-24
+    parameterization). For full 12-hour shifts (everything in this dataset
+    post-filter), amount = rate × 12 exactly, so coefficients should match
+    the rate model up to a unit rescaling. Any larger discrepancy is a
+    data-quality canary.
+    """)
+    return
+
+
+@app.cell
+def _(SITE_NAME, cohort_merged_final, pd):
+    import statsmodels.formula.api as _smf_amt
+    import statsmodels.api as _sm_amt
+    sbt_done_formula_amt = """sbt_done_next_day ~ prop_dif_mg + fenteq_dif_mcg + midazeq_dif_mg +
+    _prop_day_mg + _midazeq_day_mg + _fenteq_day_mcg +
+    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
+    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
+    """
+    gee_model_amt = _smf_amt.gee(formula=sbt_done_formula_amt, groups='hospitalization_id', data=cohort_merged_final, family=_sm_amt.families.Binomial())
+    gee_result_amt = gee_model_amt.fit()
+    _summary_df = gee_result_amt.summary().tables[1]
+    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/gee_summary_amount.csv', index=False)
+    _cov_matrix = gee_result_amt.cov_params()
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/gee_covmat_amount.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/gee_summary_amount.csv, gee_covmat_amount.csv")
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
     ## Logistic Regression: Successful Extubation Next Day
     """)
     return
@@ -113,6 +148,35 @@ def _(SITE_NAME, cohort_merged_final, pd):
     _cov_matrix = logit_result.cov_params()
     _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/logit_covmat.csv')
     print(f"Saved output_to_share/{SITE_NAME}/logit_summary.csv, logit_covmat.csv")
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ### Sensitivity (absolute amounts, per 12-h shift) — `logit_summary_amount.csv`
+
+    Mirror of the production logit above using the per-shift total exposures.
+    """)
+    return
+
+
+@app.cell
+def _(SITE_NAME, cohort_merged_final, pd):
+    import statsmodels.formula.api as _smf_amt
+    success_extub_formula_amt = """success_extub_next_day ~ prop_dif_mg + fenteq_dif_mcg + midazeq_dif_mg +
+    _prop_day_mg + _midazeq_day_mg + _fenteq_day_mcg +
+    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
+    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
+    """
+    logit_model_amt = _smf_amt.logit(formula=success_extub_formula_amt, data=cohort_merged_final)
+    logit_result_amt = logit_model_amt.fit(cov_type='cluster', cov_kwds={'groups': cohort_merged_final['hospitalization_id']})
+    _summary_df = logit_result_amt.summary().tables[1]
+    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/logit_summary_amount.csv', index=False)
+    _cov_matrix = logit_result_amt.cov_params()
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/logit_covmat_amount.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/logit_summary_amount.csv, logit_covmat_amount.csv")
     return
 
 
@@ -162,14 +226,23 @@ def _():
     # Scales below were retuned so "per N unit" stays clinically meaningful
     # after the rate conversion (old totals-era scales were ~12x larger).
     VAR_DISPLAY = {
-        # Exposures (day-night rate differences)
+        # Exposures (day-night rate differences) — production, mg/hr or mcg/hr
         'prop_dif_mg_hr':    {'scale': 10,  'label': 'Δ propofol (per 10 mg/hr)'},
         'fenteq_dif_mcg_hr': {'scale': 10,  'label': 'Δ fentanyl eq (per 10 mcg/hr)'},
         'midazeq_dif_mg_hr': {'scale': 0.1, 'label': 'Δ midazolam eq (per 0.1 mg/hr)'},
-        # Daytime absolute rates
+        # Daytime absolute rates (production)
         '_prop_day_mg_hr':    {'scale': 10,  'label': 'Daytime propofol (per 10 mg/hr)'},
         '_fenteq_day_mcg_hr': {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
         '_midazeq_day_mg_hr': {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
+        # Sensitivity: absolute amounts per 12-h shift. Scale = 12 × the rate
+        # scale, so an OR "per 120 mg propofol over 12h" is comparable to the
+        # rate model's OR "per 10 mg/hr propofol".
+        'prop_dif_mg':     {'scale': 120, 'label': 'Δ propofol (per 120 mg over 12h)'},
+        'fenteq_dif_mcg':  {'scale': 120, 'label': 'Δ fentanyl eq (per 120 mcg over 12h)'},
+        'midazeq_dif_mg':  {'scale': 1.2, 'label': 'Δ midazolam eq (per 1.2 mg over 12h)'},
+        '_prop_day_mg':    {'scale': 120, 'label': 'Daytime propofol (per 120 mg)'},
+        '_fenteq_day_mcg': {'scale': 120, 'label': 'Daytime fentanyl eq (per 120 mcg)'},
+        '_midazeq_day_mg': {'scale': 1.2, 'label': 'Daytime midazolam eq (per 1.2 mg)'},
         # Other continuous covariates (unchanged)
         'age':          {'scale': 1,   'label': 'Age (per year)'},
         'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
@@ -206,6 +279,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
                      cov_kwds={'groups': data['hospitalization_id']})
 
     # ── Dimension 1: nested covariate sets (all include exposures) ────
+    # PRODUCTION parameterization: rate-based exposures (mg/hr, mcg/hr)
     BASELINE = ("{{outcome}} ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
                 "age + C(sex_category) + C(icu_type) + cci_score")
     DAYDOSE = BASELINE + " + _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
@@ -227,13 +301,40 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
-    COVARIATE_SPECS = [
-        {'label': 'baseline', 'formula': BASELINE},
-        {'label': 'daydose',  'formula': DAYDOSE},
-        {'label': 'sofa',     'formula': SOFA},
-        {'label': 'clinical', 'formula': CLINICAL},
-        {'label': 'sofa_rcs', 'formula': SOFA_RCS},
-    ]
+    # SENSITIVITY parameterization: absolute amounts (mg, mcg) per 12-h shift.
+    # Mirrors the production specs above with bare _mg / _mcg column names.
+    BASELINE_AMOUNT = ("{{outcome}} ~ prop_dif_mg + fenteq_dif_mcg + midazeq_dif_mg + "
+                       "age + C(sex_category) + C(icu_type) + cci_score")
+    DAYDOSE_AMOUNT = BASELINE_AMOUNT + " + _prop_day_mg + _midazeq_day_mg + _fenteq_day_mcg"
+    SOFA_AMOUNT = DAYDOSE_AMOUNT + " + sofa_total"
+    CLINICAL_AMOUNT = DAYDOSE_AMOUNT + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
+                                       "pf_level_7pm + nee_7am + nee_7pm")
+    SOFA_RCS_AMOUNT = (
+        "{{outcome}} ~ "
+        "cr(prop_dif_mg, df=4) + cr(fenteq_dif_mcg, df=4) + cr(midazeq_dif_mg, df=4) + "
+        "cr(_prop_day_mg, df=4) + cr(_fenteq_day_mcg, df=4) + cr(_midazeq_day_mg, df=4) + "
+        "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
+    )
+
+    # Nested specs grouped by parameterization. Both lists share spec labels
+    # ('baseline', 'daydose', ...) so the wide-table builder can compare them
+    # side-by-side at the cost of a parameterization suffix on the filename.
+    COVARIATE_SPECS_BY_PARAM = {
+        'rate': [
+            {'label': 'baseline', 'formula': BASELINE},
+            {'label': 'daydose',  'formula': DAYDOSE},
+            {'label': 'sofa',     'formula': SOFA},
+            {'label': 'clinical', 'formula': CLINICAL},
+            {'label': 'sofa_rcs', 'formula': SOFA_RCS},
+        ],
+        'amount': [
+            {'label': 'baseline', 'formula': BASELINE_AMOUNT},
+            {'label': 'daydose',  'formula': DAYDOSE_AMOUNT},
+            {'label': 'sofa',     'formula': SOFA_AMOUNT},
+            {'label': 'clinical', 'formula': CLINICAL_AMOUNT},
+            {'label': 'sofa_rcs', 'formula': SOFA_RCS_AMOUNT},
+        ],
+    }
 
     # ── Dimension 2: outcome x model type ─────────────────────────────
     MODEL_CONFIGS = [
@@ -242,43 +343,48 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         {'outcome': 'success_extub_next_day', 'model_type': 'logit', 'fit_fn': _fit_logit},
     ]
 
-    # ── Cross-product loop: keep fitted results for wide-table builder
-    fitted = {}  # {(outcome, model_type): {spec_label: result}}
-    for _config in MODEL_CONFIGS:
-        _key = (_config['outcome'], _config['model_type'])
-        fitted[_key] = {}
-        for _spec in COVARIATE_SPECS:
-            _formula = _spec['formula'].replace('{{outcome}}', _config['outcome'])
-            try:
-                _result = _config['fit_fn'](_formula, _df_scaled)
-                fitted[_key][_spec['label']] = _result
-                print(f"  OK: {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
-            except Exception as e:
-                print(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
+    # ── Cross-product loop: now also iterates over parameterization
+    # Key shape: (outcome, model_type, param) → {spec_label: result}
+    fitted = {}
+    for _param, _specs in COVARIATE_SPECS_BY_PARAM.items():
+        for _config in MODEL_CONFIGS:
+            _key = (_config['outcome'], _config['model_type'], _param)
+            fitted[_key] = {}
+            for _spec in _specs:
+                _formula = _spec['formula'].replace('{{outcome}}', _config['outcome'])
+                try:
+                    _result = _config['fit_fn'](_formula, _df_scaled)
+                    fitted[_key][_spec['label']] = _result
+                    print(f"  OK: {_param} / {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
+                except Exception as e:
+                    print(f"  FAIL: {_param} / {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
     return MODEL_CONFIGS, fitted, np, re
 
 
 @app.cell
 def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
     # ── Long-format CSV (federated-friendly) ──────────────────────────
-    def _extract_long(result, label, outcome, model_type):
+    # Now carries a 'parameterization' column ('rate' vs 'amount') so the
+    # row identifier is (outcome, model_type, parameterization, sensitivity).
+    def _extract_long(result, label, outcome, model_type, parameterization):
         _tbl = result.summary().tables[1]
         _row = pd.DataFrame(_tbl.data[1:], columns=_tbl.data[0])
         _row['sensitivity'] = label
         _row['outcome'] = outcome
         _row['model_type'] = model_type
+        _row['parameterization'] = parameterization
         return _row
 
     sa_results = []
-    for (_outcome, _mt), _spec_dict in fitted.items():
+    for (_outcome, _mt, _param), _spec_dict in fitted.items():
         for _label, _result in _spec_dict.items():
-            sa_results.append(_extract_long(_result, _label, _outcome, _mt))
+            sa_results.append(_extract_long(_result, _label, _outcome, _mt, _param))
     sa_all = pd.concat(sa_results, ignore_index=True)
     _sa_path = f'output_to_share/{SITE_NAME}/sensitivity_analysis.csv'
     sa_all.to_csv(_sa_path, index=False)
     print(f"Saved {_sa_path} ({len(sa_all)} rows)")
 
-    # ── Wide comparison tables per (outcome, model_type) ──────────────
+    # ── Wide comparison tables per (outcome, model_type, param) ───────
     def _pretty_label(varname):
         """Map statsmodels parameter name -> human-readable label."""
         if varname in VAR_DISPLAY:
@@ -316,21 +422,26 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
         _tbl.index.name = 'Variable'
         return _tbl
 
+    # Filename convention: rate parameterization keeps the production file
+    # name unsuffixed (`model_comparison_sbt_gee.csv`); amount is sibling
+    # suffixed (`model_comparison_sbt_gee_amount.csv`).
     for _config in MODEL_CONFIGS:
-        _key = (_config['outcome'], _config['model_type'])
-        if _key not in fitted or not fitted[_key]:
-            continue
-        _outcome_short = 'sbt' if 'sbt' in _config['outcome'] else 'extub'
-        _fname = f"output_to_share/{SITE_NAME}/model_comparison_{_outcome_short}_{_config['model_type']}.csv"
-        # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
-        # as OR-per-unit. The RCS results are still exported in the long-format
-        # sensitivity_analysis.csv above, and visualized via marginal-effect plots.
-        _results_for_table = {
-            _k: _v for _k, _v in fitted[_key].items() if _k != 'sofa_rcs'
-        }
-        _wide = build_wide_table(_results_for_table)
-        _wide.to_csv(_fname)
-        print(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
+        for _param in ['rate', 'amount']:
+            _key = (_config['outcome'], _config['model_type'], _param)
+            if _key not in fitted or not fitted[_key]:
+                continue
+            _outcome_short = 'sbt' if 'sbt' in _config['outcome'] else 'extub'
+            _suffix = '' if _param == 'rate' else '_amount'
+            _fname = f"output_to_share/{SITE_NAME}/model_comparison_{_outcome_short}_{_config['model_type']}{_suffix}.csv"
+            # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
+            # as OR-per-unit. The RCS results are still exported in the long-format
+            # sensitivity_analysis.csv above, and visualized via marginal-effect plots.
+            _results_for_table = {
+                _k: _v for _k, _v in fitted[_key].items() if _k != 'sofa_rcs'
+            }
+            _wide = build_wide_table(_results_for_table)
+            _wide.to_csv(_fname)
+            print(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
     return
 
 
@@ -520,8 +631,13 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
     # signal without needing a formal p-value threshold. Plotting both specs
     # also gives a stronger methods story than pre-specifying one.
     # To add/remove specs, edit PLOT_SPECS. Filenames encode the spec label.
+    # Only the 'rate' parameterization is plotted — amount-parameterized fits
+    # produce structurally identical curves up to x-axis units (rate × 12),
+    # so plotting both would double the figure count for no new information.
     PLOT_SPECS = ['sofa', 'sofa_rcs']
-    for (_outcome, _mt), _spec_dict in fitted.items():
+    for (_outcome, _mt, _param), _spec_dict in fitted.items():
+        if _param != 'rate':
+            continue
         for _spec_label in PLOT_SPECS:
             if _spec_label in _spec_dict:
                 plot_marginal_effects(

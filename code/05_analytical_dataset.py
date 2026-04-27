@@ -192,6 +192,21 @@ def _(
         , prop_dif_mg_hr:     (COALESCE(s.prop_night_mg, 0)    - COALESCE(s.prop_day_mg, 0))    / 12.0
         , fenteq_dif_mcg_hr:  (COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)) / 12.0
         , midazeq_dif_mg_hr:  (COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)) / 12.0
+        -- Absolute totals (per 12-hr shift) — kept alongside the rate columns
+        -- above for the sensitivity model in 08_models.py that regresses on
+        -- absolute amounts instead of per-hour rates. Pre-2026-04-24 this was
+        -- the only parameterization; restored as a SA variant. For full 12-h
+        -- shifts (everything in this dataset post-filter), amount = rate × 12
+        -- exactly, so the two model fits should agree up to a unit rescaling.
+        , _prop_day_mg:      COALESCE(s.prop_day_mg, 0)
+        , _prop_night_mg:    COALESCE(s.prop_night_mg, 0)
+        , _fenteq_day_mcg:   COALESCE(s.fenteq_day_mcg, 0)
+        , _fenteq_night_mcg: COALESCE(s.fenteq_night_mcg, 0)
+        , _midazeq_day_mg:   COALESCE(s.midazeq_day_mg, 0)
+        , _midazeq_night_mg: COALESCE(s.midazeq_night_mg, 0)
+        , prop_dif_mg:    COALESCE(s.prop_night_mg, 0)    - COALESCE(s.prop_day_mg, 0)
+        , fenteq_dif_mcg: COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)
+        , midazeq_dif_mg: COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)
         , COLUMNS('(7am)|(7pm)')
         , age: h.age_at_admission
         , p.sex_category

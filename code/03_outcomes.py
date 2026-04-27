@@ -143,24 +143,6 @@ def _(CONFIG_PATH, hosp):
     return (cs_df,)
 
 
-@app.cell
-def _(CONFIG_PATH, get_config_or_params, pd):
-    # Compute last vitals datetime per hospitalization
-    _cfg = get_config_or_params(CONFIG_PATH)
-    _vitals_path = f"{_cfg['data_directory']}/clif_vitals.{_cfg.get('filetype', 'parquet')}"
-    _vitals = pd.read_parquet(
-        _vitals_path,
-        columns=['hospitalization_id', 'recorded_dttm'],
-    )
-    last_vitals_df = (
-        _vitals
-        .groupby('hospitalization_id', as_index=False)['recorded_dttm']
-        .max()
-    )
-    print(f"last_vitals_df: {len(last_vitals_df)} hospitalizations")
-    return (last_vitals_df,)
-
-
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -206,7 +188,9 @@ def _(resp_p):
 def _(sbt_t1):
     sbt_t2 = mo.sql(
         f"""
-        -- Gaps-and-islands: cumulative extubation and trach flags
+        -- Gaps-and-islands: cumulative extubation and trach flags;
+        -- plus row-level prior-state predicates needed downstream by sbt_outcomes
+        -- to enforce spec-literal SBT-onset definition (see docs/intub_extub_specs.md).
         FROM sbt_t1
         SELECT *
             , _chg_sbt_state: CASE
@@ -218,6 +202,21 @@ def _(sbt_t1):
             , _trach_flip_cum: SUM(_trach_flip_to_1) OVER w
             , _trach_1st: CASE
                 WHEN _trach_flip_to_1 = 1 AND _trach_flip_cum = 1 THEN 1 ELSE 0 END
+            -- Prior-row SBT state. NULL on first row → treated as not-0 by
+            -- equality, so the SBT-onset CASE in sbt_outcomes never fires
+            -- on the very first respiratory_support row of a hospitalization
+            -- (excludes the patient-arrives-already-in-PS edge case).
+            , _lag_sbt_state: LAG(_sbt_state) OVER w
+            -- Spec-literal "from controlled mode" predicate (per
+            -- CLIF_rule_based_SAT_SBT_signature/docs/sbt_delivery_implementation.md).
+            -- mCIDE values are lowercase by convention.
+            , _prior_mode_controlled: CASE
+                WHEN LAG(mode_category) OVER w IN (
+                    'assist control-volume control',
+                    'pressure control',
+                    'pressure-regulated volume control',
+                    'simv'
+                ) THEN 1 ELSE 0 END
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
         """
     )
@@ -225,10 +224,10 @@ def _(sbt_t1):
 
 
 @app.cell
-def _(last_vitals_df, sbt_t1, sbt_t2):
+def _(sbt_t1, sbt_t2):
     sbt_t3 = mo.sql(
         f"""
-        -- Assign block IDs, detect failed extubation, check last vitals within 24h
+        -- Assign block IDs, detect failed extubation
         FROM sbt_t2
         SELECT *
             , _block_id: SUM(_chg_sbt_state) OVER w
@@ -240,14 +239,6 @@ def _(last_vitals_df, sbt_t1, sbt_t2):
                       AND sbt_t1._intub = 1
                       AND sbt_t1.recorded_dttm > sbt_t2.recorded_dttm
                       AND sbt_t1.recorded_dttm <= sbt_t2.recorded_dttm + INTERVAL 24 HOUR
-                ) THEN 1 ELSE 0 END
-            , _last_vitals_within_24h_of_extub: CASE
-                WHEN sbt_t2._extub_1st = 1 AND EXISTS (
-                    SELECT 1
-                    FROM last_vitals_df lv
-                    WHERE lv.hospitalization_id = sbt_t2.hospitalization_id
-                      AND lv.recorded_dttm >= sbt_t2.recorded_dttm
-                      AND lv.recorded_dttm <= sbt_t2.recorded_dttm + INTERVAL 24 HOUR
                 ) THEN 1 ELSE 0 END
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
         """
@@ -294,7 +285,7 @@ def _():
     ## SBT Outcomes
 
     Final join: SBT blocks + code status (ASOF) + hospitalization discharge info.
-    Computes sbt_done, success_extub, fail_extub, withdrawal, death_after_extub.
+    Computes sbt_done (spec-literal onset), success_extub, fail_extub, withdrawal.
     """)
     return
 
@@ -318,11 +309,29 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t3):
             , _block_duration_mins: COALESCE(b._duration_mins, 0)
             , sbt_t3.device_category, sbt_t3.device_name, sbt_t3.mode_category, sbt_t3.mode_name
             , sbt_t3.hospitalization_id, event_dttm: sbt_t3.recorded_dttm
-            , sbt_done: CASE WHEN _block_duration_mins >= 30 AND sbt_t3._sbt_state = 1 THEN 1 ELSE 0 END
+            , sbt_t3._block_id
+            , sbt_t3._lag_sbt_state, sbt_t3._prior_mode_controlled
+            -- Spec-literal SBT onset (see docs/intub_extub_specs.md). Fires only
+            -- on the legitimate transition row of a qualifying block:
+            --   (a) sustained ≥30 min via _block_duration_mins
+            --   (b) current row is in SBT target state (_sbt_state = 1)
+            --   (c) immediate predecessor was non-SBT (_lag_sbt_state = 0;
+            --       NULL on row 1 doesn't equal 0, so first-row arrivals
+            --       never fire — onset-only by construction)
+            --   (d) immediate predecessor's mode_category was controlled
+            --       (_prior_mode_controlled = 1; spec literal)
+            -- These conditions together select exactly one row per qualifying
+            -- block, so MAX-based hourly/daily aggregation reflects unique
+            -- trials (no spillover into subsequent rows or days).
+            , sbt_done: CASE
+                WHEN _block_duration_mins >= 30
+                    AND sbt_t3._sbt_state = 1
+                    AND sbt_t3._lag_sbt_state = 0
+                    AND sbt_t3._prior_mode_controlled = 1
+                THEN 1 ELSE 0 END
             , _extub_1st, _intub, sbt_t3._trach_1st, _fail_extub
             , c.code_status_category, cs_start_dttm: c.start_dttm
             , h.discharge_category, discharge_dttm: h.discharge_dttm
-            , _last_vitals_within_24h_of_extub
             , _withdrawl_lst: CASE
                 WHEN _extub_1st = 1
                     AND TRIM(LOWER(code_status_category)) != 'full'
@@ -331,17 +340,23 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t3):
             , _success_extub: CASE
                 WHEN _extub_1st = 1 AND _withdrawl_lst = 0 AND _fail_extub = 0
                 THEN 1 ELSE 0 END
-            , _death_after_extub_wo_reintub: CASE
-                WHEN _extub_1st = 1
-                    AND _last_vitals_within_24h_of_extub = 1
-                    AND _fail_extub = 0
-                    AND TRIM(LOWER(discharge_category)) IN ('hospice', 'expired')
-                THEN 1 ELSE 0 END
         WHERE (sbt_t3.tracheostomy = 0 OR sbt_t3._trach_1st = 1)
         ORDER BY sbt_t3.hospitalization_id, event_dttm
         """
     )
     return (sbt_outcomes,)
+
+
+@app.cell
+def _(SITE_NAME, sbt_outcomes):
+    # Persist the raw row-level table for audit / QC dashboard consumption.
+    # Naming convention: this is the second-to-last aggregation tier (before
+    # hourly + daily roll-ups), saved alongside `sbt_outcomes_daily.parquet`.
+    _out = sbt_outcomes.df()
+    _path = f"output/{SITE_NAME}/sbt_outcomes.parquet"
+    _out.to_parquet(_path)
+    print(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
+    return
 
 
 @app.cell(hide_code=True)
@@ -369,7 +384,6 @@ def _(sbt_outcomes):
             , _fail_extub: MAX(_fail_extub)
             , _extub_1st: MAX(_extub_1st)
             , _withdrawl_lst: MAX(_withdrawl_lst)
-            , _death_after_extub_wo_reintub: MAX(_death_after_extub_wo_reintub)
         GROUP BY hospitalization_id, _dh
         """
     )
@@ -392,7 +406,6 @@ def _(cohort_hrly_grids_f, sbt_outcomes_hrly):
             , _fail_extub: COALESCE(s._fail_extub, 0)
             , _extub_1st: COALESCE(s._extub_1st, 0)
             , _withdrawl_lst: COALESCE(s._withdrawl_lst, 0)
-            , _death_after_extub_wo_reintub: COALESCE(s._death_after_extub_wo_reintub, 0)
         ORDER BY g.hospitalization_id, g.event_dttm
         """
     )
@@ -412,7 +425,6 @@ def _(cohort_sbt_outcomes_hrly):
             , _fail_extub: MAX(_fail_extub)
             , _extub_1st: MAX(_extub_1st)
             , _withdrawl_lst: MAX(_withdrawl_lst)
-            , _death_after_extub_wo_reintub: MAX(_death_after_extub_wo_reintub)
         GROUP BY hospitalization_id, _nth_day
         ORDER BY hospitalization_id, _nth_day
         """
