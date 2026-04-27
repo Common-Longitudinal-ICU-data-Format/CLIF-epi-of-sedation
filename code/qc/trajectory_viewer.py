@@ -432,20 +432,10 @@ def update_pin_state(pinned_ts, table_records, page_size):
     return style_cond, page_current, status
 
 
-@app.callback(
-    Output("linked-table-collapse", "is_open", allow_duplicate=True),
-    Output("collapse-caret", "children", allow_duplicate=True),
-    Input("timeline-graph", "hoverData"),
-    State("linked-table-collapse", "is_open"),
-    prevent_initial_call=True,
-)
-def auto_open_drawer_on_first_hover(hover_data, is_open):
-    """Auto-expand the drawer the first time the user hovers — that's the
-    discoverability hook. After that, hover doesn't mutate any state.
-    """
-    if not hover_data or is_open:
-        return no_update, no_update
-    return True, "▾ "
+# NOTE: The previous "auto-open drawer on first hover" callback was removed
+# (2026-04-26) at user request — it kept popping the table over the plot
+# whenever the cursor passed over a panel, covering half the screen.
+# The drawer now only opens via the visible toggle button or Ctrl+` hotkey.
 
 
 # ── Click-to-pin: clicking the plot freezes the cursor at that x ──────
@@ -680,11 +670,19 @@ def build_timeline(
     # ── Layout: hide y-axis tick labels; set rotated row titles via
     # annotations on the left margin. Per-trace normalization makes [0, 1]
     # the natural range for every panel.
+    #
+    # `fixedrange=True` on every y-axis is the canonical Plotly idiom for
+    # "horizontal-only zoom" — it disables scroll-zoom, box-zoom, and
+    # double-click rescale on y while leaving x fully interactive. Without
+    # this, scroll-wheel zoom would silently rescale y to fit data and
+    # break the lower-bound-at-0 invariant on the sedative panel (and
+    # every other normalized panel).
     for i, p in enumerate(ordered, start=1):
         fig.update_yaxes(
             showticklabels=False,
             showgrid=False, zeroline=False,
             range=[0, 1.05] if p["id"] != "assessments" else None,
+            fixedrange=True,
             row=i, col=1,
         )
         # Compact left-margin label (panel title + subtitle on two lines).
