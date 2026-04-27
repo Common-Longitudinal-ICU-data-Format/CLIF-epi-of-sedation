@@ -114,11 +114,17 @@ def _panel_checklist() -> dcc.Checklist:
     )
 
 
-# Bottom drawer: always-visible thin tab + collapsible body. Ctrl+` toggles.
+# Bottom drawer: in-flow section below the plot, NOT a fixed overlay.
+# Earlier (2026-04-26) the drawer was `position: fixed` so it floated at
+# the bottom of the viewport — but that covered the lower plot panels
+# (resp/pressors/vitals) when expanded, with no way to scroll past it.
+# Switching to default in-flow positioning lets the page scroll normally;
+# the drawer just appears below the plot. The always-visible tab strip
+# still acts as the toggle, and Ctrl+` still collapses/expands.
 _BOTTOM_DRAWER_STYLE = {
-    "position": "fixed", "bottom": "0", "left": "0", "right": "0",
     "backgroundColor": "white", "borderTop": "1px solid #ccc",
-    "zIndex": 1030, "boxShadow": "0 -2px 8px rgba(0,0,0,0.06)",
+    "boxShadow": "0 -2px 8px rgba(0,0,0,0.06)",
+    "marginTop": "12px",
 }
 
 
@@ -162,6 +168,55 @@ app.layout = dbc.Container([
 
     html.Div(id="summary-strip", className="mb-2"),
 
+    # ── SBT label legend (collapsed by default) ───────────────────────
+    # Five SBT operationalizations are rendered as separate event vlines on
+    # the plot — auditors need a quick reference for what each label means.
+    # Placed inside an html.Details so the table is hidden until the user
+    # clicks the summary line.
+    html.Details([
+        html.Summary(
+            "ℹ️  What does each SBT label mean? (click to expand)",
+            style={"cursor": "pointer", "fontSize": "12px",
+                   "color": "#555", "padding": "4px 0"},
+        ),
+        dcc.Markdown(
+            """
+| Plot label | Variant column | What it flags |
+|---|---|---|
+| `sbt-prim` | `sbt_done` (primary, spec-literal) | ≥30 min sustained on PS-with-low-pressure-support, prior row was on a *controlled* mode (AC-VC, PC, PRVC, SIMV) |
+| `anyprior` | `sbt_done_anyprior` | ≥30 min sustained on PS-with-low, prior row was *any* non-SBT mode (drops the controlled-mode whitelist) |
+| `imv6h` | `sbt_done_imv6h` | ≥30 min sustained on PS-with-low, plus ≥6 *continuous* hours on IMV before the flip (pySBT-style) |
+| `prefix` | `sbt_done_prefix` | ≥30 min on PS-with-low — **NO prior-mode check at all** (pre-fix every-row baseline; this is the over-counting definition) |
+| `2min` | `sbt_done_2min` | ≥2 min on PS-with-low, controlled-mode prior (relaxed sustained-duration variant of primary) |
+
+**How to read divergences on this plot**
+
+- `prefix` fires on every day with ≥30 min on PS-with-low — including days where the patient was *already* on PS-with-low yesterday.
+- `sbt-prim` requires a clean *transition* from controlled mode → PS-with-low. Days where the patient was already on PS-with-low yesterday do NOT fire here.
+- A day with only `prefix` flagged but not `sbt-prim` is a row that the spec-literal **correctly excluded** — verify against the resp panel's mode ribbon (the patient was on PS-with-low for both day-1 and day-N, no transition).
+- A day with `prefix` + `anyprior` but not `sbt-prim` means the prior mode was supportive (e.g., NIPPV / CPAP / BiPAP) rather than controlled.
+
+**Audit columns now in the linked table** (Ctrl+`` ` ``  to expand): pin a cursor at any SBT vline and read these to verify *why* each variant fired or didn't.
+
+| Column | Meaning |
+|---|---|
+| `blk_id`, `blk_dur_min` | Which contiguous SBT-state block this row belongs to, and how long the block has lasted at this row. (`prefix` requires `blk_dur_min ≥ 30`.) |
+| `lag_sbt` | The SBT-state of the immediately prior row (0 / 1). Variants `sbt`, `sbt_any`, `sbt_imv6h`, `sbt_2m` all require `lag_sbt = 0` (clean transition). |
+| `prior_ctrl` | Whether the immediately prior row's mode was a controlled mode (AC-VC / PC / PRVC / SIMV). `sbt-prim` and `sbt_2m` require `prior_ctrl = 1`. |
+| `imv_h`, `lag_imv_h` | Hours the patient has been continuously on IMV at this row, and at the prior row. `sbt_imv6h` requires `lag_imv_h ≥ 6`. |
+| `ps_bf`, `mode_bf`, `device_bf` | Backfilled (post-`resp_processed_bf`) PS-set / mode / device — these are what `03_outcomes.py` actually evaluates against. Compare with raw `mode` / `device` from `wide_df` to spot waterfall-fill differences. |
+| `sbt`, `sbt_any`, `sbt_imv6h`, `sbt_pre`, `sbt_2m` | The 5 flag outputs themselves, sourced row-by-row. |
+
+See `docs/intub_extub_specs.md` § "Sensitivity siblings" for the full operationalizations.
+            """,
+            style={"fontSize": "11px", "marginTop": "4px",
+                   "fontFamily": "system-ui, sans-serif"},
+        ),
+    ], className="mb-2", style={
+        "border": "1px solid #e0e0e0", "borderRadius": "4px",
+        "padding": "4px 10px", "backgroundColor": "#fafafa",
+    }),
+
     dbc.Row([
         dbc.Col([html.Small("Show panels:", className="fw-semibold text-muted me-2")], width="auto"),
         dbc.Col(_panel_checklist(), width=True),
@@ -184,10 +239,10 @@ app.layout = dbc.Container([
         ),
     ),
 
-    # Spacer so the fixed bottom drawer never covers content above.
-    html.Div(style={"height": "60px"}),
-
-    # Fixed-bottom drawer (VS Code-style). Tab strip is always visible.
+    # In-flow drawer (placed below the plot). Tab strip is always visible;
+    # body collapses/expands on click or Ctrl+`. The drawer used to be
+    # position:fixed which covered the lower plot panels — removed because
+    # scrolling past it was impossible. Now the page scrolls normally.
     html.Div([
         # Always-visible tab strip
         dbc.Button(
@@ -349,16 +404,27 @@ def toggle_collapse(_n, is_open):
     return new_state, ("▾ " if new_state else "▸ ")
 
 
-def _ts_to_naive(x: object) -> pd.Timestamp | None:
-    """Robustly parse an x-value (from hover/click/store) to a naive ts."""
+def _ts_to_utc(x: object) -> pd.Timestamp | None:
+    """Robustly parse an x-value (from hover/click/store) to a tz-aware UTC ts.
+
+    Plotly's click event emits `points[0].x` as an ISO-like string. For
+    tz-aware data, the value is internally in UTC (regardless of how the
+    chart displays the wall-clock). We normalize everything to UTC for
+    comparison so neither side has to guess the originating tz.
+
+    - Naive input  → assume UTC (matches Plotly's emit format).
+    - Tz-aware     → convert to UTC.
+    """
     if x is None:
         return None
     try:
         ts = pd.Timestamp(x)
     except (TypeError, ValueError):
         return None
-    if ts.tzinfo is not None:
-        ts = ts.tz_localize(None)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
     return ts
 
 
@@ -366,10 +432,12 @@ def _table_window_subset(table_df: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFra
     """Return rows whose event_time is within ±HOVER_WINDOW_MIN of `ts`."""
     if "event_time" not in table_df.columns or table_df.empty:
         return table_df.iloc[0:0]
-    time_col = pd.to_datetime(table_df["event_time"])
-    if time_col.dt.tz is not None:
-        time_col = time_col.dt.tz_localize(None)
+    time_col = pd.to_datetime(table_df["event_time"], utc=True)
     window = pd.Timedelta(minutes=HOVER_WINDOW_MIN)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
     mask = (time_col >= ts - window) & (time_col <= ts + window)
     return table_df.loc[mask]
 
@@ -377,6 +445,7 @@ def _table_window_subset(table_df: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFra
 @app.callback(
     Output("linked-table", "style_data_conditional"),
     Output("linked-table", "page_current"),
+    Output("linked-table", "active_cell"),
     Output("pin-status", "children"),
     Input("pinned-cursor", "data"),
     State("linked-table", "data"),
@@ -388,18 +457,20 @@ def update_pin_state(pinned_ts, table_records, page_size):
     (always-full) table and jump the table to that row's page so it's
     visible. When unpinned, clear styling.
 
-    The table data itself is rendered once at patient load and never
-    changes — this is an audit view. Hovering the plot only moves the
-    visual cursor; it doesn't filter rows anymore.
+    Comparison is done in UTC on both sides — the table records'
+    event_time strings carry tz offsets (via `_records_for_display`'s
+    `%z` format) and the click x is normalized to UTC by `_ts_to_utc`.
+    Without this, a wall-clock-only comparison would mis-anchor by the
+    UTC-offset (4h in EDT) and pick a row ~hours away from the pin.
     """
     if not pinned_ts:
-        return [], no_update, "Hover the plot to read values · click to pin a cursor"
+        return [], no_update, no_update, "Hover the plot to read values · click to pin a cursor"
 
-    ts = _ts_to_naive(pinned_ts)
+    ts = _ts_to_utc(pinned_ts)
     if ts is None or not table_records:
-        return [], no_update, no_update
+        return [], no_update, no_update, no_update
 
-    # Find the table row whose event_time is closest to the pin.
+    # Find the table row whose event_time is closest to the pin (UTC).
     diffs = []
     for i, rec in enumerate(table_records):
         et = rec.get("event_time")
@@ -407,29 +478,64 @@ def update_pin_state(pinned_ts, table_records, page_size):
             continue
         try:
             t = pd.Timestamp(et)
-            if t.tzinfo is not None:
-                t = t.tz_localize(None)
+            if t.tzinfo is None:
+                t = t.tz_localize("UTC")
+            else:
+                t = t.tz_convert("UTC")
             diffs.append((i, abs((t - ts).total_seconds())))
         except (ValueError, TypeError):
             continue
     if not diffs:
-        return [], no_update, no_update
-    best_idx, _ = min(diffs, key=lambda x: x[1])
+        return [], no_update, no_update, no_update
+    best_idx, best_secs = min(diffs, key=lambda x: x[1])
 
-    style_cond = [{
-        "if": {"row_index": best_idx},
-        "backgroundColor": "#fff3e0",
-        "fontWeight": "bold",
-    }]
+    # Strong row highlight: saturated background + left border + bold so
+    # the row is unmistakable against the otherwise-uniform table. Clear
+    # `active_cell` so a stale cell-focus from a prior table click doesn't
+    # visually compete with the row highlight.
+    style_cond = [
+        {
+            "if": {"row_index": best_idx},
+            "backgroundColor": "#fde9c2",
+            "fontWeight": "bold",
+            "color": "#222",
+        },
+        {
+            # Left-edge marker — first column gets a thick orange border so
+            # the highlighted row is locatable even when scrolled horizontally.
+            "if": {"row_index": best_idx, "column_id": "event_time"},
+            "borderLeft": "4px solid #e6550d",
+        },
+    ]
     page_current = best_idx // (page_size or 50)
 
+    # Localize the displayed pinned time back to the data tz for the
+    # status banner — UTC-only would confuse the user. Pull the tz from
+    # the first parseable record so this works for any site (MIMIC's
+    # US/Eastern, UCMC's US/Central, etc.) without hard-coding.
+    display_tz = None
+    for rec in table_records:
+        et = rec.get("event_time")
+        if et:
+            try:
+                _t = pd.Timestamp(et)
+                if _t.tzinfo is not None:
+                    display_tz = _t.tzinfo
+                    break
+            except (ValueError, TypeError):
+                continue
+    ts_display = (
+        ts.tz_convert(display_tz).strftime("%Y-%m-%d %H:%M %Z")
+        if display_tz is not None
+        else ts.strftime("%Y-%m-%d %H:%M UTC")
+    )
     status = html.Span([
         html.Strong("📌 PINNED ", style={"color": "#e6550d"}),
-        f"at {ts.strftime('%Y-%m-%d %H:%M')} · ",
+        f"at {ts_display} · closest row {best_secs / 60:.1f} min away · ",
         html.Span("click the plot again to unpin · table jumped to closest row",
                   className="text-muted"),
     ])
-    return style_cond, page_current, status
+    return style_cond, page_current, None, status
 
 
 # NOTE: The previous "auto-open drawer on first hover" callback was removed
@@ -648,10 +754,11 @@ def build_timeline(
 
     _draw_event_vlines(fig, events, n_rows=len(ordered))
 
-    # _nth_day labels along top edge
+    # _nth_day labels along top edge. Pushed above the staggered SBT-variant
+    # annotation band (1.005..1.130) so they never collide with event labels.
     for ts_center, nth_day in day_labels_for_cohort(cohort_start, cohort_end):
         fig.add_annotation(
-            x=ts_center, y=1.025, xref="x", yref="paper",
+            x=ts_center, y=1.160, xref="x", yref="paper",
             text=f"d{nth_day}", showarrow=False,
             font={"size": 9, "color": "dimgray"},
         )
@@ -698,7 +805,9 @@ def build_timeline(
             font={"size": 11},
         )
 
-    # Rangeselector on the TOP rendered panel
+    # Rangeselector on the TOP rendered panel. Placed at y=1.20 to clear
+    # the staggered SBT-variant annotation band (1.005..1.130) and the
+    # day labels (1.160) below it.
     rangeselector_cfg = {
         "buttons": [
             {"count": 6, "label": "6h", "step": "hour", "stepmode": "backward"},
@@ -709,7 +818,7 @@ def build_timeline(
             {"label": "All stay", "step": "all"},
         ],
         "font": {"size": 10},
-        "x": 0, "y": 1.06, "xanchor": "left", "yanchor": "bottom",
+        "x": 0, "y": 1.20, "xanchor": "left", "yanchor": "bottom",
         "bgcolor": "#f5f5f5",
     }
     fig.update_xaxes(rangeselector=rangeselector_cfg, row=1, col=1)
@@ -725,7 +834,9 @@ def build_timeline(
 
     fig.update_layout(
         hovermode="x unified",
-        margin={"t": 80, "b": 40, "l": 130, "r": 20},
+        # margin.t bumped from 80 → 140 to accommodate the staggered SBT
+        # variant annotation band + the day labels above it.
+        margin={"t": 140, "b": 40, "l": 130, "r": 20},
         legend={
             "orientation": "v", "x": 1.01, "y": 1.0,
             "groupclick": "toggleitem", "font": {"size": 10},
@@ -1080,13 +1191,51 @@ def _draw_device_ribbon(fig: go.Figure, wide_df: pd.DataFrame, row: int) -> None
 
 # ── Events ────────────────────────────────────────────────────────────
 
+# Per-kind y-offset (paper coords) for the event annotation labels at the
+# top of the plot. The 5 SBT operationalizations are *always* coincident
+# (all anchored to the same day-start timestamp) so they have to be
+# staggered vertically — without this they collide into an unreadable
+# stack. Non-SBT events get the original y=1.005; day labels (drawn
+# elsewhere) live above the highest variant slot.
+EVENT_LABEL_Y = {
+    "intubation":         1.005,
+    "extubation":         1.005,
+    "tracheostomy":       1.005,
+    "withdrawal":         1.005,
+    "discharge_home":     1.005,
+    "discharge_snf":      1.005,
+    "discharge_other":    1.005,
+    "discharge_hospice":  1.005,
+    "discharge_death":    1.005,
+    # SBT primary + 4 sensitivity-sibling variants — staggered up. See the
+    # in-app SBT legend (above the plot) for what each variant flags.
+    "sbt":          1.030,
+    "sbt_anyprior": 1.055,
+    "sbt_imv6h":    1.080,
+    "sbt_prefix":   1.105,
+    "sbt_2min":     1.130,
+}
+
+# Short on-plot text for SBT variants — the full kind names ("sbt_anyprior")
+# are too verbose to render at every event tick. Non-SBT kinds keep the
+# existing rendering (with the discharge_ prefix collapsed).
+SBT_KIND_DISPLAY = {
+    "sbt":          "sbt-prim",
+    "sbt_anyprior": "anyprior",
+    "sbt_imv6h":    "imv6h",
+    "sbt_prefix":   "prefix",
+    "sbt_2min":     "2min",
+}
+
+
 def _draw_event_vlines(fig: go.Figure, events: pd.DataFrame, n_rows: int) -> None:
     if events.empty:
         return
     # Per-row vlines so each is bound to its panel's domain
     for _, e in events.iterrows():
         t_iso = pd.Timestamp(e["time"]).isoformat()
-        color = EVENT_COLORS.get(e["kind"], "#444")
+        kind = e["kind"]
+        color = EVENT_COLORS.get(kind, "#444")
         for r in range(1, n_rows + 1):
             fig.add_shape(
                 type="line", xref="x", yref="y domain",
@@ -1095,9 +1244,13 @@ def _draw_event_vlines(fig: go.Figure, events: pd.DataFrame, n_rows: int) -> Non
                 layer="above",
                 row=r, col=1,
             )
+        label_y = EVENT_LABEL_Y.get(kind, 1.005)
+        label_text = SBT_KIND_DISPLAY.get(
+            kind, kind.replace("discharge_", "disch:")
+        )
         fig.add_annotation(
-            x=t_iso, y=1.005, xref="x", yref="paper",
-            text=e["kind"].replace("discharge_", "disch:"),
+            x=t_iso, y=label_y, xref="x", yref="paper",
+            text=label_text,
             showarrow=False,
             font={"size": 8, "color": color}, xanchor="center",
         )
@@ -1214,23 +1367,73 @@ _TABLE_COLUMN_LABELS = {
     "map":                 "map",
     "spo2":                "spo2",
     "respiratory_rate":    "rr",
+    # SBT/extub audit columns merged in from sbt_outcomes.parquet via the
+    # left-join in `_linked_table_source`. These columns are what
+    # `code/03_outcomes.py` uses to compute both the 5 SBT variant flags
+    # and the extubation outcome flags; surfacing them lets the auditor
+    # verify *why* each flag agreed or disagreed at the row.
+    "_block_id":               "blk_id",
+    "_block_duration_mins":    "blk_dur_min",
+    "_lag_sbt_state":          "lag_sbt",
+    "_prior_mode_controlled":  "prior_ctrl",
+    "_imv_streak_h":           "imv_h",
+    "_lag_imv_streak_h":       "lag_imv_h",
+    # Backfilled resp settings (from resp_processed_bf via sbt_outcomes).
+    # Raw counterparts (`fio2`, `peep`, `mode`, `device`) come from
+    # wide_df so the auditor can see both side-by-side.
+    "_fio2_bf":                "fio2_bf",
+    "_peep_bf":                "peep_bf",
+    "_ps_set_bf":              "ps_bf",
+    "_mode_bf":                "mode_bf",
+    "_mode_name_bf":           "mode_name_bf",
+    "_device_bf":              "device_bf",
+    "_device_name_bf":         "device_name_bf",
+    # 5 SBT variant flags
+    "sbt_done":                "sbt",
+    "sbt_done_anyprior":       "sbt_any",
+    "sbt_done_imv6h":          "sbt_imv6h",
+    "sbt_done_prefix":         "sbt_pre",
+    "sbt_done_2min":           "sbt_2m",
+    # Extub outcome flags (drives extub GEE/logit in 08_models.py)
+    "_intub":                  "intub_evt",
+    "_extub_1st":              "extub_1st",
+    "_fail_extub":             "fail_extub",
+    "_success_extub":          "succ_extub",
+    "_trach_1st":              "trach_1st",
 }
 
-# Final L→R column order in the linked table (matches panel order:
-# sedatives → resp → pressors → vitals; assessments dropped).
+# Final L→R column order in the linked table.
+# event_time → SBT/extub flags + audit context → backfilled resp settings
+# → raw resp settings (for comparison) → other panel data (meds, pressors, vitals).
 _TABLE_COLUMN_ORDER = [
     "event_time",
-    # Sedatives (cont/intm pairs per drug)
+    # ── Outcome flags first (most navigated for both SBT and extub audit) ──
+    # 5 SBT variant flags
+    "sbt", "sbt_any", "sbt_imv6h", "sbt_pre", "sbt_2m",
+    # Extub outcome flags (intubation / extubation / fail / success / trach)
+    "intub_evt", "extub_1st", "fail_extub", "succ_extub", "trach_1st",
+    # ── Why-did-it-fire context ───────────────────────────────────
+    # Block context: which block this row is in and how long it's lasted.
+    "blk_id", "blk_dur_min",
+    # LAG-check inputs: why primary / 2min require these to be 0/1.
+    "lag_sbt", "prior_ctrl",
+    # IMV-streak duration (hours) — why imv6h fires (≥6h before flip).
+    "imv_h", "lag_imv_h",
+    # ── Backfilled resp settings (what 03_outcomes evaluates against) ──
+    "fio2_bf", "peep_bf", "ps_bf",
+    "mode_bf", "mode_name_bf",
+    "device_bf", "device_name_bf",
+    # ── Raw resp settings (from wide_df; compare with the _bf versions) ──
+    "fio2", "peep", "mode", "device",
+    # ── Sedatives (cont/intm pairs per drug) ──────────────────────
     "prop_mg_min", "prop_mg",
     "fent_mcg_min", "fent_mcg",
     "midaz_mg_min", "midaz_mg",
     "loraz_mg_min", "loraz_mg",
     "hydromorph_mg_min", "hydromorph_mg",
-    # Resp
-    "fio2", "peep", "mode", "device",
-    # Pressors
+    # ── Pressors ──────────────────────────────────────────────────
     "norepi_mcg_kg_min", "epi_mcg_kg_min", "vaso_units_min",
-    # Vitals
+    # ── Vitals ────────────────────────────────────────────────────
     "hr", "map", "spo2", "rr",
 ]
 
@@ -1291,6 +1494,79 @@ def _linked_table_source(wide_df: pd.DataFrame, enr: PatientEnrichment) -> pd.Da
         out = pd.concat([out, intm_pivot], ignore_index=True, sort=False)
         out = out.sort_values("event_time").reset_index(drop=True)
 
+    # ── SBT audit columns ──────────────────────────────────────────────
+    # Left-join the per-row sbt_outcomes audit columns onto the wide_df
+    # spine using event_time = event_dttm. wide_df rows that don't have
+    # a corresponding sbt_outcomes row (e.g., pure vital/med rows between
+    # resp records) get NaN audit cols, which is correct — those rows
+    # have no SBT computation context.
+    #
+    # mode_category / device_category / pressure_support_set are renamed
+    # with a `_bf` suffix ("backfilled") so they don't collide with the
+    # raw wide_df versions; the auditor can compare side-by-side to spot
+    # rows where the resp_processed_bf waterfall changed the value used
+    # by the SBT logic.
+    audit = enr.sbt_audit
+    if not audit.empty:
+        audit_subset = audit[[
+            "event_dttm",
+            # Block / LAG-check context for SBT flag computation
+            "_block_id", "_block_duration_mins",
+            "_lag_sbt_state", "_prior_mode_controlled",
+            "_imv_streak_minutes", "_lag_imv_streak_minutes",
+            # Backfilled resp settings — compare with raw (`fio2`, `peep`,
+            # `mode`, `device` from wide_df) to spot waterfall-fill effects.
+            "fio2_set", "peep_set", "pressure_support_set",
+            "mode_category", "mode_name",
+            "device_category", "device_name",
+            # 5 SBT variant flags
+            "sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
+            "sbt_done_prefix", "sbt_done_2min",
+            # Extub outcome flags
+            "_intub", "_extub_1st", "_fail_extub", "_success_extub",
+            "_trach_1st",
+        ]].rename(columns={
+            "event_dttm":          "event_time",
+            "fio2_set":            "_fio2_bf",
+            "peep_set":            "_peep_bf",
+            "pressure_support_set":"_ps_set_bf",
+            "mode_category":       "_mode_bf",
+            "mode_name":           "_mode_name_bf",
+            "device_category":     "_device_bf",
+            "device_name":         "_device_name_bf",
+        })
+        # Convert IMV-streak minutes → hours for readability (the spec
+        # threshold is "≥6h continuous IMV").
+        audit_subset["_imv_streak_h"] = audit_subset["_imv_streak_minutes"] / 60.0
+        audit_subset["_lag_imv_streak_h"] = audit_subset["_lag_imv_streak_minutes"] / 60.0
+        audit_subset = audit_subset.drop(
+            columns=["_imv_streak_minutes", "_lag_imv_streak_minutes"]
+        )
+        # Align tz so the merge key matches exactly. Both should already
+        # be in the site's configured tz (US/Eastern for MIMIC).
+        if (pd.api.types.is_datetime64_any_dtype(out["event_time"])
+                and pd.api.types.is_datetime64_any_dtype(audit_subset["event_time"])):
+            out_tz = out["event_time"].dt.tz
+            audit_tz = audit_subset["event_time"].dt.tz
+            if out_tz != audit_tz:
+                if audit_tz is not None and out_tz is not None:
+                    audit_subset["event_time"] = audit_subset["event_time"].dt.tz_convert(out_tz)
+                elif audit_tz is None and out_tz is not None:
+                    audit_subset["event_time"] = audit_subset["event_time"].dt.tz_localize(out_tz)
+                else:
+                    audit_subset["event_time"] = audit_subset["event_time"].dt.tz_localize(None)
+        # Drop dup audit rows (shouldn't exist but guard against it).
+        audit_subset = audit_subset.drop_duplicates(subset=["event_time"], keep="first")
+        # Outer-merge so audit timestamps that don't exist in wide_df
+        # (e.g., resp_processed_bf backfill rows) still appear as new
+        # rows in the table with audit cols populated and wide_df cols
+        # NaN. Without this, we'd lose visibility on most of the
+        # SBT-relevant rows since wide_df is built from RAW
+        # respiratory_support while sbt_outcomes is built from the
+        # backfilled `resp_processed_bf`.
+        out = out.merge(audit_subset, on="event_time", how="outer")
+        out = out.sort_values("event_time").reset_index(drop=True)
+
     # Apply rename → snake_case with unit suffixes.
     out = out.rename(columns={k: v for k, v in _TABLE_COLUMN_LABELS.items()
                               if k in out.columns})
@@ -1303,14 +1579,24 @@ def _linked_table_source(wide_df: pd.DataFrame, enr: PatientEnrichment) -> pd.Da
 def _records_for_display(df: pd.DataFrame) -> list[dict]:
     """Convert a table-source DataFrame to DataTable-ready records.
 
-    Stringifies `event_time` and rounds floats. Idempotent on already-
-    string event_time columns.
+    Stringifies `event_time` (preserving tz offset) and rounds floats.
+    Idempotent on already-string event_time columns.
+
+    Including the `%z` tz offset in the formatted string is important —
+    it lets the pin callback's pd.Timestamp parser reconstruct a
+    tz-aware timestamp and compare correctly against the click event's
+    `points[0].x` (which Plotly may emit in UTC for tz-aware data).
+    Without `%z`, the wall-clock-only string causes a ~UTC-offset hour
+    mismatch in the closest-row search.
     """
     if df.empty:
         return []
     out = df.copy()
     if "event_time" in out.columns and pd.api.types.is_datetime64_any_dtype(out["event_time"]):
-        out["event_time"] = out["event_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        if out["event_time"].dt.tz is not None:
+            out["event_time"] = out["event_time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
+        else:
+            out["event_time"] = out["event_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
     for c in out.columns:
         if out[c].dtype.kind == "f":
             out[c] = out[c].round(2)

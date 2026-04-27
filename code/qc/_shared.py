@@ -268,6 +268,8 @@ class PatientEnrichment:
     sed_hourly: pd.DataFrame
     covariates: pd.DataFrame
     sbt_daily: pd.DataFrame
+    sbt_rows: pd.DataFrame                 # Per-row ONSET events (filtered) for vline drawing
+    sbt_audit: pd.DataFrame                # Per-row FULL sbt_outcomes for linked-table merge
     imv_streaks: pd.DataFrame              # First qualifying streak only (cohort)
     all_imv_streaks: pd.DataFrame          # Every streak, incl. < 24h and post-cohort
     first_icu_dttm: pd.Timestamp | None
@@ -284,6 +286,124 @@ def _read_filtered_parquet(path: Path, hosp_id: str) -> pd.DataFrame:
     return pd.read_parquet(path, filters=[("hospitalization_id", "=", hosp_id)])
 
 
+def _read_sbt_onset_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
+    """Load row-level SBT onset events for one hospitalization.
+
+    Reads the per-row `sbt_outcomes.parquet` (NOT the daily aggregate
+    `sbt_outcomes_daily.parquet`) so the dashboard can place SBT vlines at
+    the *actual* `event_dttm` of each onset row. The daily aggregate has
+    no timestamp column and forces an admit-time-anchored guess that can
+    be off by up to 24 h.
+
+    Filters at parquet-read time to (a) the patient's rows and (b) rows
+    where any of the 5 flag columns = 1.
+
+    NOTE on flag semantics: the four variants with LAG checks (`sbt_done`,
+    `sbt_done_anyprior`, `sbt_done_imv6h`, `sbt_done_2min`) are 1 on a
+    single onset row per qualifying block. `sbt_done_prefix` has NO LAG
+    check by design, so it's 1 on *every* row of a qualifying ≥30-min
+    PS-with-low block — collapsing those to one event per block (via
+    `_block_id` in `extract_events`) is the dashboard's responsibility,
+    NOT this loader's.
+
+    Includes supporting columns alongside each flag so the auditor can
+    verify *why* each variant fired (e.g., `_prior_mode_controlled = 1`
+    for the primary `sbt_done`).
+    """
+    path = site_dir / "sbt_outcomes.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    cols = [
+        "hospitalization_id", "event_dttm", "_block_id",
+        "sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
+        "sbt_done_prefix", "sbt_done_2min",
+        # Supporting columns for "why did this fire" audit.
+        "_block_duration_mins", "_lag_sbt_state",
+        "_prior_mode_controlled", "_lag_imv_streak_minutes",
+        "mode_category", "device_category",
+    ]
+    df = pd.read_parquet(
+        path,
+        columns=cols,
+        filters=[("hospitalization_id", "=", hosp_id)],
+    )
+    if df.empty:
+        return df
+    # NOTE: `event_dttm` in `sbt_outcomes.parquet` is tagged `America/Chicago`
+    # (DuckDB stamps `TIMESTAMPTZ` columns with the session tz at write time,
+    # and 03_outcomes.py runs in the user's local tz). Re-tag to the config's
+    # `US/Eastern` so the wall-clock matches `wide_df.event_time` in the
+    # dashboard's linked table. Same UTC instant, just the display label.
+    cfg = load_site_config(site_dir.name)
+    target_tz = cfg.get("timezone")
+    if target_tz and pd.api.types.is_datetime64_any_dtype(df["event_dttm"]):
+        if df["event_dttm"].dt.tz is not None:
+            df["event_dttm"] = df["event_dttm"].dt.tz_convert(target_tz)
+    flag_cols = ["sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
+                 "sbt_done_prefix", "sbt_done_2min"]
+    onset_mask = (df[flag_cols].fillna(0).astype(int) == 1).any(axis=1)
+    return df.loc[onset_mask].sort_values("event_dttm").reset_index(drop=True)
+
+
+def _read_sbt_audit_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
+    """Load the FULL per-row sbt_outcomes data for one hospitalization.
+
+    Sibling of `_read_sbt_onset_rows` but returns *every* row for the patient
+    (no onset-mask filter). Used by the dashboard's linked table to surface
+    the row-level SBT computation context — `_block_id`, `_block_duration_mins`,
+    `_lag_sbt_state`, `_prior_mode_controlled`, `_imv_streak_minutes`,
+    `_lag_imv_streak_minutes`, `pressure_support_set`, the post-processed
+    `mode_category` / `device_category`, and the 5 flag columns — alongside
+    the wide_df rows.
+
+    These are the columns that *determine* whether each variant flag fires
+    (or doesn't) per `code/03_outcomes.py`. Without them, the auditor sees
+    only the onset moment via the vline but has no view into WHY each
+    variant agreed or disagreed at that moment.
+
+    `event_dttm` is tz-converted to the site's configured timezone so
+    timestamps align with `wide_df.event_time` for the merge in
+    `_linked_table_source`.
+    """
+    path = site_dir / "sbt_outcomes.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    cols = [
+        "hospitalization_id", "event_dttm",
+        # Block / LAG-check context for SBT flag computation
+        "_block_id", "_block_duration_mins",
+        "_lag_sbt_state", "_prior_mode_controlled",
+        "_imv_streak_minutes", "_lag_imv_streak_minutes",
+        # All resp settings as the BACKFILLED versions (resp_processed_bf
+        # waterfall) — these are what `code/03_outcomes.py` evaluates
+        # against. Compare with the raw versions in wide_df to spot
+        # backfill differences.
+        "fio2_set", "peep_set", "pressure_support_set",
+        "mode_category", "mode_name",
+        "device_category", "device_name",
+        # All 5 SBT variant flags
+        "sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
+        "sbt_done_prefix", "sbt_done_2min",
+        # Extubation outcome flags (row-level, drives the extub GEE/logit
+        # outcomes in 08_models.py)
+        "_intub", "_extub_1st", "_fail_extub", "_success_extub",
+        "_trach_1st",
+    ]
+    df = pd.read_parquet(
+        path,
+        columns=cols,
+        filters=[("hospitalization_id", "=", hosp_id)],
+    )
+    if df.empty:
+        return df
+    cfg = load_site_config(site_dir.name)
+    target_tz = cfg.get("timezone")
+    if target_tz and pd.api.types.is_datetime64_any_dtype(df["event_dttm"]):
+        if df["event_dttm"].dt.tz is not None:
+            df["event_dttm"] = df["event_dttm"].dt.tz_convert(target_tz)
+    return df.sort_values("event_dttm").reset_index(drop=True)
+
+
 @lru_cache(maxsize=32)
 def get_enrichment(site: str, hosp_id: str) -> PatientEnrichment:
     site_dir = OUTPUT_DIR / site
@@ -291,6 +411,8 @@ def get_enrichment(site: str, hosp_id: str) -> PatientEnrichment:
     sed_hourly = _read_filtered_parquet(site_dir / "sed_dose_by_hr.parquet", hosp_id)
     covariates = _read_filtered_parquet(site_dir / "covariates_daily.parquet", hosp_id)
     sbt_daily = _read_filtered_parquet(site_dir / "sbt_outcomes_daily.parquet", hosp_id)
+    sbt_rows = _read_sbt_onset_rows(site_dir, hosp_id)
+    sbt_audit = _read_sbt_audit_rows(site_dir, hosp_id)
     imv_streaks = _read_filtered_parquet(site_dir / "cohort_imv_streaks.parquet", hosp_id)
     all_streaks = get_all_imv_streaks(site, hosp_id)
 
@@ -318,6 +440,8 @@ def get_enrichment(site: str, hosp_id: str) -> PatientEnrichment:
         sed_hourly=sed_hourly,
         covariates=covariates,
         sbt_daily=sbt_daily,
+        sbt_rows=sbt_rows,
+        sbt_audit=sbt_audit,
         imv_streaks=imv_streaks,
         all_imv_streaks=all_streaks,
         first_icu_dttm=first_icu,
@@ -599,28 +723,59 @@ def extract_events(enr: PatientEnrichment) -> pd.DataFrame:
                 "label": f"{prefix_out} (streak {sid})",
             })
 
-    # SBT / trach / withdrawal — daily flags, anchored to day start.
-    # All five SBT operationalizations are emitted as distinct event kinds
-    # (see EVENT_COLORS); the dashboard renders them as distinct vlines so
-    # the auditor can compare which days each variant flagged on a single
-    # patient. Most informative: anywhere `sbt_prefix` fires but `sbt`
-    # does not is a row the spec-literal correctly excluded.
+    # SBT events — read from the per-row `sbt_outcomes.parquet` (via
+    # `enr.sbt_rows`) so the vline x-position is the *actual* onset
+    # `event_dttm`, not an admit-time-anchored guess derived from the
+    # daily aggregate's `_nth_day`. Pre-2026-04-26 the dashboard used the
+    # daily aggregate, which has no timestamp column — that's why the
+    # vlines never lined up with the resp panel's mode-ribbon transitions.
+    #
+    # Collapse to ONE event per `_block_id` per variant. The four LAG-
+    # checked variants (sbt_done, sbt_done_anyprior, sbt_done_imv6h,
+    # sbt_done_2min) are already 1 on a single onset row per block, so
+    # the groupby is a no-op for them. `sbt_done_prefix` has no LAG
+    # check by design — it's 1 on every row of a qualifying ≥30-min
+    # PS-with-low block — so the groupby collapses each block to its
+    # first row's event_dttm (the moment the block began).
+    sbt_flag_to_kind = {
+        "sbt_done":          ("sbt",          "SBT (primary)"),
+        "sbt_done_anyprior": ("sbt_anyprior", "SBT (anyprior)"),
+        "sbt_done_imv6h":    ("sbt_imv6h",    "SBT (imv6h)"),
+        "sbt_done_prefix":   ("sbt_prefix",   "SBT (prefix)"),
+        "sbt_done_2min":     ("sbt_2min",     "SBT (2min)"),
+    }
+    if not enr.sbt_rows.empty:
+        sorted_rows = enr.sbt_rows.sort_values("event_dttm")
+        for col, (kind, label) in sbt_flag_to_kind.items():
+            flagged = sorted_rows[sorted_rows[col].fillna(0).astype(int) == 1]
+            if flagged.empty:
+                continue
+            # First row per `_block_id` ⇒ block start. `keep="first"` after
+            # the sort_values above gives the earliest event_dttm per block.
+            onsets = flagged.drop_duplicates(subset=["_block_id"], keep="first")
+            for _, r in onsets.iterrows():
+                rows.append({
+                    "time": pd.Timestamp(r["event_dttm"]),
+                    "kind": kind,
+                    "label": label,
+                })
+
+    # Trach / withdrawal — patient-level flags from the daily aggregate.
+    # These don't have a precise row-level onset moment in the same way
+    # SBT events do, so the daily anchor is appropriate. (The same admit-
+    # time anchoring caveat applies but is far less visually distracting
+    # since these fire at most once per patient.)
     if not enr.sbt_daily.empty and enr.first_icu_dttm is not None:
-        sbt_flag_map = {
-            "sbt_done":          ("sbt",          "SBT (primary)"),
-            "sbt_done_anyprior": ("sbt_anyprior", "SBT (anyprior)"),
-            "sbt_done_imv6h":    ("sbt_imv6h",    "SBT (imv6h)"),
-            "sbt_done_prefix":   ("sbt_prefix",   "SBT (prefix)"),
-            "sbt_done_2min":     ("sbt_2min",     "SBT (2min)"),
-            "_trach_1st":        ("tracheostomy", "Tracheostomy"),
-            "_withdrawl_lst":    ("withdrawal",   "Withdrawal of care"),
+        daily_flag_map = {
+            "_trach_1st":     ("tracheostomy", "Tracheostomy"),
+            "_withdrawl_lst": ("withdrawal",   "Withdrawal of care"),
         }
         for _, d in enr.sbt_daily.iterrows():
             day_idx = d.get("_nth_day")
             if pd.isna(day_idx):
                 continue
             t = enr.first_icu_dttm + pd.Timedelta(days=int(day_idx))
-            for col, (kind, label) in sbt_flag_map.items():
+            for col, (kind, label) in daily_flag_map.items():
                 if int(d.get(col, 0) or 0) == 1:
                     rows.append({"time": t, "kind": kind, "label": f"{label} (day {int(day_idx)})"})
 
