@@ -172,6 +172,20 @@ def _(
         , _success_extub_today: o._success_extub
         , sbt_done_next_day: LEAD(o.sbt_done) OVER w
         , success_extub_next_day: LEAD(o._success_extub) OVER w
+        -- Sensitivity-sibling SBT outcomes (see docs/intub_extub_specs.md
+        -- "Sensitivity siblings"). Each varies the prior-mode operationalization
+        -- or sustained-duration threshold; primary `sbt_done` above is the
+        -- spec-literal version. The cohort filter at the bottom of this cell
+        -- still anchors on `sbt_done_next_day` (primary) — variants ride along
+        -- as additional outcome columns for sensitivity comparison in 08_models.py.
+        , _sbt_done_anyprior_today: o.sbt_done_anyprior
+        , sbt_done_anyprior_next_day: LEAD(o.sbt_done_anyprior) OVER w
+        , _sbt_done_imv6h_today: o.sbt_done_imv6h
+        , sbt_done_imv6h_next_day: LEAD(o.sbt_done_imv6h) OVER w
+        , _sbt_done_prefix_today: o.sbt_done_prefix
+        , sbt_done_prefix_next_day: LEAD(o.sbt_done_prefix) OVER w
+        , _sbt_done_2min_today: o.sbt_done_2min
+        , sbt_done_2min_next_day: LEAD(o.sbt_done_2min) OVER w
         -- NOTE: Dose columns below are per-hour RATES (mg/hr or mcg/hr),
         -- computed as shift totals ÷ 12 (hours per shift). Valid because the
         -- filter (_nth_day > 0 AND outcome-columns non-null) guarantees
@@ -279,6 +293,173 @@ def _(SITE_NAME, cohort_merged_final):
     _path = f"output/{SITE_NAME}/analytical_dataset.parquet"
     _df.to_parquet(_path, index=False)
     print(f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations)")
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Day-0 Sensitivity Sibling
+
+    Builds `analytical_dataset_day0.parquet` — a sibling of the production
+    analytical dataset that **includes day 0** (the partial admission day before
+    the first 7am, currently dropped by the `_nth_day > 0` filter). Two minimal
+    differences from the production chain above:
+
+    1. Rate divisors swap from hardcoded `/12.0` to `NULLIF(s.n_hours_<shift>, 0)`.
+       For full 12-h shifts (every day-1+ row) this is mathematically identical;
+       for day 0 (mean `n_hours_day` ≈ 5.4h, `n_hours_night` ≈ 9.5h) it correctly
+       normalizes per-hour rates and avoids the "higher total just because more
+       hours" bias.
+
+    2. Filter relaxes from `_nth_day > 0` to `_nth_day >= 0`.
+
+    The amount columns (`_prop_day_mg`, etc.) are kept as-is — for day 0 they
+    represent total dose over a partial shift, which is the natural "absolute
+    amount" for that shift. Production stays unchanged; this sibling is the
+    SA input for `08_models.py`'s day-0 fit.
+    """)
+    return
+
+
+@app.cell
+def _(
+    cci_df,
+    covariates_t1,
+    covs_daily,
+    elix_df,
+    hosp_df,
+    icu_type_df,
+    patient_df,
+    sbt_outcomes_daily,
+    sed_dose_daily,
+    sofa_daily,
+    weight_daily,
+):
+    cohort_merged_day0 = mo.sql(
+        f"""
+        -- Day-0 sibling of the production cohort_merged. Differs only in the
+        -- rate divisor (NULLIF(n_hours_*, 0) instead of /12.0); the absolute-
+        -- amount columns and all categorical/clinical covariates are unchanged.
+        FROM sbt_outcomes_daily o
+        LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
+        LEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)
+        LEFT JOIN hosp_df h USING (hospitalization_id)
+        LEFT JOIN patient_df p USING (patient_id)
+        LEFT JOIN icu_type_df i USING (hospitalization_id)
+        LEFT JOIN sofa_daily sf USING (hospitalization_id, _nth_day)
+        LEFT JOIN cci_df cc USING (hospitalization_id)
+        LEFT JOIN elix_df ex USING (hospitalization_id)
+        LEFT JOIN covariates_t1 t1 USING (hospitalization_id)
+        LEFT JOIN weight_daily wd USING (hospitalization_id, _nth_day)
+        SELECT o.hospitalization_id
+        , o._nth_day
+        , _sbt_done_today: o.sbt_done
+        , _success_extub_today: o._success_extub
+        , sbt_done_next_day: LEAD(o.sbt_done) OVER w
+        , success_extub_next_day: LEAD(o._success_extub) OVER w
+        , _sbt_done_anyprior_today: o.sbt_done_anyprior
+        , sbt_done_anyprior_next_day: LEAD(o.sbt_done_anyprior) OVER w
+        , _sbt_done_imv6h_today: o.sbt_done_imv6h
+        , sbt_done_imv6h_next_day: LEAD(o.sbt_done_imv6h) OVER w
+        , _sbt_done_prefix_today: o.sbt_done_prefix
+        , sbt_done_prefix_next_day: LEAD(o.sbt_done_prefix) OVER w
+        , _sbt_done_2min_today: o.sbt_done_2min
+        , sbt_done_2min_next_day: LEAD(o.sbt_done_2min) OVER w
+        -- N-hours-aware rate columns. NULLIF(n_hours_*, 0) yields NULL when
+        -- the patient had zero hours on that shift (e.g., extubation occurred
+        -- exactly at 7am), which then propagates through the arithmetic to a
+        -- NULL rate — same downstream behavior as having no recorded dose.
+        -- For all-12h-shift rows (i.e., every existing day-1+ row), this
+        -- expression equals the production /12.0 exactly.
+        , _prop_day_mg_hr:      COALESCE(s.prop_day_mg, 0)      / NULLIF(s.n_hours_day, 0)
+        , _prop_night_mg_hr:    COALESCE(s.prop_night_mg, 0)    / NULLIF(s.n_hours_night, 0)
+        , _fenteq_day_mcg_hr:   COALESCE(s.fenteq_day_mcg, 0)   / NULLIF(s.n_hours_day, 0)
+        , _fenteq_night_mcg_hr: COALESCE(s.fenteq_night_mcg, 0) / NULLIF(s.n_hours_night, 0)
+        , _midazeq_day_mg_hr:   COALESCE(s.midazeq_day_mg, 0)   / NULLIF(s.n_hours_day, 0)
+        , _midazeq_night_mg_hr: COALESCE(s.midazeq_night_mg, 0) / NULLIF(s.n_hours_night, 0)
+        , prop_dif_mg_hr:    (COALESCE(s.prop_night_mg, 0)    / NULLIF(s.n_hours_night, 0))
+                           - (COALESCE(s.prop_day_mg, 0)      / NULLIF(s.n_hours_day, 0))
+        , fenteq_dif_mcg_hr: (COALESCE(s.fenteq_night_mcg, 0) / NULLIF(s.n_hours_night, 0))
+                           - (COALESCE(s.fenteq_day_mcg, 0)   / NULLIF(s.n_hours_day, 0))
+        , midazeq_dif_mg_hr: (COALESCE(s.midazeq_night_mg, 0) / NULLIF(s.n_hours_night, 0))
+                           - (COALESCE(s.midazeq_day_mg, 0)   / NULLIF(s.n_hours_day, 0))
+        -- Absolute totals — kept identical to production. For day 0 these are
+        -- "total over partial shift" which is the natural absolute-amount SA.
+        , _prop_day_mg:      COALESCE(s.prop_day_mg, 0)
+        , _prop_night_mg:    COALESCE(s.prop_night_mg, 0)
+        , _fenteq_day_mcg:   COALESCE(s.fenteq_day_mcg, 0)
+        , _fenteq_night_mcg: COALESCE(s.fenteq_night_mcg, 0)
+        , _midazeq_day_mg:   COALESCE(s.midazeq_day_mg, 0)
+        , _midazeq_night_mg: COALESCE(s.midazeq_night_mg, 0)
+        , prop_dif_mg:    COALESCE(s.prop_night_mg, 0)    - COALESCE(s.prop_day_mg, 0)
+        , fenteq_dif_mcg: COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)
+        , midazeq_dif_mg: COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)
+        , COLUMNS('(7am)|(7pm)')
+        , age: h.age_at_admission
+        , p.sex_category
+        , i.icu_type
+        , sofa_total: COALESCE(sf.sofa_total,0)
+        , cci_score: COALESCE(cc.cci_score, 0)
+        , elix_score: COALESCE(ex.elix_score, 0)
+        , t1.bmi
+        , t1.height_cm
+        , t1.weight_kg
+        , wd.weight_kg_asof_day_start
+        , t1.sofa_1st24h
+        , t1.sofa_cv_97_1st24h
+        , t1.sofa_coag_1st24h
+        , t1.sofa_liver_1st24h
+        , t1.sofa_resp_1st24h
+        , t1.sofa_cns_1st24h
+        , t1.sofa_renal_1st24h
+        , ever_pressor: COALESCE(t1.ever_pressor, 0)
+        , t1.pf_1st24h_min
+        , t1.pf_1st24h_source
+        , t1.imv_duration_hrs
+        , sepsis_ase: COALESCE(t1.sepsis_ase, 0)
+        , t1._first_icu_dttm
+        WINDOW w AS (PARTITION BY o.hospitalization_id ORDER BY o._nth_day)
+        ORDER BY o.hospitalization_id, o._nth_day
+        """
+    )
+    return (cohort_merged_day0,)
+
+
+@app.cell
+def _(cohort_merged_day0):
+    _merged_df = cohort_merged_day0.df()
+    _merged_df.dropna(subset=['age'], inplace=True)
+    cohort_merged_day0_clean = _merged_df
+    print(f"[day-0] After dropping null age: {len(cohort_merged_day0_clean)} rows")
+    return (cohort_merged_day0_clean,)
+
+
+@app.cell
+def _(cohort_merged_day0_clean, nmb_excluded):
+    cohort_merged_day0_final = mo.sql(
+        f"""
+        -- Same hospitalization-level NMB exclusion as production. Filter
+        -- relaxes from `_nth_day > 0` to `_nth_day >= 0` so day 0 is included.
+        FROM cohort_merged_day0_clean
+        ANTI JOIN (SELECT DISTINCT hospitalization_id FROM nmb_excluded) USING (hospitalization_id)
+        SELECT *
+        WHERE _nth_day >= 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL
+        """
+    )
+    return (cohort_merged_day0_final,)
+
+
+@app.cell
+def _(SITE_NAME, cohort_merged_day0_final):
+    _df = cohort_merged_day0_final.df()
+    _path = f"output/{SITE_NAME}/analytical_dataset_day0.parquet"
+    _df.to_parquet(_path, index=False)
+    _n_day0 = (_df['_nth_day'] == 0).sum()
+    print(
+        f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations, "
+        f"{_n_day0} day-0 rows)"
+    )
     return
 
 

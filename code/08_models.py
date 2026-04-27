@@ -91,6 +91,105 @@ def _(SITE_NAME, cohort_merged_final, pd):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
+    ### Multicollinearity diagnostic (VIF) — `vif_sbt_rate.csv`
+
+    Variance inflation factor for each continuous regressor in the primary
+    rate-parameterization GEE. VIF_j = 1 / (1 − R²_j) where R²_j is from
+    regressing predictor *j* on all other predictors. Categorical dummies are
+    excluded — their VIF interpretation is awkward and they aren't the
+    suspected source of the OR-reversal pattern.
+
+    The six dose terms have a built-in linear-combination structure
+    (`*_dif_*` = night − day), so high VIF on any of them would flag that
+    redundancy as a candidate explanation for the counterintuitive OR > 1 sign
+    on `*_dif_*` coefficients post-Phase-4.
+
+    Rule of thumb: VIF > 5 is moderate, > 10 is severe, ≥ 20 is typically
+    enough to flip a coefficient sign.
+    """)
+    return
+
+
+@app.cell
+def _(SITE_NAME, cohort_merged_final, pd):
+    from patsy import dmatrix as _dmatrix
+    from statsmodels.stats.outliers_influence import (
+        variance_inflation_factor as _vif_fn,
+    )
+    _vif_terms = (
+        "prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
+        "_prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr + "
+        "ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + "
+        "nee_7am + nee_7pm + age + _nth_day + sofa_total + cci_score"
+    )
+    _X = _dmatrix(_vif_terms, data=cohort_merged_final, return_type='dataframe').dropna()
+    _vif_rows = []
+    for _i, _name in enumerate(_X.columns):
+        if _name == 'Intercept':
+            continue
+        _vif_rows.append({'term': _name, 'vif': _vif_fn(_X.values, _i)})
+    _vif_df = pd.DataFrame(_vif_rows).sort_values('vif', ascending=False)
+    _vif_path = f'output_to_share/{SITE_NAME}/vif_sbt_rate.csv'
+    _vif_df.to_csv(_vif_path, index=False)
+    print(_vif_df.to_string(index=False))
+    print(
+        f"Severe (VIF>10): {(_vif_df['vif'] > 10).sum()}; "
+        f"Moderate (5<VIF≤10): {((_vif_df['vif'] > 5) & (_vif_df['vif'] <= 10)).sum()}"
+    )
+    print(f"Saved {_vif_path}")
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ### Sensitivity (day-0 included) — `gee_summary_day0.csv`
+
+    Same primary rate-parameterization GEE as the production cell above, but
+    fit on `analytical_dataset_day0.parquet` — the sibling that includes day 0
+    (the partial admission day before the first 7am, normally excluded by the
+    `_nth_day > 0` filter). Rate divisors in that dataset use
+    `NULLIF(n_hours_*, 0)` so partial-shift normalization is correct;
+    day-1+ rows are numerically identical to production.
+
+    The diagnostic question this answers: does excluding day 0 contribute to
+    the counterintuitive OR > 1 sign on dose-rate coefficients? If signs
+    persist on the day-0 fit, the issue is elsewhere (e.g., multicollinearity
+    per the VIF cell above). If signs flip, day-0 inclusion materially changes
+    the picture.
+    """)
+    return
+
+
+@app.cell
+def _(SITE_NAME, pd):
+    import statsmodels.formula.api as _smf_d0
+    import statsmodels.api as _sm_d0
+    _df_day0 = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset_day0.parquet")
+    _n_day0_rows = (_df_day0['_nth_day'] == 0).sum()
+    print(f"[day-0] Loaded {len(_df_day0)} rows ({_n_day0_rows} are day-0 rows)")
+    sbt_done_formula_d0 = """sbt_done_next_day ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
+    _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
+    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
+    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
+    """
+    _gee_d0 = _smf_d0.gee(
+        formula=sbt_done_formula_d0,
+        groups='hospitalization_id',
+        data=_df_day0,
+        family=_sm_d0.families.Binomial(),
+    ).fit()
+    _summary_df = _gee_d0.summary().tables[1]
+    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/gee_summary_day0.csv', index=False)
+    _gee_d0.cov_params().to_csv(f'output_to_share/{SITE_NAME}/gee_covmat_day0.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/gee_summary_day0.csv, gee_covmat_day0.csv")
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
     ### Sensitivity (absolute amounts, per 12-h shift) — `gee_summary_amount.csv`
 
     Same GEE structure as the rate-based production model above, but exposures
@@ -337,17 +436,38 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     }
 
     # ── Dimension 2: outcome x model type ─────────────────────────────
+    # Primary outcomes get fit in BOTH rate and amount parameterizations.
+    # SBT sensitivity siblings (anyprior / imv6h / prefix / 2min) are
+    # rate-only — rate↔amount agreement was already established at perfect
+    # ratio = 144.000 = 12² for the spec-literal primary, so triplicate
+    # amount fits for siblings would add no diagnostic information.
     MODEL_CONFIGS = [
-        {'outcome': 'sbt_done_next_day',      'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'success_extub_next_day', 'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'success_extub_next_day', 'model_type': 'logit', 'fit_fn': _fit_logit},
+        {'outcome': 'sbt_done_next_day',          'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'success_extub_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'success_extub_next_day',     'model_type': 'logit', 'fit_fn': _fit_logit},
+        # SBT sensitivity siblings (rate parameterization only)
+        {'outcome': 'sbt_done_anyprior_next_day', 'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_imv6h_next_day',    'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_prefix_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_2min_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
     ]
+
+    # Outcomes restricted to rate parameterization only (skip amount fit).
+    SBT_VARIANT_OUTCOMES = {
+        'sbt_done_anyprior_next_day',
+        'sbt_done_imv6h_next_day',
+        'sbt_done_prefix_next_day',
+        'sbt_done_2min_next_day',
+    }
 
     # ── Cross-product loop: now also iterates over parameterization
     # Key shape: (outcome, model_type, param) → {spec_label: result}
     fitted = {}
     for _param, _specs in COVARIATE_SPECS_BY_PARAM.items():
         for _config in MODEL_CONFIGS:
+            # Variants are rate-only (see SBT_VARIANT_OUTCOMES comment above)
+            if _config['outcome'] in SBT_VARIANT_OUTCOMES and _param == 'amount':
+                continue
             _key = (_config['outcome'], _config['model_type'], _param)
             fitted[_key] = {}
             for _spec in _specs:
@@ -358,7 +478,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
                     print(f"  OK: {_param} / {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
                 except Exception as e:
                     print(f"  FAIL: {_param} / {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
-    return MODEL_CONFIGS, fitted, np, re
+    return MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fitted, np, re
 
 
 @app.cell
@@ -424,13 +544,23 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
 
     # Filename convention: rate parameterization keeps the production file
     # name unsuffixed (`model_comparison_sbt_gee.csv`); amount is sibling
-    # suffixed (`model_comparison_sbt_gee_amount.csv`).
+    # suffixed (`model_comparison_sbt_gee_amount.csv`). SBT sensitivity
+    # siblings get suffixed short-names so each variant gets its own
+    # CSV (otherwise all "sbt"-containing outcomes would collapse).
+    _OUTCOME_SHORT = {
+        'sbt_done_next_day':          'sbt',
+        'sbt_done_anyprior_next_day': 'sbt_anyprior',
+        'sbt_done_imv6h_next_day':    'sbt_imv6h',
+        'sbt_done_prefix_next_day':   'sbt_prefix',
+        'sbt_done_2min_next_day':     'sbt_2min',
+        'success_extub_next_day':     'extub',
+    }
     for _config in MODEL_CONFIGS:
         for _param in ['rate', 'amount']:
             _key = (_config['outcome'], _config['model_type'], _param)
             if _key not in fitted or not fitted[_key]:
                 continue
-            _outcome_short = 'sbt' if 'sbt' in _config['outcome'] else 'extub'
+            _outcome_short = _OUTCOME_SHORT.get(_config['outcome'], _config['outcome'])
             _suffix = '' if _param == 'rate' else '_amount'
             _fname = f"output_to_share/{SITE_NAME}/model_comparison_{_outcome_short}_{_config['model_type']}{_suffix}.csv"
             # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
@@ -468,7 +598,7 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
+def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
     # `np` is inherited from the fitting cell (returned above) to avoid the
     # marimo "multiple definitions" error. `_plt` is private (underscore
     # prefix) so it doesn't collide with any future cell that imports plt.
@@ -632,11 +762,14 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
     # also gives a stronger methods story than pre-specifying one.
     # To add/remove specs, edit PLOT_SPECS. Filenames encode the spec label.
     # Only the 'rate' parameterization is plotted — amount-parameterized fits
-    # produce structurally identical curves up to x-axis units (rate × 12),
-    # so plotting both would double the figure count for no new information.
+    # produce structurally identical curves up to x-axis units (rate × 12).
+    # SBT sensitivity siblings (anyprior / imv6h / prefix / 2min) are also
+    # skipped here — variants are compared via CSVs, not figures.
     PLOT_SPECS = ['sofa', 'sofa_rcs']
     for (_outcome, _mt, _param), _spec_dict in fitted.items():
         if _param != 'rate':
+            continue
+        if _outcome in SBT_VARIANT_OUTCOMES:
             continue
         for _spec_label in PLOT_SPECS:
             if _spec_label in _spec_dict:

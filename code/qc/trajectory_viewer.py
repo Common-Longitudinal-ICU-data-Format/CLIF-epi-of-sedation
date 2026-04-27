@@ -1152,6 +1152,26 @@ def build_summary_strip(enr: PatientEnrichment, wide_df: pd.DataFrame) -> dbc.Al
     dsp = "?"
     if enr.discharge is not None and pd.notna(enr.discharge.get("discharge_category")):
         dsp = str(enr.discharge["discharge_category"])
+
+    # Per-variant SBT counts. Reads sbt_outcomes_daily directly so the
+    # numbers reflect raw upstream flags (analytical_dataset's
+    # `sbt_done_today` is filter-trimmed and therefore an undercount).
+    # Built as `primary | anyprior | imv6h | prefix | 2min` so the auditor
+    # can spot a patient where the variants diverge — e.g., prefix=8 with
+    # primary=2 says the spec-literal correctly excluded 6 days that the
+    # pre-fix every-row baseline would have over-counted.
+    sbt_counts_str = "—"
+    if not enr.sbt_daily.empty:
+        _sd = enr.sbt_daily
+        _cols = ['sbt_done', 'sbt_done_anyprior', 'sbt_done_imv6h',
+                 'sbt_done_prefix', 'sbt_done_2min']
+        _shorts = ['prim', 'anyprior', 'imv6h', 'prefix', '2min']
+        _vals = [
+            int(_sd[c].fillna(0).sum()) if c in _sd.columns else 0
+            for c in _cols
+        ]
+        sbt_counts_str = ' | '.join(f"{s}={v}" for s, v in zip(_shorts, _vals))
+
     pieces = [
         f"Age {int(row.get('age'))}" if pd.notna(row.get("age")) else "Age ?",
         f"Sex {row.get('sex_category', '?')}",
@@ -1162,6 +1182,7 @@ def build_summary_strip(enr: PatientEnrichment, wide_df: pd.DataFrame) -> dbc.Al
         f"Ever extub: {ever_extub}",
         f"Reintubs: {reintub_n}",
         f"Discharge: {dsp}",
+        f"SBT-days [{sbt_counts_str}]",
     ]
     return dbc.Alert(
         " · ".join(pieces),

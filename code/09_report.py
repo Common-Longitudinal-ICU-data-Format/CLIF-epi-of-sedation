@@ -59,21 +59,33 @@ def _():
 
     13. Model comparison — SBT Done Next Day (GEE)
 
-    14. Model comparison — Successful Extubation (GEE)
+    14. Multicollinearity diagnostic (VIF) — primary SBT GEE rate spec
 
-    15. Model comparison — Successful Extubation (Logit)
+    15. Day-0 SA: dose-term ORs (production vs day-0)
 
-    16. Marginal effects (Linear) — SBT Done Next Day (GEE)
+    16. Model comparison — SBT Done Next Day, variant `anyprior` (GEE)
 
-    17. Marginal effects (Linear) — Successful Extubation (GEE)
+    17. Model comparison — SBT Done Next Day, variant `imv6h` (GEE)
 
-    18. Marginal effects (Linear) — Successful Extubation (Logit)
+    18. Model comparison — SBT Done Next Day, variant `prefix` (GEE)
 
-    19. Marginal effects (RCS) — SBT Done Next Day (GEE)
+    19. Model comparison — SBT Done Next Day, variant `2min` (GEE)
 
-    20. Marginal effects (RCS) — Successful Extubation (GEE)
+    20. Model comparison — Successful Extubation (GEE)
 
-    21. Marginal effects (RCS) — Successful Extubation (Logit)
+    21. Model comparison — Successful Extubation (Logit)
+
+    22. Marginal effects (Linear) — SBT Done Next Day (GEE)
+
+    23. Marginal effects (Linear) — Successful Extubation (GEE)
+
+    24. Marginal effects (Linear) — Successful Extubation (Logit)
+
+    25. Marginal effects (RCS) — SBT Done Next Day (GEE)
+
+    26. Marginal effects (RCS) — Successful Extubation (GEE)
+
+    27. Marginal effects (RCS) — Successful Extubation (Logit)
     """)
     return
 
@@ -367,6 +379,81 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
+    # SBT-onset sensitivity-sibling model comparison tables (4 variants).
+    # Each carries the same structure as `sbt_gee_df` above; the variant
+    # differs only in how `sbt_done_<variant>_next_day` is operationalized
+    # upstream in `code/03_outcomes.py`.
+    _variants = ['anyprior', 'imv6h', 'prefix', '2min']
+    sbt_variant_dfs = {}
+    for _v in _variants:
+        _path = f"output_to_share/{SITE_NAME}/model_comparison_sbt_{_v}_gee.csv"
+        try:
+            sbt_variant_dfs[_v] = pd.read_csv(_path, index_col=0)
+        except FileNotFoundError:
+            sbt_variant_dfs[_v] = None
+    print(f"SBT variant comparison tables loaded: "
+          f"{[_v for _v, _df in sbt_variant_dfs.items() if _df is not None]}")
+    return (sbt_variant_dfs,)
+
+
+@app.cell
+def _(SITE_NAME, pd):
+    # VIF table — multicollinearity diagnostic for the primary SBT GEE rate
+    # spec (from 08_models.py VIF cell). Sorted descending.
+    try:
+        vif_df = pd.read_csv(f"output_to_share/{SITE_NAME}/vif_sbt_rate.csv")
+        # Format VIF to 2 decimals for the report; flag the severity bucket.
+        def _bucket(_v):
+            if _v > 10: return '*** severe'
+            if _v > 5:  return '**  moderate'
+            return ''
+        vif_df['severity'] = vif_df['vif'].apply(_bucket)
+        vif_df['vif'] = vif_df['vif'].map(lambda _v: f"{_v:.2f}")
+        vif_df = vif_df.set_index('term')
+        print(f"VIF table: {vif_df.shape}")
+    except FileNotFoundError:
+        vif_df = None
+    return (vif_df,)
+
+
+@app.cell
+def _(SITE_NAME, pd):
+    # Day-0 SA dose-term comparison: pull the 6 dose-term rows from the
+    # production GEE summary and the day-0 GEE summary, compose into a
+    # side-by-side table for eyeball comparison.
+    try:
+        _prod = pd.read_csv(f"output_to_share/{SITE_NAME}/gee_summary.csv")
+        _day0 = pd.read_csv(f"output_to_share/{SITE_NAME}/gee_summary_day0.csv")
+        # First column is the term name; statsmodels' summary() emits an
+        # unnamed leading column that pandas reads as 'Unnamed: 0'.
+        _prod = _prod.rename(columns={_prod.columns[0]: 'term'})
+        _day0 = _day0.rename(columns={_day0.columns[0]: 'term'})
+        _prod['term'] = _prod['term'].astype(str).str.strip()
+        _day0['term'] = _day0['term'].astype(str).str.strip()
+        _dose_terms = [
+            'prop_dif_mg_hr', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
+            '_prop_day_mg_hr', '_midazeq_day_mg_hr', '_fenteq_day_mcg_hr',
+        ]
+        _import_cols = ['term', 'coef', 'std err', 'P>|z|']
+        _prod_d = _prod[_prod['term'].isin(_dose_terms)][_import_cols].rename(
+            columns={'coef': 'coef (prod)', 'std err': 'SE (prod)', 'P>|z|': 'p (prod)'}
+        )
+        _day0_d = _day0[_day0['term'].isin(_dose_terms)][_import_cols].rename(
+            columns={'coef': 'coef (day-0)', 'std err': 'SE (day-0)', 'P>|z|': 'p (day-0)'}
+        )
+        day0_compare_df = (
+            _prod_d.merge(_day0_d, on='term')
+            .set_index('term')
+            .reindex(_dose_terms)
+        )
+        print(f"Day-0 comparison: {day0_compare_df.shape}")
+    except FileNotFoundError:
+        day0_compare_df = None
+    return (day0_compare_df,)
+
+
+@app.cell
+def _(SITE_NAME, pd):
     # Up-titrated subcohort characteristics table (from
     # code/descriptive/uptitrated_subcohort_characteristics.py).
     # tableone writes a 2-col index (variable, level); MultiIndex header has
@@ -401,13 +488,16 @@ def _(
     cohort_stats,
     corr_df,
     datetime,
+    day0_compare_df,
     dose_by_shift_df,
     extub_gee_df,
     extub_logit_df,
     plt,
     sbt_gee_df,
+    sbt_variant_dfs,
     subcohort_df,
     table1_df,
+    vif_df,
 ):
     _pdf_path = f"output_to_share/{SITE_NAME}/figures/sedation_report.pdf"
 
@@ -440,14 +530,20 @@ def _(
         " 11. % of patient-days up-titrated by ICU day",
         " 12. Up-titrated subcohort characteristics",
         " 13. Model comparison — SBT Done Next Day (GEE)",
-        " 14. Model comparison — Successful Extubation (GEE)",
-        " 15. Model comparison — Successful Extubation (Logit)",
-        " 16. Marginal effects (Linear) — SBT Done Next Day (GEE)",
-        " 17. Marginal effects (Linear) — Successful Extubation (GEE)",
-        " 18. Marginal effects (Linear) — Successful Extubation (Logit)",
-        " 19. Marginal effects (RCS) — SBT Done Next Day (GEE)",
-        " 20. Marginal effects (RCS) — Successful Extubation (GEE)",
-        " 21. Marginal effects (RCS) — Successful Extubation (Logit)",
+        " 14. Multicollinearity diagnostic (VIF) — primary SBT GEE rate spec",
+        " 15. Day-0 SA: dose-term ORs (production vs day-0)",
+        " 16. Model comparison — SBT Done Next Day, variant `anyprior` (GEE)",
+        " 17. Model comparison — SBT Done Next Day, variant `imv6h` (GEE)",
+        " 18. Model comparison — SBT Done Next Day, variant `prefix` (GEE)",
+        " 19. Model comparison — SBT Done Next Day, variant `2min` (GEE)",
+        " 20. Model comparison — Successful Extubation (GEE)",
+        " 21. Model comparison — Successful Extubation (Logit)",
+        " 22. Marginal effects (Linear) — SBT Done Next Day (GEE)",
+        " 23. Marginal effects (Linear) — Successful Extubation (GEE)",
+        " 24. Marginal effects (Linear) — Successful Extubation (Logit)",
+        " 25. Marginal effects (RCS) — SBT Done Next Day (GEE)",
+        " 26. Marginal effects (RCS) — Successful Extubation (GEE)",
+        " 27. Marginal effects (RCS) — Successful Extubation (Logit)",
     ]
 
     # Significance legend shown as footnote on every model comparison table
@@ -570,12 +666,102 @@ def _(
                  "Run code/descriptive/uptitrated_subcohort_characteristics.py to generate."],
             )
 
-        # Pages 13-15: Model comparison tables (stargazer-style)
+        # Page 13: Primary SBT GEE comparison
         add_stargazer_table(
             _pdf, sbt_gee_df,
             "Model Comparison: SBT Done Next Day (GEE)",
             notes=_model_notes, fontsize=9,
         )
+
+        # Page 14: VIF table — multicollinearity diagnostic for primary SBT
+        # GEE rate spec. Categorical PF dummies tend to dominate VIF; the
+        # dose-term VIFs are the ones to watch when investigating sign
+        # reversals on dose coefficients.
+        if vif_df is not None:
+            add_stargazer_table(
+                _pdf, vif_df,
+                "Multicollinearity Diagnostic (VIF) — Primary SBT GEE Rate Spec",
+                notes=(
+                    "VIF_j = 1 / (1 − R²_j) where R²_j is from regressing predictor j "
+                    "on all other predictors. ** moderate (5 < VIF ≤ 10), "
+                    "*** severe (VIF > 10). High VIF on dose terms would flag "
+                    "multicollinearity as a candidate explanation for "
+                    "counterintuitive coefficient signs; high VIF on categorical "
+                    "PF dummies is structural patsy-encoding redundancy and not "
+                    "indicative of a problem."
+                ),
+                fontsize=8,
+            )
+        else:
+            add_text_page(
+                _pdf, "Multicollinearity Diagnostic (VIF)",
+                [f"[CSV not found: output_to_share/{SITE_NAME}/vif_sbt_rate.csv]",
+                 "Run 08_models.py to generate."],
+            )
+
+        # Page 15: Day-0 SA — production vs day-0 dose-term ORs side by side.
+        # Diagnostic question: does excluding day 0 contribute to the OR > 1
+        # pattern on dose-rate coefficients? If signs persist on the day-0
+        # fit (typically yes per first MIMIC rerun), the issue is elsewhere.
+        if day0_compare_df is not None:
+            add_stargazer_table(
+                _pdf, day0_compare_df,
+                "Day-0 Sensitivity: Dose-Term Coefficients (Production vs Day-0)",
+                notes=(
+                    "Same primary rate-parameterization GEE; production filters "
+                    "_nth_day > 0, day-0 fit relaxes to _nth_day >= 0 with "
+                    "n-hours-aware rate divisor (NULLIF(n_hours_*, 0) instead of "
+                    "/12.0). Day-1+ rows are numerically identical between "
+                    "datasets except for ~0.5% DST-affected rows where day-0 "
+                    "has correctly-normalized rates. Persistent signs across "
+                    "both columns ⇒ day-0 truncation is not the cause of "
+                    "counterintuitive ORs."
+                ),
+                fontsize=9,
+            )
+        else:
+            add_text_page(
+                _pdf, "Day-0 Sensitivity Analysis",
+                [f"[CSV not found: output_to_share/{SITE_NAME}/gee_summary_day0.csv]",
+                 "Run 08_models.py to generate."],
+            )
+
+        # Pages 16-19: SBT-onset sensitivity-sibling model comparison tables.
+        # Each variant differs only in how `sbt_done_<variant>_next_day` is
+        # operationalized upstream in 03_outcomes.py. The Phase-4 finding was
+        # that OR > 1 persists across primary / anyprior / imv6h / 2min and
+        # only flips under `prefix` (the pre-fix every-row reproduction),
+        # establishing that the OR > 1 pattern is robust to the SBT-detection
+        # operationalization choice. See docs/intub_extub_specs.md "Sensitivity
+        # siblings" for definitions.
+        _variant_titles = {
+            'anyprior': "anyprior — drops controlled-mode whitelist; only requires non-SBT prior row",
+            'imv6h':    "imv6h — pySBT-style, ≥6h continuous IMV before flip",
+            'prefix':   "prefix — pre-fix every-row baseline reproduction (no LAG checks)",
+            '2min':     "2min — 2-minute sustained-duration variant of spec literal",
+        }
+        for _v in ['anyprior', 'imv6h', 'prefix', '2min']:
+            _df_v = sbt_variant_dfs.get(_v)
+            _title_v = (
+                f"Model Comparison: SBT Done Next Day, variant `{_v}` (GEE)"
+            )
+            if _df_v is not None:
+                add_stargazer_table(
+                    _pdf, _df_v, _title_v,
+                    notes=(
+                        f"Variant operationalization: {_variant_titles[_v]}. "
+                        + _model_notes
+                    ),
+                    fontsize=9,
+                )
+            else:
+                add_text_page(
+                    _pdf, _title_v,
+                    [f"[CSV not found: output_to_share/{SITE_NAME}/model_comparison_sbt_{_v}_gee.csv]",
+                     "Run 08_models.py to generate."],
+                )
+
+        # Pages 20-21: Extubation comparison tables
         add_stargazer_table(
             _pdf, extub_gee_df,
             "Model Comparison: Successful Extubation Next Day (GEE)",

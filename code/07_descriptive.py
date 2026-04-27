@@ -102,6 +102,12 @@ def _(SITE_NAME, cohort_merged_final):
     _corr_path = f'output_to_share/{SITE_NAME}/pairwise_corr_matrix.csv'
     corr_matrix.to_csv(_corr_path)
     print(f"Saved {_corr_path}")
+    # PNG companion to the CSV — used to visually scan for collinearity blocks
+    # when investigating counterintuitive coefficient signs (e.g., the
+    # `_dif_*` ↔ `_day_*` linear-combination structure).
+    _corr_png = _corr_path.replace('.csv', '.png')
+    _plt.savefig(_corr_png, dpi=120, bbox_inches='tight')
+    print(f"Saved {_corr_png}")
     _plt.gcf()
     return
 

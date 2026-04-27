@@ -119,9 +119,20 @@ MODE_CATEGORY_BAND_COLORS = {
 EVENT_COLORS = {
     "intubation": "#b2182b",
     "extubation": "#2166ac",
-    "sbt": "#7a5195",
+    # Primary SBT (spec-literal) and its 4 sensitivity siblings. Variants are
+    # rendered as distinct shades of the same purple family so they read as
+    # related-but-different markers; see docs/intub_extub_specs.md "Sensitivity
+    # siblings" for what each variant operationalizes. The contrast between
+    # `sbt` (primary) and `sbt_prefix` (pre-fix every-row reproduction) is
+    # the most informative side-by-side: anywhere `sbt_prefix` fires but
+    # `sbt` does not is a row that the spec-literal correctly excluded
+    # (e.g., LAG-mode-not-controlled, or row-1 streak start).
+    "sbt": "#7a5195",            # primary — spec-literal
+    "sbt_anyprior": "#a87bd7",   # drops controlled-mode whitelist
+    "sbt_imv6h":    "#5d3d7a",   # ≥6h continuous IMV before flip
+    "sbt_prefix":   "#c4a8e0",   # pre-fix every-row baseline reproduction
+    "sbt_2min":     "#9b6cb8",   # 2-min sustained-duration variant
     "tracheostomy": "#d97706",
-    "death": "#111111",
     "withdrawal": "#525252",
     # Discharge event color-coded by outcome bucket
     "discharge_home": "#2ca02c",
@@ -588,13 +599,21 @@ def extract_events(enr: PatientEnrichment) -> pd.DataFrame:
                 "label": f"{prefix_out} (streak {sid})",
             })
 
-    # SBT / trach / death / withdrawal — daily flags, anchored to day start.
+    # SBT / trach / withdrawal — daily flags, anchored to day start.
+    # All five SBT operationalizations are emitted as distinct event kinds
+    # (see EVENT_COLORS); the dashboard renders them as distinct vlines so
+    # the auditor can compare which days each variant flagged on a single
+    # patient. Most informative: anywhere `sbt_prefix` fires but `sbt`
+    # does not is a row the spec-literal correctly excluded.
     if not enr.sbt_daily.empty and enr.first_icu_dttm is not None:
         sbt_flag_map = {
-            "sbt_done": ("sbt", "SBT attempted"),
-            "_trach_1st": ("tracheostomy", "Tracheostomy"),
-            "_withdrawl_lst": ("withdrawal", "Withdrawal of care"),
-            "_death_after_extub_wo_reintub": ("death", "Death after extubation"),
+            "sbt_done":          ("sbt",          "SBT (primary)"),
+            "sbt_done_anyprior": ("sbt_anyprior", "SBT (anyprior)"),
+            "sbt_done_imv6h":    ("sbt_imv6h",    "SBT (imv6h)"),
+            "sbt_done_prefix":   ("sbt_prefix",   "SBT (prefix)"),
+            "sbt_done_2min":     ("sbt_2min",     "SBT (2min)"),
+            "_trach_1st":        ("tracheostomy", "Tracheostomy"),
+            "_withdrawl_lst":    ("withdrawal",   "Withdrawal of care"),
         }
         for _, d in enr.sbt_daily.iterrows():
             day_idx = d.get("_nth_day")

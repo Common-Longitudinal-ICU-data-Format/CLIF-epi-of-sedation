@@ -217,6 +217,14 @@ def _(sbt_t1):
                     'pressure-regulated volume control',
                     'simv'
                 ) THEN 1 ELSE 0 END
+            -- IMV-streak gaps-and-islands. Used by the sbt_done_imv6h variant
+            -- in sbt_outcomes — captures the pySBT.py-style "patient must have
+            -- been on IMV for ≥6h before the candidate flip" check. The streak
+            -- ID itself (SUM(_imv_chg) OVER w) is computed in sbt_t3, where
+            -- _imv_chg is a stable FROM column — DuckDB rejects window-over-
+            -- window nesting if both are in the same SELECT via reusable alias.
+            , _on_imv: CASE WHEN device_category = 'imv' THEN 1 ELSE 0 END
+            , _imv_chg: CASE WHEN _on_imv IS DISTINCT FROM LAG(_on_imv) OVER w THEN 1 ELSE 0 END
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
         """
     )
@@ -227,10 +235,15 @@ def _(sbt_t1):
 def _(sbt_t1, sbt_t2):
     sbt_t3 = mo.sql(
         f"""
-        -- Assign block IDs, detect failed extubation
+        -- Assign block IDs (per-hospitalization gap-island over _sbt_state)
+        -- and IMV-streak IDs (gap-island over device_category='imv'). Both
+        -- are SUM(...) OVER window functions over the corresponding _chg
+        -- flags from sbt_t2 — _chg flags are stable FROM columns here, so
+        -- no nested-window error.
         FROM sbt_t2
         SELECT *
             , _block_id: SUM(_chg_sbt_state) OVER w
+            , _imv_streak_id: SUM(_imv_chg) OVER w
             , _fail_extub: CASE
                 WHEN sbt_t2._extub_1st = 1 AND EXISTS (
                     SELECT 1
@@ -244,6 +257,50 @@ def _(sbt_t1, sbt_t2):
         """
     )
     return (sbt_t3,)
+
+
+@app.cell
+def _(sbt_t3):
+    # IMV-streak duration metadata for the sbt_done_imv6h variant. Split out
+    # from sbt_t3 because DuckDB rejects nested window calls — the start_dttm
+    # uses MIN() OVER (PARTITION BY ..., _imv_streak_id) and the lag_minutes
+    # uses LAG() OVER, both of which would resolve through reusable aliases
+    # to nested OVER expressions if defined alongside _imv_streak_id in sbt_t3.
+    # The inner WITH clause keeps streak_start_dttm and streak_minutes in one
+    # SELECT (date_diff isn't a window so the start_dttm reference is fine);
+    # the outer SELECT then computes _lag_imv_streak_minutes off the stable
+    # _imv_streak_minutes column.
+    sbt_t4 = mo.sql(
+        f"""
+        WITH streak AS (
+            FROM sbt_t3
+            SELECT *
+                -- Min recorded_dttm per IMV streak. Broadcasts across the streak.
+                -- The CASE filters to rows actually on IMV so non-IMV streaks
+                -- have NULL start.
+                , _imv_streak_start_dttm: MIN(
+                    CASE WHEN _on_imv = 1 THEN recorded_dttm END
+                  ) OVER (PARTITION BY hospitalization_id, _imv_streak_id)
+                -- Minutes the patient has been continuously on IMV at this row.
+                -- NULL when not on IMV.
+                , _imv_streak_minutes: CASE
+                    WHEN _on_imv = 1
+                    THEN date_diff('minute', _imv_streak_start_dttm, recorded_dttm)
+                    ELSE NULL END
+        )
+        FROM streak
+        SELECT *
+            -- Duration of the prior row's IMV streak (used by sbt_done_imv6h).
+            -- For T-piece SBT (current row not on IMV), the prior row was on
+            -- IMV (controlled or supportive) and this LAG gives that prior
+            -- streak's minutes-so-far. For PS-with-low SBT (current row still
+            -- on IMV), the streak hasn't broken, so LAG gives the duration up
+            -- to the prior row.
+            , _lag_imv_streak_minutes: LAG(_imv_streak_minutes) OVER w
+        WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
+        """
+    )
+    return (sbt_t4,)
 
 
 @app.cell
@@ -329,6 +386,37 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t3):
                     AND sbt_t3._lag_sbt_state = 0
                     AND sbt_t3._prior_mode_controlled = 1
                 THEN 1 ELSE 0 END
+            -- ── Sensitivity variants (see docs/intub_extub_specs.md §
+            --    "SBT Detection (current implementation) > Sensitivity siblings")
+            -- (a) anyprior: drop the controlled-mode-list requirement; just need
+            --     the prior row was non-SBT. Most permissive prior-mode check.
+            , sbt_done_anyprior: CASE
+                WHEN _block_duration_mins >= 30
+                    AND sbt_t3._sbt_state = 1
+                    AND sbt_t3._lag_sbt_state = 0
+                THEN 1 ELSE 0 END
+            -- (b) imv6h: pySBT.py-style — patient has been continuously on IMV
+            --     for ≥6h before the candidate flip. Simplified vs spec by
+            --     dropping the explicit 10pm-6am window.
+            , sbt_done_imv6h: CASE
+                WHEN _block_duration_mins >= 30
+                    AND sbt_t3._sbt_state = 1
+                    AND sbt_t3._lag_sbt_state = 0
+                    AND sbt_t3._lag_imv_streak_minutes >= 360
+                THEN 1 ELSE 0 END
+            -- (c) prefix: pre-fix sanity check — the original definition before
+            --     this plan. Should reproduce the baseline 52.9% event rate.
+            , sbt_done_prefix: CASE
+                WHEN _block_duration_mins >= 30
+                    AND sbt_t3._sbt_state = 1
+                THEN 1 ELSE 0 END
+            -- (d) 2min: spec-literal prior conditions but ≥2 min duration.
+            , sbt_done_2min: CASE
+                WHEN _block_duration_mins >= 2
+                    AND sbt_t3._sbt_state = 1
+                    AND sbt_t3._lag_sbt_state = 0
+                    AND sbt_t3._prior_mode_controlled = 1
+                THEN 1 ELSE 0 END
             , _extub_1st, _intub, sbt_t3._trach_1st, _fail_extub
             , c.code_status_category, cs_start_dttm: c.start_dttm
             , h.discharge_category, discharge_dttm: h.discharge_dttm
@@ -379,6 +467,10 @@ def _(sbt_outcomes):
         SELECT hospitalization_id
             , _dh: date_trunc('hour', event_dttm)
             , sbt_done: MAX(sbt_done)
+            , sbt_done_anyprior: MAX(sbt_done_anyprior)
+            , sbt_done_imv6h: MAX(sbt_done_imv6h)
+            , sbt_done_prefix: MAX(sbt_done_prefix)
+            , sbt_done_2min: MAX(sbt_done_2min)
             , _success_extub: MAX(_success_extub)
             , _trach_1st: MAX(_trach_1st)
             , _fail_extub: MAX(_fail_extub)
@@ -401,6 +493,10 @@ def _(cohort_hrly_grids_f, sbt_outcomes_hrly):
             AND g._dh = s._dh
         SELECT g.hospitalization_id, g.event_dttm, g._dh, g._nth_day, g._shift, g._day_shift
             , sbt_done: COALESCE(s.sbt_done, 0)
+            , sbt_done_anyprior: COALESCE(s.sbt_done_anyprior, 0)
+            , sbt_done_imv6h: COALESCE(s.sbt_done_imv6h, 0)
+            , sbt_done_prefix: COALESCE(s.sbt_done_prefix, 0)
+            , sbt_done_2min: COALESCE(s.sbt_done_2min, 0)
             , _success_extub: COALESCE(s._success_extub, 0)
             , _trach_1st: COALESCE(s._trach_1st, 0)
             , _fail_extub: COALESCE(s._fail_extub, 0)
@@ -420,6 +516,10 @@ def _(cohort_sbt_outcomes_hrly):
         FROM cohort_sbt_outcomes_hrly
         SELECT hospitalization_id, _nth_day
             , sbt_done: MAX(sbt_done)
+            , sbt_done_anyprior: MAX(sbt_done_anyprior)
+            , sbt_done_imv6h: MAX(sbt_done_imv6h)
+            , sbt_done_prefix: MAX(sbt_done_prefix)
+            , sbt_done_2min: MAX(sbt_done_2min)
             , _success_extub: MAX(_success_extub)
             , _trach_1st: MAX(_trach_1st)
             , _fail_extub: MAX(_fail_extub)
