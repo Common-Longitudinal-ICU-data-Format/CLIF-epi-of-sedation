@@ -29,6 +29,7 @@ Two output tiers — federated-safe (numeric summaries; no IDs) and PHI-internal
 | `weight_qc_summary.csv` | One row per metric across sections (a)–(h). The exhaustive numeric trace of the audit. |
 | `weight_qc_exclusions.csv` | One row per drop criterion: counts and percentages. The CONSORT-ready summary. |
 | `weight_impact_comparison.csv` | One row per weight-handling strategy (status quo / fresh-only / patient-median / winsorized) showing how cohort-level `prop_dif_mcg_kg_min` summary stats change. |
+| `weight_qc_unit_failure_breakdown.csv` | One row per non-silent failure pattern, categorized as `input_nan_dose` (upstream NaN propagating through), `unit_mismatch` (clifpy can't convert this unit string), or `unexpected_nan_output` (clifpy edge case — should be 0). Columns: `failure_category`, `key`, `med_dose_unit`, `med_dose_unit_converted`, `n_admins`, `drugs_affected`. Federated-safe: counts only, no IDs. |
 
 ### Federated-safe — `output_to_share/{site}/figures/`
 
@@ -134,6 +135,27 @@ The audit detects these via section (b) (`n_weighted_input_AND_null_weight`) and
 
 **Why it doesn't matter at MIMIC**: the footprint is 43 admins out of 345,657 (0.012%) for propofol, and 0 for the other sedatives. It's small enough that downstream summaries don't move appreciably, but the bug is real.
 
+**At UCMC the silent-bug count is much larger** (4,089 propofol = 0.78% of weighted-input propofol admins, ~65× the MIMIC rate). Phase 2 is more urgent there.
+
+### The "other" non-silent failures (`weight_qc_unit_failure_breakdown.csv`)
+
+A second failure mode the audit characterizes — split into three diagnostic categories so you can tell which warrant action:
+
+| failure_category | what it means | implication |
+|---|---|---|
+| `input_nan_dose` | `med_dose` was NaN in the raw `medication_admin_continuous` data — typically `mar_action_category='other'` or `'start'`. Propagates as NaN through clifpy's conversion. **Not** a clifpy bug; a charting / source-data sparseness issue. | Watch the count per drug. If high, downstream forward-fill in `02_exposure.py` is doing the heavy lifting; ensure those rows aren't artificially inflating "drug-on" patient-day counts. |
+| `unit_mismatch` | `med_dose` is finite but clifpy returned a `med_dose_unit_converted` that doesn't match the project's `preferred_units` mapping. Typically volume↔mass mismatches (`mL/hour` input → no convertible target) or unit strings clifpy doesn't recognize. | If the count is meaningful, either extend `preferred_units` to cover the volume case, OR file a clifpy issue to expand its unit dictionary. Empty in our data so far at both MIMIC and UCMC. |
+| `unexpected_nan_output` | `med_dose` finite, unit string matches preferred, but `med_dose_converted` is NaN and clifpy still says success. Should be 0; non-zero is a clifpy edge case. | If non-zero, file a clifpy issue. Currently 0 at both sites. |
+
+**Site comparison** (after Phase 1 follow-up):
+
+| site | input_nan_dose | unit_mismatch | unexpected_nan_output |
+|---|---|---|---|
+| MIMIC | 0 | 0 | 0 |
+| UCMC | 13,361 | 0 | 0 |
+
+UCMC's 13,361 are entirely concentrated in `mar_action='other'` (~12,200) and `mar_action='start'` (~1,150), distributed across propofol (7,200), fentanyl (5,600), midazolam (450), hydromorphone (80), lorazepam (2). Not a clifpy issue — just sparser source charting at UCMC.
+
 **How Phase 2 will avoid it**: by pre-attaching a project-controlled `weight_kg` column on `cont_sed_deduped` *before* `convert_dose_units_by_med_category`, clifpy never has to do its own ASOF and never sees NULL. The handful of patients with truly zero charted weights are dropped at cohort time using the drop list this audit produces.
 
 ---
@@ -218,6 +240,7 @@ The audit's verification step asserts the following hold; if they don't, treat t
 3. `d.pct_nonnull_using_fallback ≥ b.pct_admins_null_weight`
 4. `g.drop_total_unique_hosp == g.drop_zero_weight + g.drop_jump + g.drop_range`
 5. `c.n_clifpy_silent_bugs == b.n_weighted_input_AND_null_weight`
+6. `c.n_admins_failed == c.n_clifpy_silent_bugs + c.n_input_nan_dose + c.n_unit_mismatch + c.n_unexpected_nan_output`
 
 Run the snippet at the end of `code/qc/weight_audit.py`'s development log (or re-paste from the verification step in the audit's output) to verify these post-run.
 

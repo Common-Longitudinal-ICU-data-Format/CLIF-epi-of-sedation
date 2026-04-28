@@ -366,6 +366,92 @@ def section_c_conversion_outcome(med: pd.DataFrame, raw_w_clamped: pd.DataFrame,
         pref_match & dose_nonnull & ~converted["_silent_bug"]
     )
 
+    # Non-silent failures: rows that aren't OK and aren't the silent-weight
+    # bug. These split into three diagnostic categories with very different
+    # implications:
+    #
+    #   1. input_nan_dose: med_dose was NaN in the source (typically
+    #      mar_action_category='other' / 'start' / paused). NOT a clifpy
+    #      conversion failure — just upstream missing data. Most common at
+    #      UCMC. These propagate as NaN through downstream aggregation,
+    #      which is fine *if* the downstream forward-fill logic in
+    #      02_exposure.py treats them correctly.
+    #
+    #   2. unit_mismatch: med_dose is finite but med_dose_unit_converted
+    #      doesn't match the preferred unit. These are the genuine
+    #      "clifpy can't convert this unit string" cases (volume↔mass,
+    #      unrecognized unit strings, etc.). Worth investigating.
+    #
+    #   3. unexpected_nan_output: status=success and unit matches preferred
+    #      but med_dose_converted is NaN despite med_dose being finite.
+    #      Should be ~0 — non-zero indicates a clifpy edge case.
+    #
+    # Federated-safe: aggregates over anonymous string keys; no IDs surfaced.
+    non_silent_fail = ~converted["_converted_ok"] & ~converted["_silent_bug"]
+
+    nsf_input_nan = non_silent_fail & converted["med_dose"].isna()
+    nsf_unit_fail = (
+        non_silent_fail & converted["med_dose"].notna() & ~pref_match
+    )
+    nsf_unexpected = (
+        non_silent_fail & converted["med_dose"].notna() & pref_match & ~dose_nonnull
+    )
+
+    breakdown_rows = []
+    # (1) input_nan_dose: group by (drug, mar_action) so we can spot which
+    # MAR actions UCMC charts as NaN. mar_action_category is an enum-like
+    # string column from CLIF.
+    if nsf_input_nan.any():
+        nan_in = converted.loc[nsf_input_nan]
+        for (drug, action), sub in nan_in.groupby(
+            ["med_category", "mar_action_category"], dropna=False
+        ):
+            breakdown_rows.append({
+                "failure_category": "input_nan_dose",
+                "key": f"mar_action={action}",
+                "med_dose_unit": "(input was NaN)",
+                "med_dose_unit_converted": "(propagated NaN)",
+                "n_admins": int(len(sub)),
+                "drugs_affected": str(drug),
+            })
+    # (2) unit_mismatch: group by (input, output) unit pair.
+    if nsf_unit_fail.any():
+        uf = converted.loc[nsf_unit_fail]
+        for (in_u, out_u), sub in uf.groupby(
+            ["med_dose_unit", "med_dose_unit_converted"], dropna=False
+        ):
+            breakdown_rows.append({
+                "failure_category": "unit_mismatch",
+                "key": f"{in_u} → {out_u}",
+                "med_dose_unit": str(in_u),
+                "med_dose_unit_converted": str(out_u),
+                "n_admins": int(len(sub)),
+                "drugs_affected": ",".join(sorted(sub["med_category"].unique())),
+            })
+    # (3) unexpected_nan_output: should be ~0; row exists for visibility.
+    if nsf_unexpected.any():
+        unx = converted.loc[nsf_unexpected]
+        for drug, sub in unx.groupby("med_category"):
+            breakdown_rows.append({
+                "failure_category": "unexpected_nan_output",
+                "key": f"drug={drug}",
+                "med_dose_unit": str(sub["med_dose_unit"].mode().iat[0]),
+                "med_dose_unit_converted": str(sub["med_dose_unit_converted"].mode().iat[0]),
+                "n_admins": int(len(sub)),
+                "drugs_affected": str(drug),
+            })
+
+    breakdown = (
+        pd.DataFrame(breakdown_rows).sort_values(
+            ["failure_category", "n_admins"], ascending=[True, False]
+        ).reset_index(drop=True)
+        if breakdown_rows
+        else pd.DataFrame(columns=[
+            "failure_category", "key", "med_dose_unit",
+            "med_dose_unit_converted", "n_admins", "drugs_affected",
+        ])
+    )
+
     by_drug = converted.groupby("med_category").agg(
         n_admins=("admin_dttm", "size"),
         n_converted_ok=("_converted_ok", "sum"),
@@ -380,6 +466,14 @@ def section_c_conversion_outcome(med: pd.DataFrame, raw_w_clamped: pd.DataFrame,
     smry.add("c", "n_clifpy_silent_bugs", int(by_drug["n_silent_bug"].sum()),
              note="weighted input + NULL weight + clifpy says success "
                   "(/kg factor silently dropped from dose)")
+    smry.add("c", "n_input_nan_dose", int(nsf_input_nan.sum()),
+             note="med_dose NaN in source (typically mar_action='other'); "
+                  "propagates as NaN downstream — not a clifpy conversion failure")
+    smry.add("c", "n_unit_mismatch", int(nsf_unit_fail.sum()),
+             note="finite input dose but converted-unit ≠ preferred-unit; "
+                  "see weight_qc_unit_failure_breakdown.csv")
+    smry.add("c", "n_unexpected_nan_output", int(nsf_unexpected.sum()),
+             note="finite input + matching unit + NaN output dose; should be 0")
     for _, r in by_drug.iterrows():
         smry.add("c", f"silent_bug_{r['med_category']}",
                  int(r["n_silent_bug"]),
@@ -395,7 +489,7 @@ def section_c_conversion_outcome(med: pd.DataFrame, raw_w_clamped: pd.DataFrame,
     for k, v in why.items():
         smry.add("c", f"why_{k[:60]}", int(v))
 
-    return {"by_drug": by_drug}
+    return {"by_drug": by_drug, "breakdown": breakdown}
 
 
 # ── Section (d) ──────────────────────────────────────────────────────────
@@ -873,7 +967,7 @@ def _csv_with_header(path: Path, df: pd.DataFrame, header_lines: list[str]) -> N
         df.to_csv(f, index=False)
 
 
-def write_outputs(smry: AuditSummary, sec_g: dict, sec_h: dict) -> None:
+def write_outputs(smry: AuditSummary, sec_c: dict, sec_g: dict, sec_h: dict) -> None:
     """Two-tier output: federated under output_to_share/, PHI under output/."""
     SITE_QC.mkdir(parents=True, exist_ok=True)
     SHARE_QC.mkdir(parents=True, exist_ok=True)
@@ -898,6 +992,10 @@ def write_outputs(smry: AuditSummary, sec_g: dict, sec_h: dict) -> None:
     cmp_df = sec_h.get("compare_df", pd.DataFrame())
     if not cmp_df.empty:
         _csv_with_header(SHARE_QC / "weight_impact_comparison.csv", cmp_df, header)
+    breakdown = sec_c.get("breakdown", pd.DataFrame())
+    _csv_with_header(
+        SHARE_QC / "weight_qc_unit_failure_breakdown.csv", breakdown, header,
+    )
 
     # PHI-internal: drop list parquet (not CSV — preserves integer admin counts etc.)
     drop_list = sec_g["drop_list"]
@@ -945,12 +1043,13 @@ def main() -> None:
 
     render_panel_png(sec_a, sec_b, sec_d, sec_e, sec_f, sec_h,
                      SHARE_FIG / "weight_audit.png")
-    write_outputs(smry, sec_g, sec_h)
+    write_outputs(smry, sec_c, sec_g, sec_h)
 
     print(f"\nWrote:")
     print(f"  {SHARE_QC}/weight_qc_summary.csv")
     print(f"  {SHARE_QC}/weight_qc_exclusions.csv")
     print(f"  {SHARE_QC}/weight_impact_comparison.csv")
+    print(f"  {SHARE_QC}/weight_qc_unit_failure_breakdown.csv")
     print(f"  {SHARE_FIG}/weight_audit.png")
     print(f"  {SITE_QC}/weight_qc_drop_list.parquet")
     print(f"  {SITE_QC}/weight_audit_examples.csv")
