@@ -88,8 +88,8 @@ def _(SITE_NAME, cohort_merged_final):
     import seaborn as _sns
     continuous_vars = [
         'age', '_nth_day', 'sofa_total', 'cci_score', 'elix_score',
-        'prop_dif_mg_hr', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
-        '_prop_day_mg_hr', '_prop_night_mg_hr', '_fenteq_day_mcg_hr', '_fenteq_night_mcg_hr',
+        'prop_dif_mcg_kg_min', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
+        '_prop_day_mcg_kg_min', '_prop_night_mcg_kg_min', '_fenteq_day_mcg_hr', '_fenteq_night_mcg_hr',
         '_midazeq_day_mg_hr', '_midazeq_night_mg_hr', 'nee_7am', 'nee_7pm',
         '_ph_7am', '_ph_7pm', '_pf_7am', '_pf_7pm',
     ]
@@ -149,7 +149,8 @@ def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
         .agg({
             'fenteq_day_mcg': 'sum', 'fenteq_night_mcg': 'sum',
             'midazeq_day_mg': 'sum', 'midazeq_night_mg': 'sum',
-            'prop_day_mg': 'sum', 'prop_night_mg': 'sum',
+            # Phase 2: propofol totals are now in mcg/kg.
+            'prop_day_mcg_kg': 'sum', 'prop_night_mcg_kg': 'sum',
             'n_hours_day': 'sum', 'n_hours_night': 'sum',
         })
         .reindex(_cohort_hosp_ids)
@@ -164,8 +165,9 @@ def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
     _per_pt['fenteq_rate_day']   = _safe_rate(_per_pt['fenteq_day_mcg'],   _per_pt['n_hours_day'])
     _per_pt['midazeq_rate_night'] = _safe_rate(_per_pt['midazeq_night_mg'], _per_pt['n_hours_night'])
     _per_pt['midazeq_rate_day']   = _safe_rate(_per_pt['midazeq_day_mg'],   _per_pt['n_hours_day'])
-    _per_pt['prop_rate_night']   = _safe_rate(_per_pt['prop_night_mg'], _per_pt['n_hours_night'])
-    _per_pt['prop_rate_day']     = _safe_rate(_per_pt['prop_day_mg'],   _per_pt['n_hours_day'])
+    # Phase 2: propofol rate in mcg/kg/min (sum mcg/kg / hours / 60).
+    _per_pt['prop_rate_night'] = _safe_rate(_per_pt['prop_night_mcg_kg'], _per_pt['n_hours_night']) / 60.0
+    _per_pt['prop_rate_day']   = _safe_rate(_per_pt['prop_day_mcg_kg'],   _per_pt['n_hours_day']) / 60.0
 
     print(f"Per-patient rates: {len(_per_pt)} hospitalizations")
 
@@ -215,7 +217,7 @@ def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
     for _label, _night_col, _day_col in [
         ('Fentanyl equivalents dose rate (mcg/hr)', 'fenteq_rate_night', 'fenteq_rate_day'),
         ('Midazolam equivalents dose rate (mg/hr)', 'midazeq_rate_night', 'midazeq_rate_day'),
-        ('Propofol dose rate (mg/hr)',              'prop_rate_night',   'prop_rate_day'),
+        ('Propofol dose rate (mcg/kg/min)',          'prop_rate_night',   'prop_rate_day'),
     ]:
         _night = _per_pt[_night_col]
         _day = _per_pt[_day_col]
@@ -252,7 +254,9 @@ def _(SITE_NAME, sed_dose_by_hr):
         -- Average dose by hour of day
         FROM sed_dose_by_hr
         SELECT _hr
-        , propofol_mg: AVG(prop_mg_total)
+        -- Phase 2: prop_mcg_kg_total is mcg/kg delivered in the hour
+        -- (= mcg/kg/hr rate). AVG across patients is mcg/kg/hr.
+        , propofol_mcg_kg: AVG(prop_mcg_kg_total)
         , _fenteq_mcg: AVG(_fenteq_mcg_total)
         , _midazeq_mg: AVG(_midazeq_mg_total)
         GROUP BY _hr
@@ -273,7 +277,7 @@ def _(SITE_NAME, sed_dose_by_hr_of_day):
 
     _df = sed_dose_by_hr_of_day.df()
     hours = _df['_hr']
-    propofol = _df['propofol_mg']
+    propofol = _df['propofol_mcg_kg']
     fenteq = _df['_fenteq_mcg']
     midazeq = _df['_midazeq_mg']
 
@@ -303,8 +307,8 @@ def _(SITE_NAME, sed_dose_by_hr_of_day):
     bar_width = 0.6
 
     axs[0].bar(x, propofol_ordered, color='skyblue', width=bar_width)
-    axs[0].set_ylabel('Propofol (mg)')
-    axs[0].set_title('Mean Total Propofol Dose by Hour of Day')
+    axs[0].set_ylabel('Propofol (mcg/kg/hr)')
+    axs[0].set_title('Mean Propofol Rate by Hour of Day (continuous infusion)')
     axs[0].grid(True, axis='y')
 
     axs[1].bar(x, fenteq_ordered, color='salmon', width=bar_width)

@@ -71,8 +71,8 @@ def _():
 def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
     import statsmodels.api as _sm
-    sbt_done_formula = """sbt_done_next_day ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
-    _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
+    sbt_done_formula = """sbt_done_next_day ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
+    _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
@@ -117,8 +117,8 @@ def _(SITE_NAME, cohort_merged_final, pd):
         variance_inflation_factor as _vif_fn,
     )
     _vif_terms = (
-        "prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
-        "_prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr + "
+        "prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
+        "_prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr + "
         "ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + "
         "nee_7am + nee_7pm + age + _nth_day + sofa_total + cci_score"
     )
@@ -168,8 +168,8 @@ def _(SITE_NAME, pd):
     _df_day0 = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset_day0.parquet")
     _n_day0_rows = (_df_day0['_nth_day'] == 0).sum()
     print(f"[day-0] Loaded {len(_df_day0)} rows ({_n_day0_rows} are day-0 rows)")
-    sbt_done_formula_d0 = """sbt_done_next_day ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
-    _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
+    sbt_done_formula_d0 = """sbt_done_next_day ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
+    _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
@@ -206,8 +206,8 @@ def _():
 def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf_amt
     import statsmodels.api as _sm_amt
-    sbt_done_formula_amt = """sbt_done_next_day ~ prop_dif_mg + fenteq_dif_mcg + midazeq_dif_mg +
-    _prop_day_mg + _midazeq_day_mg + _fenteq_day_mcg +
+    sbt_done_formula_amt = """sbt_done_next_day ~ prop_dif_mcg_kg + fenteq_dif_mcg + midazeq_dif_mg +
+    _prop_day_mcg_kg + _midazeq_day_mg + _fenteq_day_mcg +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
@@ -233,13 +233,25 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf
-    success_extub_formula = """success_extub_next_day ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
-    _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
+    success_extub_formula = """success_extub_next_day ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
+    _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
-    logit_model = _smf.logit(formula=success_extub_formula, data=cohort_merged_final)
-    logit_result = logit_model.fit(cov_type='cluster', cov_kwds={'groups': cohort_merged_final['hospitalization_id']})
+    # Drop NaN rows before fitting so the cluster-robust SE's `groups` argument
+    # has the same length as the model's residuals (statsmodels' Logit with
+    # cov_type='cluster' doesn't auto-align them when missing='drop' is used).
+    _logit_cols = [
+        'prop_dif_mcg_kg_min', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
+        '_prop_day_mcg_kg_min', '_midazeq_day_mg_hr', '_fenteq_day_mcg_hr',
+        'ph_level_7am', 'ph_level_7pm', 'pf_level_7am', 'pf_level_7pm',
+        'nee_7am', 'nee_7pm', 'age', '_nth_day', 'sofa_total', 'cci_score',
+        'sex_category', 'icu_type', 'success_extub_next_day',
+        'hospitalization_id',
+    ]
+    _logit_df = cohort_merged_final.dropna(subset=_logit_cols)
+    logit_model = _smf.logit(formula=success_extub_formula, data=_logit_df)
+    logit_result = logit_model.fit(cov_type='cluster', cov_kwds={'groups': _logit_df['hospitalization_id']})
     print(logit_result.summary())
     _summary_df = logit_result.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
@@ -263,13 +275,22 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_merged_final, pd):
     import statsmodels.formula.api as _smf_amt
-    success_extub_formula_amt = """success_extub_next_day ~ prop_dif_mg + fenteq_dif_mcg + midazeq_dif_mg +
-    _prop_day_mg + _midazeq_day_mg + _fenteq_day_mcg +
+    success_extub_formula_amt = """success_extub_next_day ~ prop_dif_mcg_kg + fenteq_dif_mcg + midazeq_dif_mg +
+    _prop_day_mcg_kg + _midazeq_day_mg + _fenteq_day_mcg +
     ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
     age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
     """
-    logit_model_amt = _smf_amt.logit(formula=success_extub_formula_amt, data=cohort_merged_final)
-    logit_result_amt = logit_model_amt.fit(cov_type='cluster', cov_kwds={'groups': cohort_merged_final['hospitalization_id']})
+    _logit_amt_cols = [
+        'prop_dif_mcg_kg', 'fenteq_dif_mcg', 'midazeq_dif_mg',
+        '_prop_day_mcg_kg', '_midazeq_day_mg', '_fenteq_day_mcg',
+        'ph_level_7am', 'ph_level_7pm', 'pf_level_7am', 'pf_level_7pm',
+        'nee_7am', 'nee_7pm', 'age', '_nth_day', 'sofa_total', 'cci_score',
+        'sex_category', 'icu_type', 'success_extub_next_day',
+        'hospitalization_id',
+    ]
+    _logit_amt_df = cohort_merged_final.dropna(subset=_logit_amt_cols)
+    logit_model_amt = _smf_amt.logit(formula=success_extub_formula_amt, data=_logit_amt_df)
+    logit_result_amt = logit_model_amt.fit(cov_type='cluster', cov_kwds={'groups': _logit_amt_df['hospitalization_id']})
     _summary_df = logit_result_amt.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
     _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/logit_summary_amount.csv', index=False)
@@ -287,11 +308,11 @@ def _():
     Fits 4 nested models (progressively adding adjustment variables) for each
     (outcome, model_type) combination.
 
-    **Model specs (all include exposures: prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr):**
+    **Model specs (all include exposures: prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr):**
 
     1. **baseline**: age + sex + ICU type + CCI
 
-    2. **daydose**: baseline + daytime absolute dose rates (`_prop_day_mg_hr`, `_fenteq_day_mcg_hr`, `_midazeq_day_mg_hr`)
+    2. **daydose**: baseline + daytime absolute dose rates (`_prop_day_mcg_kg_min`, `_fenteq_day_mcg_hr`, `_midazeq_day_mg_hr`)
 
     3. **sofa**: daydose + `sofa_total`
 
@@ -318,30 +339,31 @@ def _():
     # To change a label: edit 'label'.
     # To add a new scaled variable: add a new entry.
     #
-    # UNIT NOTE: Dose columns (prop_dif_mg_hr, fenteq_dif_mcg_hr, midazeq_dif_mg_hr,
-    # _prop_day_mg_hr, _fenteq_day_mcg_hr, _midazeq_day_mg_hr) are per-hour RATES
-    # (mg/hr or mcg/hr), explicit in their column-name suffixes.
-    # The ÷12 conversion from shift-totals happens in 05_analytical_dataset.py.
-    # Scales below were retuned so "per N unit" stays clinically meaningful
-    # after the rate conversion (old totals-era scales were ~12x larger).
+    # UNIT NOTE: Phase 2 (2026-04-27): propofol exposures are now in
+    # mcg/kg/min (the bedside pump-display unit) thanks to the pre-attached
+    # weight column in 02_exposure.py and the preferred_units change to
+    # mcg/kg/min. Other drugs unchanged: fentanyl mcg/hr, midazolam mg/hr.
+    # Scales below: propofol "per 10 mcg/kg/min" matches typical pump
+    # titration steps (5–25 mcg/kg/min increments).
     VAR_DISPLAY = {
-        # Exposures (day-night rate differences) — production, mg/hr or mcg/hr
-        'prop_dif_mg_hr':    {'scale': 10,  'label': 'Δ propofol (per 10 mg/hr)'},
-        'fenteq_dif_mcg_hr': {'scale': 10,  'label': 'Δ fentanyl eq (per 10 mcg/hr)'},
-        'midazeq_dif_mg_hr': {'scale': 0.1, 'label': 'Δ midazolam eq (per 0.1 mg/hr)'},
+        # Exposures (day-night rate differences) — production
+        'prop_dif_mcg_kg_min': {'scale': 10,  'label': 'Δ propofol (per 10 mcg/kg/min)'},
+        'fenteq_dif_mcg_hr':   {'scale': 10,  'label': 'Δ fentanyl eq (per 10 mcg/hr)'},
+        'midazeq_dif_mg_hr':   {'scale': 0.1, 'label': 'Δ midazolam eq (per 0.1 mg/hr)'},
         # Daytime absolute rates (production)
-        '_prop_day_mg_hr':    {'scale': 10,  'label': 'Daytime propofol (per 10 mg/hr)'},
-        '_fenteq_day_mcg_hr': {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
-        '_midazeq_day_mg_hr': {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
-        # Sensitivity: absolute amounts per 12-h shift. Scale = 12 × the rate
-        # scale, so an OR "per 120 mg propofol over 12h" is comparable to the
-        # rate model's OR "per 10 mg/hr propofol".
-        'prop_dif_mg':     {'scale': 120, 'label': 'Δ propofol (per 120 mg over 12h)'},
+        '_prop_day_mcg_kg_min': {'scale': 10,  'label': 'Daytime propofol (per 10 mcg/kg/min)'},
+        '_fenteq_day_mcg_hr':   {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
+        '_midazeq_day_mg_hr':   {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
+        # Sensitivity: absolute amounts per 12-h shift. For propofol, the
+        # absolute amount is now in mcg/kg (was mg). 720 mcg/kg over 12h
+        # ≈ 1 mcg/kg/min × 60 × 12; "per 120 mcg/kg" is comparable to
+        # "per 10 mcg/kg/min × 12 min ≈ 120" (rough order-of-magnitude match).
+        'prop_dif_mcg_kg': {'scale': 120, 'label': 'Δ propofol (per 120 mcg/kg over 12h)'},
         'fenteq_dif_mcg':  {'scale': 120, 'label': 'Δ fentanyl eq (per 120 mcg over 12h)'},
         'midazeq_dif_mg':  {'scale': 1.2, 'label': 'Δ midazolam eq (per 1.2 mg over 12h)'},
-        '_prop_day_mg':    {'scale': 120, 'label': 'Daytime propofol (per 120 mg)'},
-        '_fenteq_day_mcg': {'scale': 120, 'label': 'Daytime fentanyl eq (per 120 mcg)'},
-        '_midazeq_day_mg': {'scale': 1.2, 'label': 'Daytime midazolam eq (per 1.2 mg)'},
+        '_prop_day_mcg_kg': {'scale': 120, 'label': 'Daytime propofol (per 120 mcg/kg)'},
+        '_fenteq_day_mcg':  {'scale': 120, 'label': 'Daytime fentanyl eq (per 120 mcg)'},
+        '_midazeq_day_mg':  {'scale': 1.2, 'label': 'Daytime midazolam eq (per 1.2 mg)'},
         # Other continuous covariates (unchanged)
         'age':          {'scale': 1,   'label': 'Age (per year)'},
         'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
@@ -373,15 +395,24 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         return m.fit()
 
     def _fit_logit(formula, data):
-        m = smf.logit(formula=formula, data=data)
+        # Drop rows with NaN in any column referenced by the formula so the
+        # cluster-robust SE's `groups` length matches the model's residuals.
+        # statsmodels' Logit with cov_type='cluster' doesn't auto-align
+        # groups when missing rows are dropped internally — the result is a
+        # length mismatch in cov_cluster's bincount.
+        _names = [c for c in data.columns if c in formula]
+        if 'hospitalization_id' not in _names:
+            _names.append('hospitalization_id')
+        _d = data.dropna(subset=_names)
+        m = smf.logit(formula=formula, data=_d)
         return m.fit(cov_type='cluster',
-                     cov_kwds={'groups': data['hospitalization_id']})
+                     cov_kwds={'groups': _d['hospitalization_id']})
 
     # ── Dimension 1: nested covariate sets (all include exposures) ────
     # PRODUCTION parameterization: rate-based exposures (mg/hr, mcg/hr)
-    BASELINE = ("{{outcome}} ~ prop_dif_mg_hr + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
+    BASELINE = ("{{outcome}} ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
                 "age + C(sex_category) + C(icu_type) + cci_score")
-    DAYDOSE = BASELINE + " + _prop_day_mg_hr + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
+    DAYDOSE = BASELINE + " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
     SOFA = DAYDOSE + " + sofa_total"
     CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
                           "pf_level_7pm + nee_7am + nee_7pm")
@@ -395,23 +426,23 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # aren't human-interpretable as OR-per-unit. See plan_rcs_exposures.md memory.
     SOFA_RCS = (
         "{{outcome}} ~ "
-        "cr(prop_dif_mg_hr, df=4) + cr(fenteq_dif_mcg_hr, df=4) + cr(midazeq_dif_mg_hr, df=4) + "
-        "cr(_prop_day_mg_hr, df=4) + cr(_fenteq_day_mcg_hr, df=4) + cr(_midazeq_day_mg_hr, df=4) + "
+        "cr(prop_dif_mcg_kg_min, df=4) + cr(fenteq_dif_mcg_hr, df=4) + cr(midazeq_dif_mg_hr, df=4) + "
+        "cr(_prop_day_mcg_kg_min, df=4) + cr(_fenteq_day_mcg_hr, df=4) + cr(_midazeq_day_mg_hr, df=4) + "
         "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
     # SENSITIVITY parameterization: absolute amounts (mg, mcg) per 12-h shift.
     # Mirrors the production specs above with bare _mg / _mcg column names.
-    BASELINE_AMOUNT = ("{{outcome}} ~ prop_dif_mg + fenteq_dif_mcg + midazeq_dif_mg + "
+    BASELINE_AMOUNT = ("{{outcome}} ~ prop_dif_mcg_kg + fenteq_dif_mcg + midazeq_dif_mg + "
                        "age + C(sex_category) + C(icu_type) + cci_score")
-    DAYDOSE_AMOUNT = BASELINE_AMOUNT + " + _prop_day_mg + _midazeq_day_mg + _fenteq_day_mcg"
+    DAYDOSE_AMOUNT = BASELINE_AMOUNT + " + _prop_day_mcg_kg + _midazeq_day_mg + _fenteq_day_mcg"
     SOFA_AMOUNT = DAYDOSE_AMOUNT + " + sofa_total"
     CLINICAL_AMOUNT = DAYDOSE_AMOUNT + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
                                        "pf_level_7pm + nee_7am + nee_7pm")
     SOFA_RCS_AMOUNT = (
         "{{outcome}} ~ "
-        "cr(prop_dif_mg, df=4) + cr(fenteq_dif_mcg, df=4) + cr(midazeq_dif_mg, df=4) + "
-        "cr(_prop_day_mg, df=4) + cr(_fenteq_day_mcg, df=4) + cr(_midazeq_day_mg, df=4) + "
+        "cr(prop_dif_mcg_kg, df=4) + cr(fenteq_dif_mcg, df=4) + cr(midazeq_dif_mg, df=4) + "
+        "cr(_prop_day_mcg_kg, df=4) + cr(_fenteq_day_mcg, df=4) + cr(_midazeq_day_mg, df=4) + "
         "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
@@ -616,12 +647,12 @@ def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted,
     # (05_analytical_dataset.py divides shift totals by 12), so no extra conversion
     # is needed before computing percentiles or constructing the grid.
     FOCAL_VARS = [
-        [('_prop_day_mg_hr',    'Mean Daytime Propofol Rate (mg/hr)'),
-         ('_fenteq_day_mcg_hr', 'Mean Daytime Fentanyl Eq Rate (mcg/hr)'),
-         ('_midazeq_day_mg_hr', 'Mean Daytime Midazolam Eq Rate (mg/hr)')],
-        [('prop_dif_mg_hr',     'Day-to-Night Δ Propofol Rate (mg/hr)'),
-         ('fenteq_dif_mcg_hr',  'Day-to-Night Δ Fentanyl Eq Rate (mcg/hr)'),
-         ('midazeq_dif_mg_hr',  'Day-to-Night Δ Midazolam Eq Rate (mg/hr)')],
+        [('_prop_day_mcg_kg_min',  'Mean Daytime Propofol Rate (mcg/kg/min)'),
+         ('_fenteq_day_mcg_hr',    'Mean Daytime Fentanyl Eq Rate (mcg/hr)'),
+         ('_midazeq_day_mg_hr',    'Mean Daytime Midazolam Eq Rate (mg/hr)')],
+        [('prop_dif_mcg_kg_min',   'Day-to-Night Δ Propofol Rate (mcg/kg/min)'),
+         ('fenteq_dif_mcg_hr',     'Day-to-Night Δ Fentanyl Eq Rate (mcg/hr)'),
+         ('midazeq_dif_mg_hr',     'Day-to-Night Δ Midazolam Eq Rate (mg/hr)')],
     ]
 
     Y_LABEL = {
@@ -630,13 +661,16 @@ def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted,
     }
 
     def _build_reference_row(df_scaled):
-        """Median for numeric columns, mode for object/string columns.
+        """Median for numeric columns, mode for object/category columns.
 
-        `include=['object', 'str']` is explicit to silence Pandas 4 deprecation
-        warnings about object/str dtype overlap.
+        Pandas 2.3 rejects 'str' as a select_dtypes argument (TypeError
+        'numpy string dtypes are not allowed, use \\'str\\' or \\'object\\''
+        — paradoxically). Use 'object' alone, plus 'category' for any
+        clinical-level groupings. Categoricals fall through both buckets
+        so .mode() handles them without explicit branching.
         """
         ref = df_scaled.median(numeric_only=True).to_dict()
-        for col in df_scaled.select_dtypes(include=['object', 'str']).columns:
+        for col in df_scaled.select_dtypes(include=['object', 'category']).columns:
             ref[col] = df_scaled[col].mode().iloc[0]
         return ref
 

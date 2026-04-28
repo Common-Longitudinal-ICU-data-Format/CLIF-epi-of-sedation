@@ -289,10 +289,11 @@ def _(all_streaks_w_lead):
 
 
 @app.cell
-def _(all_streaks_w_lead, cohort_imv_streaks, hosp_ids_w_icu_stays):
+def _(SITE_NAME, all_streaks_w_lead, cohort_imv_streaks, hosp_ids_w_icu_stays, pd):
     import duckdb as _ddb
+    from pathlib import Path as _Path
 
-    cohort_hosp_ids = cohort_imv_streaks.df()['hospitalization_id'].unique().tolist()
+    cohort_hosp_ids_pre_weight = cohort_imv_streaks.df()['hospitalization_id'].unique().tolist()
 
     # Intermediate CONSORT counts from all_streaks_w_lead
     _streaks_df = all_streaks_w_lead.df()
@@ -302,17 +303,46 @@ def _(all_streaks_w_lead, cohort_imv_streaks, hosp_ids_w_icu_stays):
     _n_first_imv_lt24 = len(_first_imv[_first_imv['_at_least_24h'] == 0])
     _n_trach_truncated = len(_first_imv[_first_imv['_trach_dttm'].notna() & (_first_imv['_at_least_24h'] == 0)])
 
+    # Weight-QC exclusion (Phase 2 of weight-audit work). Reads the drop list
+    # produced by `make weight-audit SITE=<site>`. If the audit hasn't run
+    # yet, the file won't exist and we skip the exclusion — first-run pipelines
+    # complete without weight QC, then the user runs the audit, then re-runs
+    # this script to apply the drop. See code/qc/weight_audit_README.md.
+    _drop_path = _Path(f"output/{SITE_NAME}/qc/weight_qc_drop_list.parquet")
+    if _drop_path.exists():
+        _drop_df = pd.read_parquet(_drop_path)
+        _weight_drop_ids = set(_drop_df['hospitalization_id'].astype(str))
+        weight_drop_breakdown = _drop_df['_drop_reason'].value_counts().to_dict()
+        cohort_hosp_ids = [
+            h for h in cohort_hosp_ids_pre_weight
+            if str(h) not in _weight_drop_ids
+        ]
+        _n_weight_excluded = len(cohort_hosp_ids_pre_weight) - len(cohort_hosp_ids)
+        print(f"Weight-QC exclusion: {_n_weight_excluded} hospitalizations dropped")
+        for _reason, _n in weight_drop_breakdown.items():
+            print(f"  {_reason}: {_n}")
+    else:
+        weight_drop_breakdown = {}
+        cohort_hosp_ids = list(cohort_hosp_ids_pre_weight)
+        _n_weight_excluded = 0
+        print(f"No weight-QC drop list at {_drop_path} — skipping weight QC")
+        print(f"  (run `make weight-audit SITE={SITE_NAME}` then re-run 01_cohort.py to apply)")
+
     consort_counts = {
         'n_icu': len(hosp_ids_w_icu_stays),
         'n_any_imv': _n_with_any_imv,
         'n_no_imv': len(hosp_ids_w_icu_stays) - _n_with_any_imv,
-        'n_first_imv_ge24': len(cohort_hosp_ids),
+        'n_first_imv_ge24': len(cohort_hosp_ids_pre_weight),
         'n_first_imv_lt24': _n_first_imv_lt24,
         'n_trach_truncated': _n_trach_truncated,
+        'n_weight_excluded': _n_weight_excluded,
+        'n_post_weight': len(cohort_hosp_ids),
+        'weight_drop_breakdown': weight_drop_breakdown,
     }
-    print(f"Cohort hospitalizations (first IMV ≥24h): {len(cohort_hosp_ids)}")
+    print(f"Cohort hospitalizations (first IMV ≥24h, post-weight-QC): {len(cohort_hosp_ids)}")
     print(f"  Excluded — no IMV: {consort_counts['n_no_imv']}")
     print(f"  Excluded — first IMV <24h: {consort_counts['n_first_imv_lt24']} (of which {consort_counts['n_trach_truncated']} tracheostomy-truncated)")
+    print(f"  Excluded — weight-QC: {_n_weight_excluded}")
     return cohort_hosp_ids, consort_counts
 
 
@@ -487,6 +517,14 @@ def _(
     _n_nmb_hosp_ids = _nmb_excluded_df['hospitalization_id'].nunique() if len(_nmb_excluded_df) > 0 else 0
     _cc = consort_counts
 
+    # Weight-QC exclusion already applied (or skipped if drop list missing) in
+    # the cohort_hosp_ids cell above. The CONSORT step here just reports the
+    # totals from consort_counts.
+    _weight_breakdown_str = (
+        ", ".join(f"{k}: {v}" for k, v in _cc['weight_drop_breakdown'].items())
+        if _cc['weight_drop_breakdown'] else "n/a — drop list not present at run time"
+    )
+
     consort_flow = {
         "site": SITE_NAME,
         "steps": [
@@ -511,8 +549,16 @@ def _(
             },
             {
                 "step": 4,
+                "description": "Pass weight-QC (zero-weight, jump rule)",
+                "n_remaining": _cc['n_post_weight'],
+                "n_excluded": _cc['n_weight_excluded'],
+                "exclusion_reason": f"Weight-QC drop list ({_weight_breakdown_str})",
+                "weight_qc_breakdown": _cc['weight_drop_breakdown'],
+            },
+            {
+                "step": 5,
                 "description": "Exclude hospitalizations with any NMB >1h",
-                "n_remaining": _cc['n_first_imv_ge24'] - _n_nmb_hosp_ids,
+                "n_remaining": _cc['n_post_weight'] - _n_nmb_hosp_ids,
                 "n_excluded": _n_nmb_hosp_ids,
                 "exclusion_reason": f"Any patient-day with NMB >1h ({_n_nmb_patient_days:,} patient-days across {_n_nmb_hosp_ids:,} hosp)",
             },
@@ -524,14 +570,27 @@ def _(
         json.dump(consort_flow, f, indent=2)
     print(f"CONSORT flow saved to {_consort_json_path}")
 
-    # Save intermediate outputs (site-scoped: output/{site}/...)
-    cohort_imv_streaks.df().to_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
-    cohort_hrly_grids_f.to_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
+    # Save intermediate outputs (site-scoped: output/{site}/...).
+    # cohort_imv_streaks and cohort_hrly_grids_f are filtered to the
+    # post-weight-QC cohort so every downstream consumer (02 / 04 / 05 / qc)
+    # only sees kept patients. The pre-weight-QC streaks/grid are still in
+    # memory (used by NMB exclusion above) but not persisted.
+    _kept_set = set(cohort_hosp_ids)
+    _streaks_df_full = cohort_imv_streaks.df()
+    _streaks_df_kept = _streaks_df_full[
+        _streaks_df_full['hospitalization_id'].isin(_kept_set)
+    ]
+    _grids_df_kept = cohort_hrly_grids_f[
+        cohort_hrly_grids_f['hospitalization_id'].isin(_kept_set)
+    ]
+
+    _streaks_df_kept.to_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
+    _grids_df_kept.to_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
     _nmb_excluded_df.to_parquet(f"output/{SITE_NAME}/nmb_excluded.parquet")
     icu_type_df.df().to_parquet(f"output/{SITE_NAME}/icu_type.parquet")
 
     print(f"Saved: output/{SITE_NAME}/cohort_imv_streaks.parquet ({len(cohort_hosp_ids)} hospitalizations)")
-    print(f"Saved: output/{SITE_NAME}/cohort_hrly_grids.parquet ({len(cohort_hrly_grids_f)} rows)")
+    print(f"Saved: output/{SITE_NAME}/cohort_hrly_grids.parquet ({len(_grids_df_kept)} rows)")
     print(f"Saved: output/{SITE_NAME}/nmb_excluded.parquet ({_n_nmb_patient_days} patient-days)")
     print(f"Saved: output/{SITE_NAME}/icu_type.parquet ({len(icu_type_df)} hospitalizations)")
 

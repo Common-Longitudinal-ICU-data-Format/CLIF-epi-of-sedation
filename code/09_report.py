@@ -435,8 +435,8 @@ def _(SITE_NAME, pd):
         _prod['term'] = _prod['term'].astype(str).str.strip()
         _day0['term'] = _day0['term'].astype(str).str.strip()
         _dose_terms = [
-            'prop_dif_mg_hr', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
-            '_prop_day_mg_hr', '_midazeq_day_mg_hr', '_fenteq_day_mcg_hr',
+            'prop_dif_mcg_kg_min', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
+            '_prop_day_mcg_kg_min', '_midazeq_day_mg_hr', '_fenteq_day_mcg_hr',
         ]
         _import_cols = ['term', 'coef', 'std err', 'P>|z|']
         _prod_d = _prod[_prod['term'].isin(_dose_terms)][_import_cols].rename(

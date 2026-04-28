@@ -139,21 +139,88 @@ def _(cont_sed, remove_meds_duplicates):
 
 
 @app.cell
+def _(cont_sed_deduped, duckdb, vitals_df):
+    # Phase 2 weight override: pre-attach a project-controlled `weight_kg`
+    # column on each admin row BEFORE handing off to clifpy. Per
+    # clifpy/utils/unit_converter.py:717-719, clifpy only runs its own ASOF
+    # when `weight_kg` isn't already a column on med_df, so this override
+    # skips clifpy's no-fallback per-admin ASOF entirely (the path that
+    # produced the silent /kg-factor-dropped bug — see
+    # code/qc/weight_audit_README.md §5).
+    #
+    # Strategy: per-admin ASOF backward-join to most-recent prior weight
+    # (same temporal logic as clifpy), with fallback to the patient's
+    # first-ever weight (admission fallback). The weight-QC drop list at
+    # 01_cohort.py guarantees every kept patient has ≥1 weight, so the
+    # admission fallback is never NULL.
+    cont_sed_with_weight = duckdb.sql("""
+        WITH weights AS (
+            FROM vitals_df
+            SELECT hospitalization_id, recorded_dttm
+                , weight_kg: vital_value
+            WHERE vital_category = 'weight_kg' AND vital_value IS NOT NULL
+        )
+        , first_w AS (
+            FROM weights
+            SELECT hospitalization_id, _admit_weight: weight_kg
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY hospitalization_id ORDER BY recorded_dttm
+            ) = 1
+        )
+        , asof_w AS (
+            FROM cont_sed_deduped m
+            ASOF LEFT JOIN weights v
+              ON m.hospitalization_id = v.hospitalization_id
+              AND v.recorded_dttm <= m.admin_dttm
+            SELECT m.*
+                , _asof_weight: v.weight_kg
+        )
+        FROM asof_w a
+        LEFT JOIN first_w f USING (hospitalization_id)
+        SELECT a.* EXCLUDE (_asof_weight)
+            , weight_kg: COALESCE(a._asof_weight, f._admit_weight)
+            , _weight_source: CASE
+                WHEN a._asof_weight IS NOT NULL THEN 'per_admin_asof'
+                WHEN f._admit_weight IS NOT NULL THEN 'admission_fallback'
+                ELSE 'null'
+                END
+        ORDER BY a.hospitalization_id, a.admin_dttm
+    """).df()
+
+    _n_total = len(cont_sed_with_weight)
+    _n_null = int(cont_sed_with_weight['weight_kg'].isna().sum())
+    _n_fallback = int((cont_sed_with_weight['_weight_source'] == 'admission_fallback').sum())
+    print(f"Pre-attached weight on {_n_total:,} admins")
+    print(f"  per_admin_asof: {_n_total - _n_fallback - _n_null:,}")
+    print(f"  admission_fallback: {_n_fallback:,}")
+    if _n_null > 0:
+        print(f"  WARNING: {_n_null:,} admins NULL after fallback — "
+              "these patients should have been in weight-QC drop list. "
+              "Check 01_cohort.py applied the drop.")
+    return (cont_sed_with_weight,)
+
+
+@app.cell
 def _(
     cont_sed,
-    cont_sed_deduped,
+    cont_sed_with_weight,
     convert_dose_units_by_med_category,
     vitals_df,
 ):
+    # Preferred unit for propofol changed to mcg/kg/min (Phase 2): pump-native
+    # /kg/min input passes through with only amount/time scaling — no weight
+    # multiplication/division at the conversion layer for the dominant
+    # charting form. Combined with the pre-attached weight column above,
+    # this eliminates the silent /kg-factor-dropped bug entirely.
     _cont_sed_preferred_units = {
-        'propofol': 'mg/min',
+        'propofol': 'mcg/kg/min',
         'midazolam': 'mg/min',
         'fentanyl': 'mcg/min',
         'hydromorphone': 'mg/min',
         'lorazepam': 'mg/min',
     }
     _cont_sed_converted, _cont_sed_convert_summary = convert_dose_units_by_med_category(
-        cont_sed_deduped,
+        cont_sed_with_weight,
         vitals_df=vitals_df,
         preferred_units=_cont_sed_preferred_units,
         override=True,
@@ -294,7 +361,10 @@ def _(cont_sed_t3, duckdb):
         ORDER BY hospitalization_id, _dh
         """
     ).df().rename(columns={
-        'propofol_mg_min_cont':      'propofol_mg_hr_cont',
+        # Propofol: mcg/kg/min input × _duration (min) summed by hour
+        # → mcg/kg total in that hour = mcg/kg/hr rate.
+        'propofol_mcg_kg_min_cont':  'propofol_mcg_kg_hr_cont',
+        # Other drugs unchanged: unweighted mg or mcg per minute → per hour.
         'fentanyl_mcg_min_cont':     'fentanyl_mcg_hr_cont',
         'midazolam_mg_min_cont':     'midazolam_mg_hr_cont',
         'hydromorphone_mg_min_cont': 'hydromorphone_mg_hr_cont',
@@ -470,7 +540,14 @@ def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
             , hydromorphone_mg_total: hydromorphone_mg_hr_intm + hydromorphone_mg_hr_cont
             , lorazepam_mg_total: lorazepam_mg_hr_intm + lorazepam_mg_hr_cont
             , midazolam_mg_total: midazolam_mg_hr_intm + midazolam_mg_hr_cont
-            , prop_mg_total: propofol_mg_hr_intm + propofol_mg_hr_cont
+            -- Phase 2: propofol is now in mcg/kg/hr (continuous-only). The
+            -- intermittent propofol path (`propofol_mg_hr_intm`) is bolus
+            -- mg/dose with no defined duration, so converting to mcg/kg/min
+            -- is ill-defined. ICU bolus propofol is rare (mostly procedural)
+            -- compared to continuous pump infusion, which dominates the
+            -- exposure signal. We track intm propofol separately (still as
+            -- mg/hr) but exclude it from the rate-based descriptive.
+            , prop_mcg_kg_total: propofol_mcg_kg_hr_cont
             , _midazeq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
             , _fenteq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
         )
@@ -505,7 +582,10 @@ def _(duckdb, sed_dose_by_hr):
         -- per-hour rates downstream carry `_mg_hr` / `_mcg_hr`.
         FROM sed_dose_by_hr
         SELECT hospitalization_id, _nth_day, _shift
-            , SUM(prop_mg_total) AS prop_mg
+            -- Phase 2: propofol now sums to total mcg/kg over the shift
+            -- (continuous infusion only). Downstream 05 divides by hours
+            -- and minutes to produce the per-min rate `_prop_day_mcg_kg_min`.
+            , SUM(prop_mcg_kg_total) AS prop_mcg_kg
             , SUM(_fenteq_mcg_total) AS fenteq_mcg
             , SUM(_midazeq_mg_total) AS midazeq_mg
             , COUNT(*) AS n_hours
@@ -527,7 +607,7 @@ def _(sed_dose_agg):
     sed_dose_daily = sed_dose_agg.pivot(
         index=['hospitalization_id', '_nth_day'],
         columns='_shift',
-        values=['prop_mg', 'fenteq_mcg', 'midazeq_mg', 'n_hours'],
+        values=['prop_mcg_kg', 'fenteq_mcg', 'midazeq_mg', 'n_hours'],
     ).reset_index()
 
     # Flatten MultiIndex columns to clean names. The pivot preserves the
@@ -535,7 +615,8 @@ def _(sed_dose_agg):
     # (value_col, 'day') then (value_col, 'night').
     sed_dose_daily.columns = [
         'hospitalization_id', '_nth_day',
-        'prop_day_mg', 'prop_night_mg',
+        # Phase 2: propofol totals are now mcg/kg over the shift (was mg).
+        'prop_day_mcg_kg', 'prop_night_mcg_kg',
         'fenteq_day_mcg', 'fenteq_night_mcg',
         'midazeq_day_mg', 'midazeq_night_mg',
         'n_hours_day', 'n_hours_night',

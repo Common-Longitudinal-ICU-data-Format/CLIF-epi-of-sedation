@@ -201,13 +201,16 @@ def _(
         -- encoded as a suffix. `_mg_hr` = per-hour rate in mg; `_mcg_hr` = per-
         -- hour rate in mcg. Source shift totals in sed_dose_daily.parquet
         -- likewise carry `_mg` / `_mcg` suffixes (total dose over 12-hour shift).
-        , _prop_day_mg_hr:      COALESCE(s.prop_day_mg, 0) / 12.0
-        , _prop_night_mg_hr:    COALESCE(s.prop_night_mg, 0) / 12.0
+        -- Phase 2: propofol rates are now in mcg/kg/min (was mg/hr).
+        -- The shift total `prop_day_mcg_kg` is total mcg/kg over 12h →
+        -- ÷ 12 = mcg/kg/hr → ÷ 60 = mcg/kg/min.
+        , _prop_day_mcg_kg_min:   COALESCE(s.prop_day_mcg_kg, 0)   / 12.0 / 60.0
+        , _prop_night_mcg_kg_min: COALESCE(s.prop_night_mcg_kg, 0) / 12.0 / 60.0
         , _fenteq_day_mcg_hr:   COALESCE(s.fenteq_day_mcg, 0) / 12.0
         , _fenteq_night_mcg_hr: COALESCE(s.fenteq_night_mcg, 0) / 12.0
         , _midazeq_day_mg_hr:   COALESCE(s.midazeq_day_mg, 0) / 12.0
         , _midazeq_night_mg_hr: COALESCE(s.midazeq_night_mg, 0) / 12.0
-        , prop_dif_mg_hr:     (COALESCE(s.prop_night_mg, 0)    - COALESCE(s.prop_day_mg, 0))    / 12.0
+        , prop_dif_mcg_kg_min: (COALESCE(s.prop_night_mcg_kg, 0) - COALESCE(s.prop_day_mcg_kg, 0)) / 12.0 / 60.0
         , fenteq_dif_mcg_hr:  (COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)) / 12.0
         , midazeq_dif_mg_hr:  (COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)) / 12.0
         -- Absolute totals (per 12-hr shift) — kept alongside the rate columns
@@ -216,13 +219,14 @@ def _(
         -- the only parameterization; restored as a SA variant. For full 12-h
         -- shifts (everything in this dataset post-filter), amount = rate × 12
         -- exactly, so the two model fits should agree up to a unit rescaling.
-        , _prop_day_mg:      COALESCE(s.prop_day_mg, 0)
-        , _prop_night_mg:    COALESCE(s.prop_night_mg, 0)
+        -- Phase 2: propofol absolute totals now mcg/kg over the 12h shift.
+        , _prop_day_mcg_kg:   COALESCE(s.prop_day_mcg_kg, 0)
+        , _prop_night_mcg_kg: COALESCE(s.prop_night_mcg_kg, 0)
         , _fenteq_day_mcg:   COALESCE(s.fenteq_day_mcg, 0)
         , _fenteq_night_mcg: COALESCE(s.fenteq_night_mcg, 0)
         , _midazeq_day_mg:   COALESCE(s.midazeq_day_mg, 0)
         , _midazeq_night_mg: COALESCE(s.midazeq_night_mg, 0)
-        , prop_dif_mg:    COALESCE(s.prop_night_mg, 0)    - COALESCE(s.prop_day_mg, 0)
+        , prop_dif_mcg_kg: COALESCE(s.prop_night_mcg_kg, 0) - COALESCE(s.prop_day_mcg_kg, 0)
         , fenteq_dif_mcg: COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)
         , midazeq_dif_mg: COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)
         , COLUMNS('(7am)|(7pm)')
@@ -318,7 +322,7 @@ def _():
 
     2. Filter relaxes from `_nth_day > 0` to `_nth_day >= 0`.
 
-    The amount columns (`_prop_day_mg`, etc.) are kept as-is — for day 0 they
+    The amount columns (`_prop_day_mcg_kg`, etc.) are kept as-is — for day 0 they
     represent total dose over a partial shift, which is the natural "absolute
     amount" for that shift. Production stays unchanged; this sibling is the
     SA input for `08_models.py`'s day-0 fit.
@@ -380,27 +384,29 @@ def _(
         -- NULL rate — same downstream behavior as having no recorded dose.
         -- For all-12h-shift rows (i.e., every existing day-1+ row), this
         -- expression equals the production /12.0 exactly.
-        , _prop_day_mg_hr:      COALESCE(s.prop_day_mg, 0)      / NULLIF(s.n_hours_day, 0)
-        , _prop_night_mg_hr:    COALESCE(s.prop_night_mg, 0)    / NULLIF(s.n_hours_night, 0)
+        -- Phase 2: propofol rates are now in mcg/kg/min.
+        , _prop_day_mcg_kg_min:   COALESCE(s.prop_day_mcg_kg, 0)   / NULLIF(s.n_hours_day, 0)   / 60.0
+        , _prop_night_mcg_kg_min: COALESCE(s.prop_night_mcg_kg, 0) / NULLIF(s.n_hours_night, 0) / 60.0
         , _fenteq_day_mcg_hr:   COALESCE(s.fenteq_day_mcg, 0)   / NULLIF(s.n_hours_day, 0)
         , _fenteq_night_mcg_hr: COALESCE(s.fenteq_night_mcg, 0) / NULLIF(s.n_hours_night, 0)
         , _midazeq_day_mg_hr:   COALESCE(s.midazeq_day_mg, 0)   / NULLIF(s.n_hours_day, 0)
         , _midazeq_night_mg_hr: COALESCE(s.midazeq_night_mg, 0) / NULLIF(s.n_hours_night, 0)
-        , prop_dif_mg_hr:    (COALESCE(s.prop_night_mg, 0)    / NULLIF(s.n_hours_night, 0))
-                           - (COALESCE(s.prop_day_mg, 0)      / NULLIF(s.n_hours_day, 0))
+        , prop_dif_mcg_kg_min: (COALESCE(s.prop_night_mcg_kg, 0) / NULLIF(s.n_hours_night, 0) / 60.0)
+                             - (COALESCE(s.prop_day_mcg_kg, 0)   / NULLIF(s.n_hours_day, 0)   / 60.0)
         , fenteq_dif_mcg_hr: (COALESCE(s.fenteq_night_mcg, 0) / NULLIF(s.n_hours_night, 0))
                            - (COALESCE(s.fenteq_day_mcg, 0)   / NULLIF(s.n_hours_day, 0))
         , midazeq_dif_mg_hr: (COALESCE(s.midazeq_night_mg, 0) / NULLIF(s.n_hours_night, 0))
                            - (COALESCE(s.midazeq_day_mg, 0)   / NULLIF(s.n_hours_day, 0))
         -- Absolute totals — kept identical to production. For day 0 these are
         -- "total over partial shift" which is the natural absolute-amount SA.
-        , _prop_day_mg:      COALESCE(s.prop_day_mg, 0)
-        , _prop_night_mg:    COALESCE(s.prop_night_mg, 0)
+        -- Phase 2: propofol absolute totals now mcg/kg over the shift.
+        , _prop_day_mcg_kg:   COALESCE(s.prop_day_mcg_kg, 0)
+        , _prop_night_mcg_kg: COALESCE(s.prop_night_mcg_kg, 0)
         , _fenteq_day_mcg:   COALESCE(s.fenteq_day_mcg, 0)
         , _fenteq_night_mcg: COALESCE(s.fenteq_night_mcg, 0)
         , _midazeq_day_mg:   COALESCE(s.midazeq_day_mg, 0)
         , _midazeq_night_mg: COALESCE(s.midazeq_night_mg, 0)
-        , prop_dif_mg:    COALESCE(s.prop_night_mg, 0)    - COALESCE(s.prop_day_mg, 0)
+        , prop_dif_mcg_kg: COALESCE(s.prop_night_mcg_kg, 0) - COALESCE(s.prop_day_mcg_kg, 0)
         , fenteq_dif_mcg: COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)
         , midazeq_dif_mg: COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)
         , COLUMNS('(7am)|(7pm)')

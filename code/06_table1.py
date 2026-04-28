@@ -116,7 +116,7 @@ def _(cohort_merged_for_t1, covs_shift, hosp_df, sed_dose_agg):
         LEFT JOIN hosp_df h USING (hospitalization_id)
         SELECT g.hospitalization_id, g._nth_day
             , s._shift
-            , s.prop_mg
+            , s.prop_mcg_kg
             , s.fenteq_mcg
             , s.midazeq_mg
             , h.patient_id
@@ -233,7 +233,7 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, tableone):
     _df = cohort_merged_for_t1_w_by_shift.df()
-    sed_vars = ['prop_mg', 'fenteq_mcg', 'midazeq_mg']
+    sed_vars = ['prop_mcg_kg', 'fenteq_mcg', 'midazeq_mg']
     _cont_vars = sed_vars + ['ph', 'pf', '_nee']
     _cat_vars = ['ph_level', 'pf_level']
     table1_by_shift = tableone.TableOne(
