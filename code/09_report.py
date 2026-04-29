@@ -104,8 +104,13 @@ def _():
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
 
-    # Site-scoped output dir (see Makefile SITE= flag).
-    os.makedirs(f"output_to_share/{SITE_NAME}/figures", exist_ok=True)
+    # Site-scoped output dirs (see Makefile SITE= flag). After the Path B++
+    # refactor, descriptive figures live under {site}/descriptive/ and model
+    # artifacts under {site}/models/. The compiled PDF is written at the
+    # top-level {site}/sedation_report.pdf so collaborators see it without
+    # navigating into a subdir.
+    os.makedirs(f"output_to_share/{SITE_NAME}/descriptive", exist_ok=True)
+    os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return SITE_NAME, datetime, pd
 
@@ -337,7 +342,7 @@ def _():
 def _(SITE_NAME, pd):
     # Cohort stats (from 06_table1.py)
     try:
-        cohort_stats = pd.read_csv(f"output_to_share/{SITE_NAME}/cohort_stats.csv").iloc[0].to_dict()
+        cohort_stats = pd.read_csv(f"output_to_share/{SITE_NAME}/models/cohort_stats.csv").iloc[0].to_dict()
     except FileNotFoundError:
         cohort_stats = {'site': 'unknown', 'n_hospitalizations': 'n/a', 'n_unique_patients': 'n/a'}
     print(f"Cohort stats: {cohort_stats}")
@@ -347,7 +352,7 @@ def _(SITE_NAME, pd):
 @app.cell
 def _(SITE_NAME, pd):
     # Table 1 (from 06_table1.py) — tableone CSV has hierarchical 2-col format
-    table1_df = pd.read_csv(f"output_to_share/{SITE_NAME}/table1.csv")
+    table1_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/table1.csv")
     # Replace NaN with empty string for cleaner display
     table1_df = table1_df.fillna('')
     print(f"Table 1: {len(table1_df)} rows, {len(table1_df.columns)} cols")
@@ -358,7 +363,7 @@ def _(SITE_NAME, pd):
 def _(SITE_NAME, pd):
     # Dose by Shift (from 07_descriptive.py) — paired + unpaired day-vs-night
     # sedation rates, long/tidy format (6 rows × 6 columns).
-    dose_by_shift_df = pd.read_csv(f"output_to_share/{SITE_NAME}/sed_dose_by_shift.csv")
+    dose_by_shift_df = pd.read_csv(f"output_to_share/{SITE_NAME}/descriptive/sed_dose_by_shift.csv")
     print(f"Dose by Shift: {dose_by_shift_df.shape}")
     return (dose_by_shift_df,)
 
@@ -366,7 +371,7 @@ def _(SITE_NAME, pd):
 @app.cell
 def _(SITE_NAME, pd):
     # Correlation matrix (from 07_descriptive.py)
-    corr_df = pd.read_csv(f"output_to_share/{SITE_NAME}/pairwise_corr_matrix.csv", index_col=0)
+    corr_df = pd.read_csv(f"output_to_share/{SITE_NAME}/descriptive/pairwise_corr_matrix.csv", index_col=0)
     print(f"Correlation matrix: {corr_df.shape}")
     return (corr_df,)
 
@@ -374,9 +379,9 @@ def _(SITE_NAME, pd):
 @app.cell
 def _(SITE_NAME, pd):
     # Model comparison tables (from 08_models.py)
-    sbt_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/model_comparison_sbt_gee.csv", index_col=0)
-    extub_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/model_comparison_extub_gee.csv", index_col=0)
-    extub_logit_df = pd.read_csv(f"output_to_share/{SITE_NAME}/model_comparison_extub_logit.csv", index_col=0)
+    sbt_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_gee.csv", index_col=0)
+    extub_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_extub_gee.csv", index_col=0)
+    extub_logit_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_extub_logit.csv", index_col=0)
     print(f"SBT GEE: {sbt_gee_df.shape}, Extub GEE: {extub_gee_df.shape}, Extub Logit: {extub_logit_df.shape}")
     return extub_gee_df, extub_logit_df, sbt_gee_df
 
@@ -390,7 +395,7 @@ def _(SITE_NAME, pd):
     _variants = ['anyprior', 'imv6h', 'prefix', '2min', 'subira', 'abc']
     sbt_variant_dfs = {}
     for _v in _variants:
-        _path = f"output_to_share/{SITE_NAME}/model_comparison_sbt_{_v}_gee.csv"
+        _path = f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_{_v}_gee.csv"
         try:
             sbt_variant_dfs[_v] = pd.read_csv(_path, index_col=0)
         except FileNotFoundError:
@@ -405,7 +410,7 @@ def _(SITE_NAME, pd):
     # VIF table — multicollinearity diagnostic for the primary SBT GEE rate
     # spec (from 08_models.py VIF cell). Sorted descending.
     try:
-        vif_df = pd.read_csv(f"output_to_share/{SITE_NAME}/vif_sbt_rate.csv")
+        vif_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/vif_sbt_rate.csv")
         # Format VIF to 2 decimals for the report; flag the severity bucket.
         def _bucket(_v):
             if _v > 10: return '*** severe'
@@ -426,8 +431,8 @@ def _(SITE_NAME, pd):
     # production GEE summary and the day-0 GEE summary, compose into a
     # side-by-side table for eyeball comparison.
     try:
-        _prod = pd.read_csv(f"output_to_share/{SITE_NAME}/gee_summary.csv")
-        _day0 = pd.read_csv(f"output_to_share/{SITE_NAME}/gee_summary_day0.csv")
+        _prod = pd.read_csv(f"output_to_share/{SITE_NAME}/models/gee_summary.csv")
+        _day0 = pd.read_csv(f"output_to_share/{SITE_NAME}/models/gee_summary_day0.csv")
         # First column is the term name; statsmodels' summary() emits an
         # unnamed leading column that pandas reads as 'Unnamed: 0'.
         _prod = _prod.rename(columns={_prod.columns[0]: 'term'})
@@ -464,7 +469,7 @@ def _(SITE_NAME, pd):
     # are downstream extensions).
     try:
         subcohort_df = pd.read_csv(
-            f"output_to_share/{SITE_NAME}/dose_pattern_subgroup_propofol.csv"
+            f"output_to_share/{SITE_NAME}/descriptive/dose_pattern_6group_table1_prop.csv"
         ).fillna('')
     except FileNotFoundError:
         subcohort_df = None
@@ -503,11 +508,11 @@ def _(
     table1_df,
     vif_df,
 ):
-    _pdf_path = f"output_to_share/{SITE_NAME}/figures/sedation_report.pdf"
+    _pdf_path = f"output_to_share/{SITE_NAME}/sedation_report.pdf"
 
     # Paths to pre-rendered images from earlier scripts
-    _consort_png = f"output_to_share/{SITE_NAME}/consort_inclusion.png"
-    _hourly_png = f"output_to_share/{SITE_NAME}/figures/sed_dose_by_hr_of_day.png"
+    _consort_png = f"output_to_share/{SITE_NAME}/models/consort_inclusion.png"
+    _hourly_png = f"output_to_share/{SITE_NAME}/descriptive/sed_dose_by_hr_of_day.png"
 
     # Build cohort summary lines (handle numeric vs string values gracefully)
     def _fmt_n(val):
@@ -629,16 +634,24 @@ def _(
         # live here (pre-models) because they motivate the exposure-of-interest
         # visually before the reader sees any coefficients.
         _uptitration_pages = [
-            (f"output_to_share/{SITE_NAME}/figures/night_day_diff_distribution.png",
-             "Night-minus-day Dose Rate: Distribution per Patient-day"),
-            (f"output_to_share/{SITE_NAME}/figures/night_day_diff_mean_by_icu_day.png",
+            (f"output_to_share/{SITE_NAME}/descriptive/paradox_summary_6group.png",
+             "Paradox Summary (6-group): Distribution, Sign Split, Tail Balance"),
+            (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_hist.png",
+             "Night-minus-day Dose Rate: Histogram per Patient-day"),
+            (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_hist_by_hosp.png",
+             "Night-minus-day Dose Rate: Histogram per Hospitalization"),
+            (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_mean_by_icu_day.png",
              "Mean Night-minus-day Dose Rate by ICU Day (±95% CI)"),
-            (f"output_to_share/{SITE_NAME}/figures/night_day_diff_spread_by_icu_day.png",
-             "Spread of Night-minus-day Dose Rate by ICU Day"),
-            (f"output_to_share/{SITE_NAME}/figures/paradox_summary.png",
-             "Paradox Summary: Distribution Shape, Sign Split, Tail Balance"),
-            (f"output_to_share/{SITE_NAME}/figures/dose_pattern_persistence.png",
-             "Dose-Pattern Persistence and Day-to-Day Transitions"),
+            (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_violin_by_icu_day.png",
+             "Spread of Night-minus-day Dose Rate by ICU Day (violin)"),
+            (f"output_to_share/{SITE_NAME}/descriptive/dose_pattern_6group_count_by_icu_day.png",
+             "Cohort Size by ICU Day with 6-group Composition"),
+            (f"output_to_share/{SITE_NAME}/descriptive/diff_tail_contribution.png",
+             "Tail Contribution to Gross Night-minus-day Diff"),
+            (f"output_to_share/{SITE_NAME}/descriptive/dose_pattern_6group_persistence.png",
+             "Dose-Pattern Persistence and Day-to-Day Transitions (6-group)"),
+            (f"output_to_share/{SITE_NAME}/descriptive/single_shift_diagnostics.png",
+             "Single-shift Diagnostics"),
         ]
         for _path, _title in _uptitration_pages:
             if os.path.exists(_path):
@@ -671,8 +684,8 @@ def _(
             add_text_page(
                 _pdf,
                 "Dose-Pattern Subgroups (propofol): Characteristics",
-                [f"[CSV not found: output_to_share/{SITE_NAME}/dose_pattern_subgroup_propofol.csv]",
-                 "Run code/descriptive/dose_pattern_subgroup_characteristics.py to generate."],
+                [f"[CSV not found: output_to_share/{SITE_NAME}/descriptive/dose_pattern_6group_table1_prop.csv]",
+                 "Run code/descriptive/dose_pattern_6group_table1.py to generate."],
             )
 
         # Page 13: Primary SBT GEE comparison
@@ -704,7 +717,7 @@ def _(
         else:
             add_text_page(
                 _pdf, "Multicollinearity Diagnostic (VIF)",
-                [f"[CSV not found: output_to_share/{SITE_NAME}/vif_sbt_rate.csv]",
+                [f"[CSV not found: output_to_share/{SITE_NAME}/models/vif_sbt_rate.csv]",
                  "Run 08_models.py to generate."],
             )
 
@@ -731,7 +744,7 @@ def _(
         else:
             add_text_page(
                 _pdf, "Day-0 Sensitivity Analysis",
-                [f"[CSV not found: output_to_share/{SITE_NAME}/gee_summary_day0.csv]",
+                [f"[CSV not found: output_to_share/{SITE_NAME}/models/gee_summary_day0.csv]",
                  "Run 08_models.py to generate."],
             )
 
@@ -768,7 +781,7 @@ def _(
             else:
                 add_text_page(
                     _pdf, _title_v,
-                    [f"[CSV not found: output_to_share/{SITE_NAME}/model_comparison_sbt_{_v}_gee.csv]",
+                    [f"[CSV not found: output_to_share/{SITE_NAME}/models/model_comparison_sbt_{_v}_gee.csv]",
                      "Run 08_models.py to generate."],
                 )
 
@@ -793,7 +806,7 @@ def _(
             ('Successful Extubation Next Day (Logit)', 'extub', 'logit'),
         ]:
             _me_path = (
-                f"output_to_share/{SITE_NAME}/figures/"
+                f"output_to_share/{SITE_NAME}/models/"
                 f"marginal_effects_{_outcome_short}_{_mt}_sofa.png"
             )
             if os.path.exists(_me_path):
@@ -818,7 +831,7 @@ def _(
             ('Successful Extubation Next Day (Logit)', 'extub', 'logit'),
         ]:
             _me_path = (
-                f"output_to_share/{SITE_NAME}/figures/"
+                f"output_to_share/{SITE_NAME}/models/"
                 f"marginal_effects_{_outcome_short}_{_mt}_sofa_rcs.png"
             )
             if os.path.exists(_me_path):

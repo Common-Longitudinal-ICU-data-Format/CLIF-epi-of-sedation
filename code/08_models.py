@@ -41,7 +41,8 @@ def _():
     SITE_NAME = cfg['site_name'].lower()
 
     # Site-scoped output dirs (see Makefile SITE= flag).
-    os.makedirs(f"output_to_share/{SITE_NAME}/figures", exist_ok=True)
+    # Path B++ refactor: every modeling artifact lands under {site}/models/.
+    os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return SITE_NAME, pd
 
@@ -81,10 +82,10 @@ def _(SITE_NAME, cohort_merged_final, pd):
     print(gee_result.summary())
     _summary_df = gee_result.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/gee_summary.csv', index=False)
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/gee_summary.csv', index=False)
     _cov_matrix = gee_result.cov_params()
-    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/gee_covmat.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/gee_summary.csv, gee_covmat.csv")
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/gee_covmat.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/models/gee_summary.csv, gee_covmat.csv")
     return
 
 
@@ -129,7 +130,7 @@ def _(SITE_NAME, cohort_merged_final, pd):
             continue
         _vif_rows.append({'term': _name, 'vif': _vif_fn(_X.values, _i)})
     _vif_df = pd.DataFrame(_vif_rows).sort_values('vif', ascending=False)
-    _vif_path = f'output_to_share/{SITE_NAME}/vif_sbt_rate.csv'
+    _vif_path = f'output_to_share/{SITE_NAME}/models/vif_sbt_rate.csv'
     _vif_df.to_csv(_vif_path, index=False)
     print(_vif_df.to_string(index=False))
     print(
@@ -149,7 +150,7 @@ def _():
     fit on `exposure_dataset.parquet` — the exposure-characterization sibling
     that retains day 0 (the partial admission day before the first 7am,
     normally excluded by the `_nth_day > 0` filter) AND last-day rows. Rate
-    divisors in that dataset use `NULLIF(n_hours_*, 0)` so partial-shift
+    divisors in that dataset use `NULLIF(n_hours_*, 0)` so single-shift
     normalization is correct; day-1+ rows are numerically identical to
     production. The next-day-outcome filter is applied inline below so the
     day-0 SA model fits the same modeling cohort as production plus the day-0
@@ -192,9 +193,9 @@ def _(SITE_NAME, pd):
     ).fit()
     _summary_df = _gee_d0.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/gee_summary_day0.csv', index=False)
-    _gee_d0.cov_params().to_csv(f'output_to_share/{SITE_NAME}/gee_covmat_day0.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/gee_summary_day0.csv, gee_covmat_day0.csv")
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/gee_summary_day0.csv', index=False)
+    _gee_d0.cov_params().to_csv(f'output_to_share/{SITE_NAME}/models/gee_covmat_day0.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/models/gee_summary_day0.csv, gee_covmat_day0.csv")
     return
 
 
@@ -226,10 +227,10 @@ def _(SITE_NAME, cohort_merged_final, pd):
     gee_result_amt = gee_model_amt.fit()
     _summary_df = gee_result_amt.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/gee_summary_amount.csv', index=False)
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/gee_summary_amount.csv', index=False)
     _cov_matrix = gee_result_amt.cov_params()
-    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/gee_covmat_amount.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/gee_summary_amount.csv, gee_covmat_amount.csv")
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/gee_covmat_amount.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/models/gee_summary_amount.csv, gee_covmat_amount.csv")
     return
 
 
@@ -266,10 +267,10 @@ def _(SITE_NAME, cohort_merged_final, pd):
     print(logit_result.summary())
     _summary_df = logit_result.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/logit_summary.csv', index=False)
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/logit_summary.csv', index=False)
     _cov_matrix = logit_result.cov_params()
-    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/logit_covmat.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/logit_summary.csv, logit_covmat.csv")
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/logit_covmat.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/models/logit_summary.csv, logit_covmat.csv")
     return
 
 
@@ -304,10 +305,10 @@ def _(SITE_NAME, cohort_merged_final, pd):
     logit_result_amt = logit_model_amt.fit(cov_type='cluster', cov_kwds={'groups': _logit_amt_df['hospitalization_id']})
     _summary_df = logit_result_amt.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/logit_summary_amount.csv', index=False)
+    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/logit_summary_amount.csv', index=False)
     _cov_matrix = logit_result_amt.cov_params()
-    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/logit_covmat_amount.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/logit_summary_amount.csv, logit_covmat_amount.csv")
+    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/logit_covmat_amount.csv')
+    print(f"Saved output_to_share/{SITE_NAME}/models/logit_summary_amount.csv, logit_covmat_amount.csv")
     return
 
 
@@ -546,7 +547,7 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
         for _label, _result in _spec_dict.items():
             sa_results.append(_extract_long(_result, _label, _outcome, _mt, _param))
     sa_all = pd.concat(sa_results, ignore_index=True)
-    _sa_path = f'output_to_share/{SITE_NAME}/sensitivity_analysis.csv'
+    _sa_path = f'output_to_share/{SITE_NAME}/models/sensitivity_analysis.csv'
     sa_all.to_csv(_sa_path, index=False)
     print(f"Saved {_sa_path} ({len(sa_all)} rows)")
 
@@ -610,7 +611,7 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
                 continue
             _outcome_short = _OUTCOME_SHORT.get(_config['outcome'], _config['outcome'])
             _suffix = '' if _param == 'rate' else '_amount'
-            _fname = f"output_to_share/{SITE_NAME}/model_comparison_{_outcome_short}_{_config['model_type']}{_suffix}.csv"
+            _fname = f"output_to_share/{SITE_NAME}/models/model_comparison_{_outcome_short}_{_config['model_type']}{_suffix}.csv"
             # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
             # as OR-per-unit. The RCS results are still exported in the long-format
             # sensitivity_analysis.csv above, and visualized via marginal-effect plots.
@@ -797,7 +798,7 @@ def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted,
 
         _outcome_short = 'sbt' if 'sbt' in outcome else 'extub'
         out_path = (
-            f"output_to_share/{SITE_NAME}/figures/"
+            f"output_to_share/{SITE_NAME}/models/"
             f"marginal_effects_{_outcome_short}_{model_type}_{spec_label}.png"
         )
         fig.savefig(out_path, dpi=250, bbox_inches='tight', facecolor='white')

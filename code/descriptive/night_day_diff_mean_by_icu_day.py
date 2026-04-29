@@ -2,14 +2,14 @@
 
 Shows whether the diurnal dose pattern is concentrated at the boundaries of
 the vent course (day 0 = intubation; "last" = day before extubation) or
-distributed across mid-stay days. X-axis: `0 (intub), 1, 2, ..., 7, 8+, last (extub)`.
+distributed across mid-stay days. X-axis: `0 (intub), 1, 2, ..., 7, 8+, last (exit)`.
 
 Day 0 and "last" are stratified into two markers each:
 
-  - **Open circle (complete coverage)** — `_partial_shift_flag = False`, i.e.
+  - **Open circle (complete coverage)** — `_single_shift_day = False`, i.e.
     both day-shift and night-shift had nonzero hours of exposure. Honest
     boundary-day signal.
-  - **Filled triangle (partial coverage)** — `_partial_shift_flag = True`,
+  - **Filled triangle (partial coverage)** — `_single_shift_day = True`,
     i.e. one shift had zero hours of exposure (e.g., intubated after 7 PM
     so day-shift hours = 0 on day 0). The diff in that subset is mechanically
     `night − 0 = full_night_rate`, which is a coverage artifact, NOT a real
@@ -57,7 +57,7 @@ from _shared import (  # noqa: E402
 # 1..MAX_MID_DAY, "8+" tail at MAX_MID_DAY+1, last-day at MAX_MID_DAY+2.
 MAX_MID_DAY = 7
 MID_DAY_BINS = [str(i) for i in range(1, MAX_MID_DAY + 1)] + [f"{MAX_MID_DAY + 1}+"]
-ALL_BIN_LABELS = ["0\n(intub)"] + MID_DAY_BINS + ["last\n(extub)"]
+ALL_BIN_LABELS = ["0\n(intub)"] + MID_DAY_BINS + ["last\n(exit)"]
 
 
 def _ci(values: np.ndarray, conf: float = 0.95) -> tuple[float, float, float]:
@@ -85,7 +85,7 @@ def _classify_bin(row: pd.Series) -> str:
     if bool(row["_is_first_day"]):
         return "0\n(intub)"
     if bool(row["_is_last_day"]):
-        return "last\n(extub)"
+        return "last\n(exit)"
     d = int(row["_nth_day"])
     if d > MAX_MID_DAY:
         return f"{MAX_MID_DAY + 1}+"
@@ -111,7 +111,7 @@ def main() -> None:
     df = prepare_diffs(load_exposure())
     # Make sure the flag columns exist (added in 05_modeling_dataset.py's
     # exposure cell). If they don't, the user is on an old build.
-    for col in ["_is_first_day", "_is_last_day", "_partial_shift_flag"]:
+    for col in ["_is_first_day", "_is_last_day", "_single_shift_day"]:
         if col not in df.columns:
             raise RuntimeError(
                 f"exposure_dataset.parquet missing column {col!r} — "
@@ -140,7 +140,7 @@ def main() -> None:
         pcts_n_higher, pcts_d_higher = [], []
         for b in ALL_BIN_LABELS:
             sub = df[df["_x_bin"] == b]
-            # For mid-stay days, partial-shift rows are negligible (they're
+            # For mid-stay days, single-shift rows are negligible (they're
             # essentially boundary-day-only artifacts); we still keep them
             # to match the exposure-view N exactly.
             vals = sub[col].dropna().to_numpy()
@@ -169,10 +169,10 @@ def main() -> None:
         # Boundary days (day 0 and "last"): plot complete-coverage and
         # partial-coverage subsets as separate markers at the same x position.
         for bx, label_for_b in [(boundary_idx_first, "0\n(intub)"),
-                                (boundary_idx_last, "last\n(extub)")]:
+                                (boundary_idx_last, "last\n(exit)")]:
             sub = df[df["_x_bin"] == label_for_b]
-            full = sub[~sub["_partial_shift_flag"].fillna(False)][col].dropna().to_numpy()
-            part = sub[sub["_partial_shift_flag"].fillna(False)][col].dropna().to_numpy()
+            full = sub[~sub["_single_shift_day"].fillna(False)][col].dropna().to_numpy()
+            part = sub[sub["_single_shift_day"].fillna(False)][col].dropna().to_numpy()
 
             if len(full):
                 m_full, lo_full, hi_full = _ci(full)
@@ -226,58 +226,20 @@ def main() -> None:
             ax.legend(loc="upper right", fontsize=7.5)
 
     fig.suptitle(
-        "Night-minus-day dose rate by ICU day "
-        "(boundary days stratified by shift coverage)",
-        fontsize=12, y=1.02,
+        "Mean night-minus-day dose rate by ICU day\n"
+        "Mid-stay days: mean ± 95% CI line + dashed median. "
+        "Boundary days (0 / last): open circle = complete cov.; filled triangle = partial cov. (one shift had 0h coverage).",
+        fontsize=11, y=1.01,
     )
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.32)
-
-    footnote = (
-        "HOW TO READ THIS FIGURE\n"
-        "\n"
-        "One panel per drug. Each marker reports the cohort mean of `diff` (= night-shift rate − day-shift rate)\n"
-        "on patient-days falling in that ICU-day bin. Units: mcg/kg/min for propofol, mcg/hr for fentanyl-eq,\n"
-        "mg/hr for midazolam-eq.\n"
-        "\n"
-        "X-AXIS — ICU day bin\n"
-        "  0 (intub) ............ The patient's intubation day (the partial day before their first 7 AM).\n"
-        "  1 ... 7 .............. Full middle-of-stay days, mean ± 95% CI line, dashed median overlay.\n"
-        "  8+ .................... Tail bin (any patient-day with _nth_day >= 8).\n"
-        "  last (extub) .......... The patient's last day on the vent (no next-day outcome). Could overlap\n"
-        "                          with a small day-number for short stays.\n"
-        "  Gray bands shade the boundary days (0 and last) so they're visually separated from mid-stay.\n"
-        "\n"
-        "MARKERS — what they mean\n"
-        "  Mid-stay days: filled circle = mean diff; ribbon = 95% CI; dashed square = median.\n"
-        "  Boundary days: TWO markers stacked at the same x position:\n"
-        "    open circle  → COMPLETE COVERAGE: both shifts had > 0 hours of exposure window.\n"
-        "                   The diff reflects a real (induction-day or extubation-day) pattern.\n"
-        "    filled triangle (alpha-reduced) → PARTIAL COVERAGE: one shift had 0 hours of exposure.\n"
-        "                   For day 0, this is patients intubated after 7 PM (0 day-shift hours, full night).\n"
-        "                   The diff is mechanically `night - 0 = full_night_rate` — it reflects coverage,\n"
-        "                   NOT a clinically interpretable diurnal pattern. The visual gap between the open\n"
-        "                   circle and the filled triangle = the size of the coverage artifact.\n"
-        "\n"
-        "ANNOTATIONS\n"
-        "  N>D xx% / D>N xx%  → for mid-stay markers, percent of patient-days with diff > 0 vs diff < 0.\n"
-        "                        Useful to see whether the per-day mean and the per-day majority direction\n"
-        "                        agree. (`Equal` and NaN rows excluded from the denominator.)\n"
-        "  n=N (n=N*)         → patient-day count per marker; * marks partial-coverage subset.\n"
-        "\n"
-        "GLOSSARY\n"
-        "  diff       — (per-hour rate during night-shift hours) − (per-hour rate during day-shift hours).\n"
-        "                Positive = night-shift dose was heavier; negative = day-shift dose was heavier.\n"
-        "  shift hour — 7 AM−7 PM = day shift; 7 PM−7 AM = night shift (local time).\n"
-        "  partial    — `_partial_shift_flag = True`: STRICTLY one shift had zero hours of exposure.\n"
-        "                Short-but-nonzero shifts (e.g., intubated at 4 PM → 3 hours day-shift coverage) are\n"
-        "                NOT flagged: their per-hour rate is already hour-normalized in the upstream pipeline.\n"
-    )
     fig.text(
-        0.04, 0.001, footnote,
-        ha="left", va="bottom", fontsize=8, color="black", family="monospace",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#f5f5f5",
-                  edgecolor="#cccccc", linewidth=0.5),
+        0.5, -0.02,
+        "Annotations: N>D / D>N = patient-day percent in each direction (Equal / NaN excluded). "
+        "n=N (n=N*) = patient-day count per marker; * marks partial-coverage subset. "
+        "Boundary-day partial-cov triangles reflect coverage artifacts (e.g. intubated after 7 PM "
+        "→ diff = night − 0 = full_night_rate), NOT a clinically interpretable diurnal pattern. "
+        "Glossary in docs/descriptive_figures.md §3.",
+        ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
     save_fig(fig, "night_day_diff_mean_by_icu_day")
 

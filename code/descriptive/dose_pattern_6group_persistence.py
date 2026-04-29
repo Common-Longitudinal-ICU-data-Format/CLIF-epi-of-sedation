@@ -14,8 +14,8 @@ panels = 3 rows × 2 cols):
       pattern (everyone with mixed ratios).
       Inset: % of patients with `>50%` of their days in each group.
 
-      Each segment is drawn in two textures: solid for non-partial-shift
-      days, hatched for partial-shift days. Total bar height (% in each
+      Each segment is drawn in two textures: solid for non-single-shift
+      days, hatched for single-shift days. Total bar height (% in each
       group) unchanged; the texture decomposes contribution origin.
 
   Panel B — day-to-day transition matrix.
@@ -25,18 +25,19 @@ panels = 3 rows × 2 cols):
       = persistent phenotype; off-diagonal-heavy = oscillating.
       A small companion bar reports `% of all transitions touching a partial-
       shift row`. A sensitivity sub-heatmap to the right shows the same
-      matrix recomputed without partial-shift transitions.
+      matrix recomputed without single-shift transitions.
 
-CSV companion (per drug): `dose_pattern_transitions_{drug}.csv` with raw
-counts + conditional probabilities per cell of the 6×6 matrix, for cross-
-site pooling under code/agg/.
+CSV companion (per sedative):
+`dose_pattern_6group_transitions_{sedative}.csv` with raw counts +
+conditional probabilities per cell of the 6×6 matrix, for cross-site
+pooling under code/agg/.
 
 Privacy: all outputs are aggregate (per-patient fractions binned into a
 heatmap, transition counts pooled across patients). No row-level data,
 no IDs.
 
 Usage:
-    uv run python code/descriptive/dose_pattern_persistence.py
+    uv run python code/descriptive/dose_pattern_6group_persistence.py
 """
 
 from __future__ import annotations
@@ -75,7 +76,7 @@ def _per_patient_fractions(d: pd.DataFrame, drug: str) -> tuple[pd.DataFrame, pd
     fractions_df: rows = hospitalization_id, cols = DOSE_PATTERN_LABELS,
                   values = per-patient % of days in each group (0..100, sums to 100 per row).
     partial_fractions_df: same shape, but values are % of patient's days in
-                          each group that came from `_partial_shift_flag = True` rows.
+                          each group that came from `_single_shift_day = True` rows.
     """
     pat_col = f"_pattern_{drug}"
     grouped = d.groupby(["hospitalization_id", pat_col], observed=False).size().unstack(
@@ -84,8 +85,8 @@ def _per_patient_fractions(d: pd.DataFrame, drug: str) -> tuple[pd.DataFrame, pd
     grouped = grouped.reindex(columns=list(DOSE_PATTERN_LABELS), fill_value=0)
     fractions = grouped.div(grouped.sum(axis=1), axis=0).fillna(0) * 100.0
 
-    # Partial-shift sub-counts per (patient × group)
-    partial = d[d["_partial_shift_flag"].fillna(False)].groupby(
+    # Single-shift sub-counts per (patient × group)
+    partial = d[d["_single_shift_day"].fillna(False)].groupby(
         ["hospitalization_id", pat_col], observed=False
     ).size().unstack(fill_value=0)
     partial = partial.reindex(columns=list(DOSE_PATTERN_LABELS), fill_value=0)
@@ -147,20 +148,20 @@ def _draw_panel_a(ax, fractions: pd.DataFrame, partial_fractions: pd.DataFrame,
 
 
 def _build_transition_matrix(d: pd.DataFrame, drug: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, float]:
-    """Return (counts_all, conditional_all, conditional_no_partial, partial_share).
+    """Return (counts_all, conditional_all, conditional_no_partial, single_share).
 
     counts_all: 6×6 raw transition counts (group_t → group_t+1).
     conditional_all: row-normalized — P(group_t+1 | group_t) on all transitions.
     conditional_no_partial: same matrix recomputed after dropping any
-        transition where either t or t+1 had `_partial_shift_flag = True`.
-    partial_share: float in [0, 1], fraction of all transitions that touched a partial shift.
+        transition where either t or t+1 had `_single_shift_day = True`.
+    single_share: float in [0, 1], fraction of all transitions that touched a single-shift day.
     """
     pat_col = f"_pattern_{drug}"
-    cols = ["hospitalization_id", "_nth_day", pat_col, "_partial_shift_flag"]
+    cols = ["hospitalization_id", "_nth_day", pat_col, "_single_shift_day"]
     sub = d[cols].dropna(subset=[pat_col]).sort_values(["hospitalization_id", "_nth_day"])
     sub["_pattern_next"] = sub.groupby("hospitalization_id", observed=False)[pat_col].shift(-1)
     sub["_partial_next"] = sub.groupby("hospitalization_id", observed=False)[
-        "_partial_shift_flag"
+        "_single_shift_day"
     ].shift(-1)
     sub = sub.dropna(subset=["_pattern_next"])
 
@@ -172,7 +173,7 @@ def _build_transition_matrix(d: pd.DataFrame, drug: str) -> tuple[pd.DataFrame, 
     ).reindex(index=labels, columns=labels, fill_value=0).astype(int)
 
     no_partial = sub[
-        ~sub["_partial_shift_flag"].fillna(False)
+        ~sub["_single_shift_day"].fillna(False)
         & ~sub["_partial_next"].fillna(False)
     ]
     counts_no_partial = pd.crosstab(
@@ -187,10 +188,10 @@ def _build_transition_matrix(d: pd.DataFrame, drug: str) -> tuple[pd.DataFrame, 
     ).fillna(0)
 
     n_total = int(counts.sum().sum())
-    n_partial_touched = n_total - int(counts_no_partial.sum().sum())
-    partial_share = (n_partial_touched / n_total) if n_total > 0 else 0.0
+    n_single_touched = n_total - int(counts_no_partial.sum().sum())
+    single_share = (n_single_touched / n_total) if n_total > 0 else 0.0
 
-    return counts, cond_all, cond_no, partial_share
+    return counts, cond_all, cond_no, single_share
 
 
 def _draw_heatmap(ax, mat: pd.DataFrame, title: str) -> None:
@@ -216,15 +217,15 @@ def _draw_heatmap(ax, mat: pd.DataFrame, title: str) -> None:
 
 def _draw_panel_b(ax_main, ax_no_partial, ax_share,
                   cond_all: pd.DataFrame, cond_no: pd.DataFrame,
-                  partial_share: float, drug: str) -> None:
+                  single_share: float, drug: str) -> None:
     _draw_heatmap(ax_main, cond_all,
                   f"{DRUG_LABELS[drug]} — P(group_t+1 | group_t), all transitions")
     _draw_heatmap(ax_no_partial, cond_no,
-                  "(sensitivity) excluding partial-shift transitions")
-    ax_share.barh(0, partial_share * 100, color="#a6611a", edgecolor="white", height=0.6)
-    ax_share.barh(0, 100 - partial_share * 100, left=partial_share * 100,
+                  "(sensitivity) excluding single-shift transitions")
+    ax_share.barh(0, single_share * 100, color="#a6611a", edgecolor="white", height=0.6)
+    ax_share.barh(0, 100 - single_share * 100, left=single_share * 100,
                   color="#dfc27d", edgecolor="white", height=0.6)
-    ax_share.text(0.5, 0, f"{partial_share*100:.1f}% of transitions touch a partial-shift row",
+    ax_share.text(0.5, 0, f"{single_share*100:.1f}% of transitions touch a single-shift row",
                   ha="center", va="center", fontsize=8.5, transform=ax_share.transAxes)
     ax_share.set_xlim(0, 100)
     ax_share.set_ylim(-0.5, 0.5)
@@ -238,9 +239,9 @@ def main() -> None:
     apply_style()
     df = prepare_diffs(load_exposure())
     ensure_dirs()
-    if "_partial_shift_flag" not in df.columns:
+    if "_single_shift_day" not in df.columns:
         raise RuntimeError(
-            "exposure_dataset.parquet missing _partial_shift_flag — "
+            "exposure_dataset.parquet missing _single_shift_day — "
             "re-run code/05_modeling_dataset.py against the current site."
         )
 
@@ -284,9 +285,9 @@ def main() -> None:
         ax_b_main = fig.add_subplot(gs_b_main[1])
         ax_b_sens = fig.add_subplot(gs[r, 2])
 
-        counts, cond_all, cond_no, partial_share = _build_transition_matrix(d, drug)
+        counts, cond_all, cond_no, single_share = _build_transition_matrix(d, drug)
         _draw_panel_b(ax_b_main, ax_b_sens, ax_share,
-                      cond_all, cond_no, partial_share, drug)
+                      cond_all, cond_no, single_share, drug)
 
         # Save the cross-site-pooling-friendly transition CSV (raw counts +
         # conditional probabilities). One row per (group_t, group_t+1, drug).
@@ -301,79 +302,25 @@ def main() -> None:
                     "p_t+1_given_t_no_partial": float(cond_no.loc[src, dst]),
                 })
         out_df = pd.DataFrame(rows)
-        path = f"{TABLES_DIR}/dose_pattern_transitions_{drug}.csv"
+        path = f"{TABLES_DIR}/dose_pattern_6group_transitions_{drug}.csv"
         out_df.to_csv(path, index=False)
-        print(f"Wrote {path}  (drug={drug}; partial-share={partial_share*100:.1f}%)")
+        print(f"Wrote {path}  (drug={drug}; partial-share={single_share*100:.1f}%)")
 
     fig.suptitle(
-        "Dose-pattern persistence and day-to-day transitions across the 6 groups",
-        fontsize=13, y=0.995,
+        "Dose-pattern persistence and day-to-day transitions (6 groups)\n"
+        "Panel A: per-patient % in each of 6 groups (solid = full coverage; // = single-shift). "
+        "Panel B: P(group_t+1 | group_t). Right heatmap = same matrix excluding single-shift transitions.",
+        fontsize=11, y=0.995,
     )
-    # Reserve bottom region for footnote.
-    fig.subplots_adjust(bottom=0.22)
-
-    footnote = (
-        "HOW TO READ THIS FIGURE\n"
-        "\n"
-        "Three rows, one per drug. Each row has THREE plots:\n"
-        "\n"
-        "(1) PANEL A (left, wide bar) — within-patient distribution\n"
-        "    One horizontal bar per patient. Total bar width is always 100% of that patient's days. The bar\n"
-        "    is split into 6 colored segments — one per dose-pattern group — sized by the % of THAT PATIENT's\n"
-        "    patient-days in each group. Patients are sorted top-to-bottom by their % \"Markedly higher at\n"
-        "    night\" (descending), so the most night-heavy patients appear at the top.\n"
-        "\n"
-        "    Each colored segment is internally split by texture:\n"
-        "      solid       → days the patient was fully covered (`_partial_shift_flag = False`).\n"
-        "      hatched //  → days the patient had a zero-hour shift (`_partial_shift_flag = True`).\n"
-        "    A patient whose entire \"Markedly higher at night\" segment is hatched got that classification\n"
-        "    only because of zero-hour-day-shift artifacts (intubation after 7 PM); a patient with mostly\n"
-        "    solid in the same segment has real night-heavier dosing across multiple full days.\n"
-        "\n"
-        "    Inset text reports `% of patients with > 50% of their days in group X` — the consistent\n"
-        "    phenotypes. Concentrations there indicate stable patient phenotypes; if all 6 numbers are\n"
-        "    small, every patient is mixed (no consistent phenotype).\n"
-        "\n"
-        "(2) PANEL B-MAIN (middle heatmap) — day-to-day transition matrix, all transitions\n"
-        "    Rows = group at day t; columns = group at day t+1. Cell (i, j) = `P(group_t+1 = j | group_t = i)`.\n"
-        "    Each row sums to 1.0. Computed by pooling all consecutive day pairs within each patient and\n"
-        "    crosstabbing on the 6×6 group axis.\n"
-        "      diagonal-heavy   → persistent: same group repeats day after day (stable phenotype).\n"
-        "      off-diagonal     → oscillating: groups change day-to-day (unstable phenotype).\n"
-        "    The horizontal stripe ABOVE the heatmap reports the % of all transitions where either day t\n"
-        "    or day t+1 was a partial-shift row. High % means the matrix's signal is partly coverage-driven.\n"
-        "\n"
-        "(3) PANEL B-SENSITIVITY (rightmost heatmap) — same matrix, partial-shift transitions excluded\n"
-        "    Identical layout to the main heatmap, but recomputed after dropping any (t, t+1) pair where\n"
-        "    either day was partial-shift. If the diagonals are very similar between the two heatmaps, the\n"
-        "    persistence story is robust to coverage. If they differ, partial-shift rows are doing real\n"
-        "    work in the matrix and the sensitivity version is the one to trust.\n"
-        "\n"
-        "GROUP DEFINITIONS (6-way classification around per-drug threshold T)\n"
-        "  Markedly higher at day      diff < -T            big day-shift dose excess vs night\n"
-        "  Slightly higher at day      -T <= diff < 0       small day-shift dose excess vs night\n"
-        "  Equal, both zero            day == 0 AND night == 0   off-drug both shifts (drug holiday)\n"
-        "  Equal, both non-zero        diff == 0 AND day > 0     truly stable, same dose both shifts\n"
-        "  Slightly higher at night    0 < diff <= +T       small night-shift dose excess vs day\n"
-        "  Markedly higher at night    diff > +T            big night-shift dose excess vs day\n"
-        "\n"
-        "GLOSSARY\n"
-        "  diff           — (per-hour rate during night-shift hours) − (per-hour rate during day-shift hours).\n"
-        "  T (threshold)  — drug-specific clinically meaningful cutoff (10 mcg/kg/min for propofol,\n"
-        "                    25 mcg/hr for fentanyl-eq, 1 mg/hr for midazolam-eq).\n"
-        "  partial-shift  — `_partial_shift_flag = True`: one shift had ZERO hours of exposure window\n"
-        "                    (e.g., intubation after 7 PM → 0 day-shift hours on day 0). NOT to be confused\n"
-        "                    with a short-but-nonzero shift, which is NOT flagged.\n"
-        "  consecutive    — successive days within the SAME hospitalization. Transitions between different\n"
-        "                    hospitalizations are not counted.\n"
-    )
+    fig.subplots_adjust(bottom=0.06)
     fig.text(
-        0.02, 0.001, footnote,
-        ha="left", va="bottom", fontsize=8, color="black", family="monospace",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#f5f5f5",
-                  edgecolor="#cccccc", linewidth=0.5),
+        0.5, 0.01,
+        "Diagonal-heavy heatmap = persistent phenotype; off-diagonal = oscillating. "
+        "Inset on Panel A: % of patients with >50% of their days in each group (consistent-phenotype share). "
+        "Glossary: docs/descriptive_figures.md §3.",
+        ha="center", va="bottom", fontsize=8, color="dimgray", wrap=True,
     )
-    save_fig(fig, "dose_pattern_persistence")
+    save_fig(fig, "dose_pattern_6group_persistence")
 
 
 if __name__ == "__main__":

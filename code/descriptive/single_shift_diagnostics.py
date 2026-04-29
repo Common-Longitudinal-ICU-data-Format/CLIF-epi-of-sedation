@@ -1,7 +1,7 @@
 """Distribution of `n_hours_day` and `n_hours_night` across patient-days.
 
 Reads `output/{site}/sed_dose_daily.parquet` (the pre-filter table — the
-modeling dataset drops most partial shifts via its
+modeling dataset drops most single-shift days via its
 `sbt_done_next_day IS NOT NULL` filter). Two panels:
 
   - Bar of the full integer distribution of `n_hours_day` and
@@ -11,11 +11,11 @@ modeling dataset drops most partial shifts via its
     (DST artifacts).
 
 This is a permanent diagnostic: if upstream 01/02 ever regresses and
-starts leaking partial-shift rows into the modeling dataset, this
+starts leaking single-shift rows into the modeling dataset, this
 figure should immediately flag it.
 
 Usage:
-    uv run python code/descriptive/partial_shift_diagnostics.py
+    uv run python code/descriptive/single_shift_diagnostics.py
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def main() -> None:
     ad = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
 
     # Flag kept-vs-dropped from the modeling filter so the plot shows how
-    # much partial-shift exposure is actually inherited downstream.
+    # much single-shift exposure is actually inherited downstream.
     ad["_nth_day"] = ad["_nth_day"].astype(int)
     sd["_nth_day"] = sd["_nth_day"].astype(int)
     kept_ids = ad[["hospitalization_id", "_nth_day"]].assign(_kept=1)
@@ -116,52 +116,22 @@ def main() -> None:
             cell.set_text_props(weight="bold")
 
     fig.suptitle(
-        f"Partial-shift diagnostics — {SITE_NAME.upper()} "
-        "(log scale; kept = retained in modeling_dataset.parquet)",
-        fontsize=13, y=1.00,
+        f"Single-shift diagnostics — {SITE_NAME.upper()} (log scale)\n"
+        "Light blue = sed_dose_daily.parquet (pre-filter). "
+        "Dark blue = subset retained in modeling_dataset.parquet "
+        "(after _nth_day>0 AND sbt_done_next_day IS NOT NULL).",
+        fontsize=11, y=1.00,
     )
-    fig.subplots_adjust(bottom=0.30)
-
-    footnote = (
-        "HOW TO READ THIS FIGURE\n"
-        "\n"
-        "Two bar panels: LEFT = day-shift hours, RIGHT = night-shift hours. X-axis: integer hours\n"
-        "(0..14) in that shift. Y-axis: number of patient-days with that many hours of exposure\n"
-        "(LOG SCALE — small bars are a small fraction of the cohort).\n"
-        "\n"
-        "  light blue bars  → ALL rows in `sed_dose_daily.parquet` (pre-filter, the full hospital-stay\n"
-        "                      coverage).\n"
-        "  dark blue bars   → the subset that survived into `modeling_dataset.parquet` (after the\n"
-        "                      `_nth_day > 0 AND sbt_done_next_day IS NOT NULL` filter).\n"
-        "\n"
-        "  full 12h     — the normal case. A patient who started the shift before 7 AM (resp. 7 PM)\n"
-        "                  and ended after the 12-hour mark.\n"
-        "  partial <12h — patient was intubated mid-shift, extubated mid-shift, or died/transferred.\n"
-        "  zero-length  — `n_hours_<shift> = 0`. The patient had no exposure window at all on that\n"
-        "                  shift (e.g., intubated after 7 PM → 0 day-shift hours on day 0).\n"
-        "  > 12h (DST)  — daylight-saving artifact; expected to be a few rows.\n"
-        "\n"
-        "USE THIS FIGURE AS A REGRESSION CANARY\n"
-        "  The dark blue bars should be concentrated almost entirely at h = 12. If you see a sudden\n"
-        "  expansion of dark blue bars at h < 12, the upstream pipeline is leaking partial-shift rows\n"
-        "  into the modeling cohort — investigate `04_covariates.py` / `05_modeling_dataset.py` filters.\n"
-        "\n"
-        "  The light blue bars should look qualitatively similar between sites (mostly h = 12, with\n"
-        "  some bumps at h = 0 from intubation-after-7-PM cases on day 0). The summary table at the\n"
-        "  bottom of the figure quantifies the % full-12h vs partial vs zero-length per source.\n"
-        "\n"
-        "GLOSSARY\n"
-        "  modeling_dataset.parquet — the outcome-modeling cohort (filtered, no day 0, no last day).\n"
-        "  sed_dose_daily.parquet   — the pre-filter source: all hospitalization-days with sedative\n"
-        "                              data, including day 0 / last day / zero-hour shifts.\n"
-    )
+    fig.subplots_adjust(bottom=0.18)
     fig.text(
-        0.04, 0.001, footnote,
-        ha="left", va="bottom", fontsize=8, color="black", family="monospace",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#f5f5f5",
-                  edgecolor="#cccccc", linewidth=0.5),
+        0.5, 0.02,
+        "Regression canary: the dark-blue (modeling-cohort) bars should be concentrated at h=12. "
+        "An expansion of dark-blue bars at h<12 means single-shift rows are leaking into the modeling cohort "
+        "— investigate 04_covariates.py / 05_modeling_dataset.py. Light blue bars typically include some h=0 "
+        "rows from intubation-after-7-PM cases on day 0 (expected).",
+        ha="center", va="bottom", fontsize=8, color="dimgray", wrap=True,
     )
-    save_fig(fig, "partial_shift_diagnostics")
+    save_fig(fig, "single_shift_diagnostics")
 
 
 if __name__ == "__main__":

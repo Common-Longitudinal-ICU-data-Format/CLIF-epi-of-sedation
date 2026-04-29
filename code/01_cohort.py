@@ -59,8 +59,11 @@ def _(CONFIG_PATH, get_config_or_params):
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    os.makedirs(f"output_to_share/{SITE_NAME}", exist_ok=True)
-    os.makedirs(f"output_to_share/{SITE_NAME}/figures", exist_ok=True)
+    # Path B++ refactor: descriptive (night-vs-day) artifacts under
+    # {site}/descriptive/, modeling-cohort artifacts (incl. CONSORT) under
+    # {site}/models/. Both flat — no nested figures/.
+    os.makedirs(f"output_to_share/{SITE_NAME}/descriptive", exist_ok=True)
+    os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return (SITE_NAME,)
 
@@ -565,7 +568,7 @@ def _(
         ],
     }
 
-    _consort_json_path = f"output_to_share/{SITE_NAME}/consort_inclusion.json"
+    _consort_json_path = f"output_to_share/{SITE_NAME}/models/consort_inclusion.json"
     with open(_consort_json_path, "w") as f:
         json.dump(consort_flow, f, indent=2)
     print(f"CONSORT flow saved to {_consort_json_path}")
@@ -596,7 +599,7 @@ def _(
 
     # CONSORT flowchart PNG
     from _utils import plot_consort
-    _consort_png_path = f"output_to_share/{SITE_NAME}/consort_inclusion.png"
+    _consort_png_path = f"output_to_share/{SITE_NAME}/models/consort_inclusion.png"
     plot_consort(consort_flow, _consort_png_path)
     print(f"Saved: {_consort_png_path}")
     return (consort_flow,)

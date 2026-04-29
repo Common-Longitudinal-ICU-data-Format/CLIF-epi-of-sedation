@@ -1,8 +1,8 @@
-"""6-way dose-pattern subgroup characteristics — per-drug stratified Table 1 + forest plot.
+"""6-group dose-pattern stratified Table 1 + forest plot — per sedative.
 
 Supersedes a prior 2-arm "night-higher vs not" subcohort table by stratifying
 into all six dose-pattern groups around ±T (see below). For each of the
-three drugs, all patient-days from `exposure_dataset.parquet` are
+three sedatives, all patient-days from `exposure_dataset.parquet` are
 classified into six neutral-terminology buckets (see
 `_shared.categorize_diff_6way`):
 
@@ -17,14 +17,14 @@ The two `diff == 0` sub-cases are split intentionally — the off-drug-both-
 shifts case is a drug-holiday day (very common for midazolam) and would
 otherwise pollute the "Slightly higher at day" bucket.
 
-Outputs (per drug, three drugs total):
+Outputs (per sedative, three sedatives total):
 
-  - `output_to_share/{site}/dose_pattern_subgroup_{drug}.csv` — tableone-
-    style stratified Table 1 with one column per group (6 columns) plus a
-    leading "Overall" anchor column. Demographics, severity, daytime
-    sedation, downstream outcomes. PLUS a parallel `_partial_shift_n` row
+  - `output_to_share/{site}/descriptive/dose_pattern_6group_table1_{sedative}.csv`
+    — tableone-style stratified Table 1 with one column per group (6 columns)
+    plus a leading "Overall" anchor column. Demographics, severity, daytime
+    sedation, downstream outcomes. PLUS a parallel `_single_shift_n` row
     showing how much of each group's N is from coverage-artifact rows.
-  - `output_to_share/{site}/figures/dose_pattern_subgroup_smd_{drug}.png`
+  - `output_to_share/{site}/descriptive/dose_pattern_6group_forest_{sedative}.png`
     — forest plot of group-vs-overall standardized mean differences for
     the headline severity vars (SOFA total, CCI, age, day-shift dose rate).
 
@@ -32,7 +32,7 @@ Privacy: all outputs are aggregate (counts / means / medians / SDs / IQRs).
 No row-level data, no IDs.
 
 Usage:
-    uv run python code/descriptive/dose_pattern_subgroup_characteristics.py
+    uv run python code/descriptive/dose_pattern_6group_table1.py
 """
 
 from __future__ import annotations
@@ -117,14 +117,14 @@ def _build_tableone(df: pd.DataFrame, drug: str, group_col: str) -> tableone.Tab
     )
 
 
-def _add_partial_shift_row(out_df: pd.DataFrame, df: pd.DataFrame, group_col: str,
+def _add_single_shift_row(out_df: pd.DataFrame, df: pd.DataFrame, group_col: str,
                            ) -> pd.DataFrame:
-    """Append a `_partial_shift_n / %` row per group to the flattened tableone CSV.
+    """Append a `_single_shift_n / %` row per group to the flattened tableone CSV.
 
-    Per the plan, the parallel `_partial_shift` row makes coverage-artifact
+    Per the plan, the parallel `_single_shift` row makes coverage-artifact
     contribution visible per group without silently dropping those rows.
     """
-    counts_per_group = df.groupby(group_col, observed=False)["_partial_shift_flag"].apply(
+    counts_per_group = df.groupby(group_col, observed=False)["_single_shift_day"].apply(
         lambda s: int(s.fillna(False).sum())
     ).reindex(list(DOSE_PATTERN_LABELS), fill_value=0)
     totals_per_group = df.groupby(group_col, observed=False).size().reindex(
@@ -138,14 +138,14 @@ def _add_partial_shift_row(out_df: pd.DataFrame, df: pd.DataFrame, group_col: st
         if label in out_df.columns:
             new_row[label] = f"{counts_per_group[label]:,} ({pcts[label]:.1f}%)"
     # Preserve any "Overall" anchor column if present.
-    overall_total = int(df["_partial_shift_flag"].fillna(False).sum())
+    overall_total = int(df["_single_shift_day"].fillna(False).sum())
     overall_pct = 100.0 * overall_total / max(len(df), 1)
     for cand in ("Overall", "all", "Grouped by"):
         if cand in out_df.columns:
             new_row[cand] = f"{overall_total:,} ({overall_pct:.1f}%)"
 
     # Add as a labeled row at the bottom.
-    new_row_series = pd.Series(new_row, name="_partial_shift_n (% of group)")
+    new_row_series = pd.Series(new_row, name="_single_shift_n (% of group)")
     out_df = pd.concat([out_df, new_row_series.to_frame().T], axis=0)
     return out_df
 
@@ -166,12 +166,12 @@ def _draw_smd_forest(df: pd.DataFrame, drug: str, group_col: str) -> None:
     """Forest plot — per-group SMD vs overall (across the cohort) for SMD_VARS.
 
     Two-tone bars per group: solid for the all-rows SMD, hatched overlay for
-    the SMD recomputed after dropping `_partial_shift_flag = True` rows.
+    the SMD recomputed after dropping `_single_shift_day = True` rows.
     Same total length per group; the hatched portion shows what fraction of
     the SMD's signal could be attributable to coverage-artifact rows.
     """
     overall = df.copy()
-    overall_no_partial = df[~df["_partial_shift_flag"].fillna(False)].copy()
+    overall_no_partial = df[~df["_single_shift_day"].fillna(False)].copy()
 
     n_vars = len(SMD_VARS)
     # Tall figure: bottom ~38% reserved for the interpretation footnote.
@@ -223,68 +223,28 @@ def _draw_smd_forest(df: pd.DataFrame, drug: str, group_col: str) -> None:
         ax.set_title(var, fontsize=10)
 
     fig.suptitle(
-        f"{DRUG_LABELS[drug]} — Standardized Mean Differences by Dose-Pattern Group",
-        fontsize=11, y=1.00,
+        f"{DRUG_LABELS[drug]} — SMD vs cohort overall by 6-group dose pattern\n"
+        "Solid bar = all rows; hatched overlay = SMD recomputed without single-shift rows. "
+        "Gray band ±0.10 = conventional ignorable-imbalance zone.",
+        fontsize=10, y=1.00,
     )
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.38)
-
-    footnote = (
-        "HOW TO READ THIS FIGURE\n"
-        "\n"
-        "Each panel shows one variable. Each row is one of the six dose-pattern groups (defined below).\n"
-        "Bar length = standardized mean difference (SMD) of that group's mean for that variable, vs the\n"
-        "cohort overall mean.\n"
-        "\n"
-        "    SMD = (group mean − cohort overall mean) / pooled standard deviation\n"
-        "\n"
-        "An SMD of +0.30 on `sofa_total` for the \"Markedly higher at night\" row means: patient-days in\n"
-        "that group have SOFA scores that are 0.30 SDs above the cohort-overall mean SOFA. Conventionally,\n"
-        "|SMD| < 0.10 (the gray band) is considered ignorable; |SMD| > 0.20 is a meaningful imbalance.\n"
-        "\n"
-        "BAR TEXTURE\n"
-        "  solid colored bar  → SMD computed over ALL patient-days in the group (including partial-shift\n"
-        "                       rows, see glossary).\n"
-        "  hatched overlay    → SMD recomputed AFTER dropping patient-days where _partial_shift_flag=True.\n"
-        "                       The visible distance between the solid bar and the hatched overlay = the\n"
-        "                       contribution of partial-shift rows to that group's signal. If the hatched\n"
-        "                       bar is much shorter than the solid bar, the group's apparent characteristics\n"
-        "                       are driven by coverage-artifact rows; the underlying complete-coverage\n"
-        "                       subgroup is far less distinctive.\n"
-        "\n"
-        "GROUP DEFINITIONS (6-way classification around per-drug threshold T; see categorize_diff_6way)\n"
-        "  Markedly higher at day      diff < -T            big day-shift dose excess vs night\n"
-        "  Slightly higher at day      -T <= diff < 0       small day-shift dose excess vs night\n"
-        "  Equal, both zero            day == 0 AND night == 0   off-drug (drug holiday / not yet started)\n"
-        "  Equal, both non-zero        diff == 0 AND day > 0     truly stable, same dose across both shifts\n"
-        "  Slightly higher at night    0 < diff <= +T       small night-shift dose excess vs day\n"
-        "  Markedly higher at night    diff > +T            big night-shift dose excess vs day\n"
-        "\n"
-        "GLOSSARY\n"
-        "  diff           — (per-hour rate during night-shift hours) − (per-hour rate during day-shift hours).\n"
-        "  T (threshold)  — drug-specific clinically meaningful cutoff (10 mcg/kg/min for propofol,\n"
-        "                    25 mcg/hr for fentanyl-eq, 1 mg/hr for midazolam-eq).\n"
-        "  partial-shift  — _partial_shift_flag=True: one shift had ZERO hours of exposure window\n"
-        "                    (e.g., intubation after 7 PM → 0 day-shift hours on day 0). NOT to be confused\n"
-        "                    with a short-but-nonzero shift, which is NOT flagged because its per-hour rate\n"
-        "                    is already hour-normalized.\n"
-    )
     fig.text(
-        0.04, 0.001, footnote,
-        ha="left", va="bottom", fontsize=7.5, color="black", family="monospace",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#f5f5f5",
-                  edgecolor="#cccccc", linewidth=0.5),
+        0.5, -0.02,
+        "SMD = (group mean − cohort overall mean) / pooled SD. |SMD|>0.20 = meaningful imbalance. "
+        "Group definitions: 6-way around ±T; see categorize_diff_6way and docs/descriptive_figures.md §3.",
+        ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
-    save_fig(fig, f"dose_pattern_subgroup_smd_{drug}")
+    save_fig(fig, f"dose_pattern_6group_forest_{drug}")
 
 
 def main() -> None:
     apply_style()
     df = prepare_diffs(load_exposure())
     ensure_dirs()
-    if "_partial_shift_flag" not in df.columns:
+    if "_single_shift_day" not in df.columns:
         raise RuntimeError(
-            "exposure_dataset.parquet missing _partial_shift_flag — "
+            "exposure_dataset.parquet missing _single_shift_day — "
             "re-run code/05_modeling_dataset.py against the current site."
         )
 
@@ -306,22 +266,22 @@ def main() -> None:
             list(DOSE_PATTERN_LABELS), fill_value=0
         )
         partial_counts = d.groupby(f"_pattern_{drug}", observed=False)[
-            "_partial_shift_flag"
+            "_single_shift_day"
         ].apply(lambda s: int(s.fillna(False).sum())).reindex(
             list(DOSE_PATTERN_LABELS), fill_value=0
         )
         print(f"\n[{drug}] 6-way group counts (T = {thr}):")
         for label in DOSE_PATTERN_LABELS:
             print(f"  {label:35s}  n = {counts[label]:>7,}  "
-                  f"(partial-shift: {partial_counts[label]:,})")
+                  f"(single-shift: {partial_counts[label]:,})")
 
         t1 = _build_tableone(d, drug, f"_pattern_{drug}")
         out_df = t1.tableone.copy()
         if isinstance(out_df.columns, pd.MultiIndex):
             out_df.columns = out_df.columns.get_level_values(-1)
-        out_df = _add_partial_shift_row(out_df, d, f"_pattern_{drug}")
+        out_df = _add_single_shift_row(out_df, d, f"_pattern_{drug}")
 
-        path = f"{TABLES_DIR}/dose_pattern_subgroup_{drug}.csv"
+        path = f"{TABLES_DIR}/dose_pattern_6group_table1_{drug}.csv"
         out_df.to_csv(path)
         print(f"Wrote {path}")
 

@@ -154,51 +154,18 @@ def main() -> None:
     )
 
     fig.suptitle(
-        "Cumulative contribution of tail patient-days to gross positive / negative diff",
-        fontsize=13, y=1.02,
+        "Tail contribution to gross night-minus-day diff (per sedative)\n"
+        "Each stacked bar = how the gross |sum| on one side of 0 is built up by the top 5/10/25/50/100% "
+        "of patient-days on that side. Fat-tail check: top-5% band carrying ≫ 5% of bar = fat tail.",
+        fontsize=11, y=1.02,
     )
     fig.tight_layout()
-    fig.subplots_adjust(bottom=0.40)
-
-    footnote = (
-        "HOW TO READ THIS FIGURE\n"
-        "\n"
-        "Each panel = one drug. Within each panel, two stacked bars: LEFT = positive tail (Night > Day),\n"
-        "RIGHT = negative tail (Day > Night). Each bar is split into 5 cumulative bands showing what fraction\n"
-        "of the GROSS sum on that side comes from the top X% of patient-days (X = 5%, 10%, 25%, 50%, 100%).\n"
-        "\n"
-        "Reading example — propofol left (positive) bar at MIMIC: if the bottom dark-red \"Top 5%\" band\n"
-        "occupies 37% of the bar height, that means 37% of the gross positive-diff sum is contributed by\n"
-        "just the top 5% of positive-diff patient-days. The remaining 95% of positive-diff days contribute\n"
-        "the other 63%. That's the empirical definition of \"fat tails\".\n"
-        "\n"
-        "EVERY-PANEL TITLE numbers (printed in the colored title text above each panel)\n"
-        "  mean   — cohort mean of `diff` over on-drug patient-days (= per-day average).\n"
-        "  median — cohort median of `diff` over on-drug patient-days.\n"
-        "  POS sum — gross arithmetic sum of `diff` values where diff > 0. Single big number.\n"
-        "  NEG sum — gross arithmetic sum of |diff| values where diff < 0. Single big number.\n"
-        "  net    — POS sum − NEG sum. Equals the cohort mean × n_on_drug. If POS sum ≈ NEG sum,\n"
-        "           net ≈ 0 — that's the \"paradox\" mechanism: huge tail activity on both sides cancels\n"
-        "           out into a tiny mean.\n"
-        "\n"
-        "GLOSSARY\n"
-        "  diff       — (per-hour rate during night-shift hours) − (per-hour rate during day-shift hours).\n"
-        "  tail       — the extreme end of the distribution. \"Positive tail\" = patient-days with\n"
-        "                 large positive diff; \"negative tail\" = patient-days with large negative diff.\n"
-        "                 We don't impose a fixed cutoff — every nonzero-diff day is part of one tail.\n"
-        "  gross sum  — arithmetic sum of values on one side of zero, e.g., gross positive sum =\n"
-        "                 Σ diff_i for all i with diff_i > 0. NOT a count: large diffs weight more.\n"
-        "  fat tails  — informal: a large fraction of the gross sum comes from a small fraction of days.\n"
-        "                 If \"top 5% of days = 5% of gross sum\", the tail is uniform (no fat tail). If\n"
-        "                 \"top 5% of days = 40% of gross sum\", the tail is fat.\n"
-        "  T          — clinical threshold per drug (printed in panel title), used by other figures to\n"
-        "                 carve buckets; not used here directly. This figure shows the FULL tail.\n"
-    )
     fig.text(
-        0.04, 0.001, footnote,
-        ha="left", va="bottom", fontsize=8, color="black", family="monospace",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#f5f5f5",
-                  edgecolor="#cccccc", linewidth=0.5),
+        0.5, -0.02,
+        "Per-panel title: cohort mean and median (over on-sedative patient-days), POS sum (Σ diff for diff>0), "
+        "NEG sum (Σ |diff| for diff<0), net (= mean × n). Balanced POS ≈ NEG sums with fat tails on both sides "
+        "is the paradox mechanism. Glossary: docs/descriptive_figures.md §3.",
+        ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
     save_fig(fig, "diff_tail_contribution")
 

@@ -574,7 +574,7 @@ def _(duckdb, sed_dose_by_hr):
         """
         -- Aggregate dose totals AND hour counts per hospitalization, day, shift.
         -- n_hours is used downstream to convert totals to per-hour dose rates,
-        -- which avoids partial-shift bias in the Dose by Shift descriptive table
+        -- which avoids single-shift bias in the Dose by Shift descriptive table
         -- and makes model dose coefficients interpretable as rates (see
         -- 05_analytical_dataset.py for the ÷12 rate conversion).
         -- Column-name convention (2026-04-24): totals carry their unit as
@@ -601,7 +601,7 @@ def _(duckdb, sed_dose_by_hr):
 def _(sed_dose_agg):
     # NOTE: Pivot to wide day/night columns using pandas .pivot()
     # n_hours_day/night flow through so downstream can compute per-hour dose rates
-    # that correctly handle partial shifts (intubation / extubation day edges).
+    # that correctly handle single-shift days (intubation / extubation day edges).
     # Unit-suffixed column names (e.g. prop_day_mg = total mg over 12h day shift)
     # match the 2026-04-24 naming convention; see 05_analytical_dataset.py.
     sed_dose_daily = sed_dose_agg.pivot(

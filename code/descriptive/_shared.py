@@ -1,7 +1,7 @@
 """Shared helpers for the diurnal-dose descriptive figures.
 
 All scripts under code/descriptive/ are pure-Python and consume the
-exposure dataset (or, for the partial-shift audit specifically, the
+exposure dataset (or, for the single-shift audit specifically, the
 modeling dataset). This module centralizes:
 
   - threshold definitions (fent > 25/hr, prop > 10 mcg/kg/min, midaz > 1/hr)
@@ -53,8 +53,13 @@ SITE_NAME = _load_site_name()
 # Makefile's SITE= flag). Phase-2 cross-site aggregation reads these dirs.
 MODELING_PARQUET = f"output/{SITE_NAME}/modeling_dataset.parquet"
 EXPOSURE_PARQUET = f"output/{SITE_NAME}/exposure_dataset.parquet"
-FIGURES_DIR = f"output_to_share/{SITE_NAME}/figures"
-TABLES_DIR = f"output_to_share/{SITE_NAME}"
+# As of the Path B++ refactor, every descriptive PNG and CSV lands FLAT in
+# output_to_share/{site}/descriptive (no figures/ subdir). The thematic
+# sibling directory `models/` houses everything written by 06/07/08/09's
+# modeling code path.
+FIGURES_DIR = f"output_to_share/{SITE_NAME}/descriptive"
+TABLES_DIR = f"output_to_share/{SITE_NAME}/descriptive"
+MODELS_DIR = f"output_to_share/{SITE_NAME}/models"
 
 
 # ── Drug-level constants ──────────────────────────────────────────────────
@@ -138,6 +143,20 @@ DOSE_PATTERN_COLORS = {
     "Markedly higher at night":   "#b2182b",  # dark red
 }
 
+# Stack order for count-by-ICU-day bar charts. Differs from
+# DOSE_PATTERN_LABELS: the drug-holiday band ("Equal, both zero") is moved
+# to the TOP of the bar so total bar height = cohort survivors and the
+# on-drug zone (the 5 remaining areas) sits as a contiguous bottom block.
+# See descriptive_figures.md §6.0.
+COUNT_BAR_STACK_ORDER = (
+    "Markedly higher at day",
+    "Slightly higher at day",
+    "Equal, both non-zero",       # on-drug, no diff
+    "Slightly higher at night",
+    "Markedly higher at night",
+    "Equal, both zero",           # off-drug — placed last (top of bar)
+)
+
 # Sensitivity knob on the weight upper bound applied inside prepare_diffs().
 # outlier_config.yaml already caps weight at 300 kg at ingestion; this env
 # var additionally clips at use-time so tightening sensitivity analyses
@@ -169,7 +188,7 @@ def load_exposure() -> pd.DataFrame:
 
     Includes day 0 AND last day so the night-vs-day diurnal characterization
     sees the full coverage of each patient's stay. Carries three flag
-    columns the figures use directly: `_partial_shift_flag`, `_is_first_day`,
+    columns the figures use directly: `_single_shift_day`, `_is_first_day`,
     `_is_last_day`. Default loader for every descriptive figure under this
     module.
     """
@@ -241,11 +260,11 @@ def categorize_diff_6way(
     the split can read whether the equality came from 0=0 or X=X.
 
     NaN handling: NaN rate on a shift means that shift had zero hours of
-    exposure (a partial-shift / coverage-artifact row, see
-    `_partial_shift_flag`). Such rows are TREATED AS ZERO-RATE on the missing
-    shift and re-classified accordingly, so partial-shift rows surface in
+    exposure (a single-shift / coverage-artifact row, see
+    `_single_shift_day`). Such rows are TREATED AS ZERO-RATE on the missing
+    shift and re-classified accordingly, so single-shift rows surface in
     whichever bucket their finite-shift dose falls into rather than being
-    silently dropped. The `_partial_shift_flag` column carries the artifact
+    silently dropped. The `_single_shift_day` column carries the artifact
     signal into figures' texture/overlay layer.
 
     Returns NaN only for rows where BOTH day and night are NaN (which
@@ -254,7 +273,7 @@ def categorize_diff_6way(
     labels = list(DOSE_PATTERN_LABELS)
     day_f = day.fillna(0).astype(float)
     night_f = night.fillna(0).astype(float)
-    # Recompute diff from filled day/night so partial-shift rows are finite.
+    # Recompute diff from filled day/night so single-shift rows are finite.
     # Falls back to user-supplied diff when both day and night are present.
     diff_use = night_f - day_f
 
@@ -269,6 +288,16 @@ def categorize_diff_6way(
     out.loc[valid & (diff_use > threshold)] = labels[5]                           # markedly night
 
     return pd.Categorical(out, categories=labels, ordered=True)
+
+
+def split_full_vs_single(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split a per-day frame into (full_coverage, single_shift) by `_single_shift_day`.
+
+    Companion figures (`*_hatched`, `*_split`) need both subsets to render the
+    artifact contribution; centralizing the split keeps the two scripts in lockstep.
+    """
+    is_single = df["_single_shift_day"].astype(bool)
+    return df.loc[~is_single].copy(), df.loc[is_single].copy()
 
 
 # ── Plotting helpers ──────────────────────────────────────────────────────

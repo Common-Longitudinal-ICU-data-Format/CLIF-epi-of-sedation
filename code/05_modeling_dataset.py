@@ -40,10 +40,10 @@ def _():
        characterization view. Filter relaxes to `_nth_day >= 0` (keeps day 0
        AND last day) so the figures in `code/descriptive/` see the full
        hospital-stay coverage. Rate divisors switch from `/12.0` to
-       `NULLIF(n_hours_*, 0)` so partial-shift rates are correctly hour-
+       `NULLIF(n_hours_*, 0)` so single-shift rates are correctly hour-
        normalized; zero-hour shifts (intubated-after-7-PM day-0 rows) yield
        NULL rates rather than misleading zeros. Adds three flag columns
-       (`_partial_shift_flag`, `_is_first_day`, `_is_last_day`) so figures
+       (`_single_shift_day`, `_is_first_day`, `_is_last_day`) so figures
        can stratify visualizations on day 0 / last-day / coverage-artifact
        rows without re-deriving them. Consumers: every `code/descriptive/*.py`
        script (via `_shared.load_exposure()`), and `08_models.py`'s day-0
@@ -215,7 +215,7 @@ def _(
         -- NOTE: Dose columns below are per-hour RATES (mg/hr or mcg/hr),
         -- computed as shift totals ÷ 12 (hours per shift). Valid because the
         -- filter (_nth_day > 0 AND outcome-columns non-null) guarantees
-        -- complete 24h 7am-anchored days — partial shifts at intubation /
+        -- complete 24h 7am-anchored days — single-shift days at intubation /
         -- extubation are already excluded. See
         -- docs/uptitration_paradox_investigation.md §0 for why this filter
         -- matters when characterizing *exposure* (vs predicting outcomes).
@@ -338,11 +338,11 @@ def _():
 
     1. Rate divisors swap from hardcoded `/12.0` to `NULLIF(s.n_hours_<shift>, 0)`.
        For full 12-h shifts (every middle-of-stay row) this is mathematically
-       identical; for partial-shift rows (day 0, last day, mid-stay extubation
+       identical; for single-shift rows (day 0, last day, mid-stay extubation
        gaps) it correctly hour-normalizes per-shift rates and avoids the
        "higher total just because more hours" bias. Zero-hour shifts yield
        NULL rates rather than 0 — the artifact those rows would otherwise
-       introduce is then surfaced by `_partial_shift_flag` (below) instead of
+       introduce is then surfaced by `_single_shift_day` (below) instead of
        being silently lumped with real low-dose rows.
 
     2. Filter relaxes from
@@ -351,7 +351,7 @@ def _():
 
     3. Adds three flag columns so descriptive figures can stratify
        visualizations natively:
-       - `_partial_shift_flag` = `True` when one shift had zero hours of
+       - `_single_shift_day` = `True` when one shift had zero hours of
          coverage (e.g., intubation after 7 PM → `n_hours_day = 0` on day 0).
          Strictly the zero-hour case; short-but-nonzero shifts are unflagged.
        - `_is_first_day` = `True` when `_nth_day == 0`.
@@ -360,7 +360,7 @@ def _():
 
     All three are computed in this cell; consumers don't need to re-derive
     them. The amount columns (`_prop_day_mcg_kg`, etc.) are kept as-is — for
-    partial-shift rows they represent total dose over the actual shift hours.
+    single-shift rows they represent total dose over the actual shift hours.
 
     `08_models.py`'s day-0 sensitivity GEE applies the next-day-outcome filter
     inline at read time (so the model cohort matches the production cell
@@ -389,10 +389,10 @@ def _(
         -- built for diurnal characterization (descriptive figures). Two
         -- core differences from the modeling chain:
         --   (1) Rate divisors use NULLIF(n_hours_*, 0) instead of /12.0
-        --       so partial-shift rows are correctly hour-normalized and
+        --       so single-shift rows are correctly hour-normalized and
         --       zero-hour shifts produce NULL rates (not misleading 0).
         --   (2) Three exposure-characterization flag columns are added
-        --       (_partial_shift_flag, _is_first_day, _is_last_day) so
+        --       (_single_shift_day, _is_first_day, _is_last_day) so
         --       descriptive figures can stratify on them natively.
         FROM sbt_outcomes_daily o
         LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
@@ -411,7 +411,7 @@ def _(
         -- figures don't have to re-derive them across N scripts).
         , _is_first_day: (o._nth_day = 0)
         , _is_last_day: (LEAD(o.sbt_done) OVER w IS NULL)
-        , _partial_shift_flag: (COALESCE(s.n_hours_day, 0) = 0
+        , _single_shift_day: (COALESCE(s.n_hours_day, 0) = 0
                                 OR COALESCE(s.n_hours_night, 0) = 0)
         , _sbt_done_today: o.sbt_done
         , _success_extub_today: o._success_extub
@@ -449,7 +449,7 @@ def _(
         , midazeq_dif_mg_hr: (COALESCE(s.midazeq_night_mg, 0) / NULLIF(s.n_hours_night, 0))
                            - (COALESCE(s.midazeq_day_mg, 0)   / NULLIF(s.n_hours_day, 0))
         -- Absolute totals — kept identical to production. For day 0 these are
-        -- "total over partial shift" which is the natural absolute-amount SA.
+        -- "total over single-shift day" which is the natural absolute-amount SA.
         -- Phase 2: propofol absolute totals now mcg/kg over the shift.
         , _prop_day_mcg_kg:   COALESCE(s.prop_day_mcg_kg, 0)
         , _prop_night_mcg_kg: COALESCE(s.prop_night_mcg_kg, 0)
@@ -526,10 +526,10 @@ def _(SITE_NAME, cohort_merged_exposure_final):
     _df.to_parquet(_path, index=False)
     _n_day0 = (_df['_nth_day'] == 0).sum()
     _n_last = int(_df['_is_last_day'].sum())
-    _n_partial = int(_df['_partial_shift_flag'].sum())
+    _n_single = int(_df['_single_shift_day'].sum())
     print(
         f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations, "
-        f"{_n_day0} day-0 rows, {_n_last} last-day rows, {_n_partial} partial-shift rows)"
+        f"{_n_day0} day-0 rows, {_n_last} last-day rows, {_n_single} single-shift rows)"
     )
     return
 

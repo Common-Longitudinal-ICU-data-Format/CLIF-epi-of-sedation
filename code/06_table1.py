@@ -47,7 +47,10 @@ def _():
     SITE_NAME = cfg['site_name'].lower()
 
     # Site-scoped output dirs (see Makefile SITE= flag).
-    os.makedirs(f"output_to_share/{SITE_NAME}", exist_ok=True)
+    # Path B++ refactor: modeling outputs live under {site}/models/ so that
+    # descriptive (night-vs-day) artifacts and model artifacts sit in
+    # parallel thematic subdirs.
+    os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     print(f"Site: {SITE_NAME}")
     return CONFIG_PATH, SITE_NAME, apply_outlier_handling, duckdb, json, pd, tableone
 
@@ -151,7 +154,7 @@ def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, pd):
         'site': [SITE_NAME],
         'n_hospitalizations': [n_hospitalizations],
         'n_unique_patients': [n_unique_patients],
-    }).to_csv(f'output_to_share/{SITE_NAME}/cohort_stats.csv', index=False)
+    }).to_csv(f'output_to_share/{SITE_NAME}/models/cohort_stats.csv', index=False)
     print(f"Cohort: {n_hospitalizations} hospitalizations from {n_unique_patients} unique patients")
     return
 
@@ -216,7 +219,7 @@ def _(SITE_NAME, cohort_merged_for_t1, hosp_df, tableone):
         order={'ever_pressor': ['Yes', 'No'], 'sepsis_ase': ['Yes', 'No']},
         limit={'ever_pressor': 1, 'sepsis_ase': 1},
     )
-    _t1_path = f'output_to_share/{SITE_NAME}/table1.csv'
+    _t1_path = f'output_to_share/{SITE_NAME}/models/table1.csv'
     table1_overall.to_csv(_t1_path)
     print(f"Saved {_t1_path}")
     return
