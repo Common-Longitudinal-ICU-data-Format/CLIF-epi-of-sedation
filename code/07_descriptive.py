@@ -51,8 +51,8 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset.parquet")
-    print(f"Analytical dataset: {len(cohort_merged_final)} rows")
+    cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
+    print(f"Modeling dataset: {len(cohort_merged_final)} rows")
     return (cohort_merged_final,)
 
 

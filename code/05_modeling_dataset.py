@@ -24,11 +24,33 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    # 05 Analytical Dataset
+    # 05 Modeling + Exposure Datasets
 
-    Merges outcomes, exposure, covariates, and demographics.
-    Computes next-day outcomes via LEAD.
-    Applies NMB exclusion.
+    Builds two sibling parquets from the same cohort base:
+
+    1. **`modeling_dataset.parquet`** (`cohort_merged_final`) — the original
+       outcome-modeling view. Filtered to
+       `_nth_day > 0 AND sbt_done_next_day IS NOT NULL AND
+       success_extub_next_day IS NOT NULL`. Drops day 0 and the last vent-course
+       day so every row has a well-defined next-day outcome. Consumers:
+       `06_table1.py`, `07_descriptive.py` (Table 1 / cohort summaries),
+       `08_models.py` (production GEE / logit fits).
+
+    2. **`exposure_dataset.parquet`** (`cohort_merged_exposure`) — the diurnal-
+       characterization view. Filter relaxes to `_nth_day >= 0` (keeps day 0
+       AND last day) so the figures in `code/descriptive/` see the full
+       hospital-stay coverage. Rate divisors switch from `/12.0` to
+       `NULLIF(n_hours_*, 0)` so partial-shift rates are correctly hour-
+       normalized; zero-hour shifts (intubated-after-7-PM day-0 rows) yield
+       NULL rates rather than misleading zeros. Adds three flag columns
+       (`_partial_shift_flag`, `_is_first_day`, `_is_last_day`) so figures
+       can stratify visualizations on day 0 / last-day / coverage-artifact
+       rows without re-deriving them. Consumers: every `code/descriptive/*.py`
+       script (via `_shared.load_exposure()`), and `08_models.py`'s day-0
+       sensitivity model (which applies the next-day-outcome filter inline at
+       read time so its modeling cohort matches the production cell exactly).
+
+    Both views apply the same NMB hospitalization-level exclusion.
     """)
     return
 
@@ -298,7 +320,7 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_merged_final):
     _df = cohort_merged_final.df()
-    _path = f"output/{SITE_NAME}/analytical_dataset.parquet"
+    _path = f"output/{SITE_NAME}/modeling_dataset.parquet"
     _df.to_parquet(_path, index=False)
     print(f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations)")
     return
@@ -307,25 +329,42 @@ def _(SITE_NAME, cohort_merged_final):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Day-0 Sensitivity Sibling
+    ## Exposure Dataset (full hospital-stay coverage)
 
-    Builds `analytical_dataset_day0.parquet` — a sibling of the production
-    analytical dataset that **includes day 0** (the partial admission day before
-    the first 7am, currently dropped by the `_nth_day > 0` filter). Two minimal
-    differences from the production chain above:
+    Builds `exposure_dataset.parquet` — a sibling of the modeling dataset that
+    retains **day 0** (the partial admission day before the first 7am) AND the
+    **last vent-course day** (where `sbt_done_next_day` is NULL because there is
+    no next day). Three differences from the modeling chain above:
 
     1. Rate divisors swap from hardcoded `/12.0` to `NULLIF(s.n_hours_<shift>, 0)`.
-       For full 12-h shifts (every day-1+ row) this is mathematically identical;
-       for day 0 (mean `n_hours_day` ≈ 5.4h, `n_hours_night` ≈ 9.5h) it correctly
-       normalizes per-hour rates and avoids the "higher total just because more
-       hours" bias.
+       For full 12-h shifts (every middle-of-stay row) this is mathematically
+       identical; for partial-shift rows (day 0, last day, mid-stay extubation
+       gaps) it correctly hour-normalizes per-shift rates and avoids the
+       "higher total just because more hours" bias. Zero-hour shifts yield
+       NULL rates rather than 0 — the artifact those rows would otherwise
+       introduce is then surfaced by `_partial_shift_flag` (below) instead of
+       being silently lumped with real low-dose rows.
 
-    2. Filter relaxes from `_nth_day > 0` to `_nth_day >= 0`.
+    2. Filter relaxes from
+       `_nth_day > 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL`
+       to just `_nth_day >= 0`. Day 0 and last day are now both included.
 
-    The amount columns (`_prop_day_mcg_kg`, etc.) are kept as-is — for day 0 they
-    represent total dose over a partial shift, which is the natural "absolute
-    amount" for that shift. Production stays unchanged; this sibling is the
-    SA input for `08_models.py`'s day-0 fit.
+    3. Adds three flag columns so descriptive figures can stratify
+       visualizations natively:
+       - `_partial_shift_flag` = `True` when one shift had zero hours of
+         coverage (e.g., intubation after 7 PM → `n_hours_day = 0` on day 0).
+         Strictly the zero-hour case; short-but-nonzero shifts are unflagged.
+       - `_is_first_day` = `True` when `_nth_day == 0`.
+       - `_is_last_day` = `True` when `sbt_done_next_day` is NULL (no next
+         observation for that patient in the dataset).
+
+    All three are computed in this cell; consumers don't need to re-derive
+    them. The amount columns (`_prop_day_mcg_kg`, etc.) are kept as-is — for
+    partial-shift rows they represent total dose over the actual shift hours.
+
+    `08_models.py`'s day-0 sensitivity GEE applies the next-day-outcome filter
+    inline at read time (so the model cohort matches the production cell
+    exactly).
     """)
     return
 
@@ -344,11 +383,17 @@ def _(
     sofa_daily,
     weight_daily,
 ):
-    cohort_merged_day0 = mo.sql(
+    cohort_merged_exposure = mo.sql(
         f"""
-        -- Day-0 sibling of the production cohort_merged. Differs only in the
-        -- rate divisor (NULLIF(n_hours_*, 0) instead of /12.0); the absolute-
-        -- amount columns and all categorical/clinical covariates are unchanged.
+        -- Exposure dataset — sibling of the production modeling cohort,
+        -- built for diurnal characterization (descriptive figures). Two
+        -- core differences from the modeling chain:
+        --   (1) Rate divisors use NULLIF(n_hours_*, 0) instead of /12.0
+        --       so partial-shift rows are correctly hour-normalized and
+        --       zero-hour shifts produce NULL rates (not misleading 0).
+        --   (2) Three exposure-characterization flag columns are added
+        --       (_partial_shift_flag, _is_first_day, _is_last_day) so
+        --       descriptive figures can stratify on them natively.
         FROM sbt_outcomes_daily o
         LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
         LEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)
@@ -362,6 +407,12 @@ def _(
         LEFT JOIN weight_daily wd USING (hospitalization_id, _nth_day)
         SELECT o.hospitalization_id
         , o._nth_day
+        -- Exposure-characterization flags (computed once here so descriptive
+        -- figures don't have to re-derive them across N scripts).
+        , _is_first_day: (o._nth_day = 0)
+        , _is_last_day: (LEAD(o.sbt_done) OVER w IS NULL)
+        , _partial_shift_flag: (COALESCE(s.n_hours_day, 0) = 0
+                                OR COALESCE(s.n_hours_night, 0) = 0)
         , _sbt_done_today: o.sbt_done
         , _success_extub_today: o._success_extub
         , sbt_done_next_day: LEAD(o.sbt_done) OVER w
@@ -437,42 +488,48 @@ def _(
         ORDER BY o.hospitalization_id, o._nth_day
         """
     )
-    return (cohort_merged_day0,)
+    return (cohort_merged_exposure,)
 
 
 @app.cell
-def _(cohort_merged_day0):
-    _merged_df = cohort_merged_day0.df()
+def _(cohort_merged_exposure):
+    _merged_df = cohort_merged_exposure.df()
     _merged_df.dropna(subset=['age'], inplace=True)
-    cohort_merged_day0_clean = _merged_df
-    print(f"[day-0] After dropping null age: {len(cohort_merged_day0_clean)} rows")
-    return (cohort_merged_day0_clean,)
+    cohort_merged_exposure_clean = _merged_df
+    print(f"[day-0] After dropping null age: {len(cohort_merged_exposure_clean)} rows")
+    return (cohort_merged_exposure_clean,)
 
 
 @app.cell
-def _(cohort_merged_day0_clean, nmb_excluded):
-    cohort_merged_day0_final = mo.sql(
+def _(cohort_merged_exposure_clean, nmb_excluded):
+    cohort_merged_exposure_final = mo.sql(
         f"""
-        -- Same hospitalization-level NMB exclusion as production. Filter
-        -- relaxes from `_nth_day > 0` to `_nth_day >= 0` so day 0 is included.
-        FROM cohort_merged_day0_clean
+        -- Same hospitalization-level NMB exclusion as the modeling cohort.
+        -- Filter relaxes to just `_nth_day >= 0`: day 0 is now included
+        -- AND last-day rows (where `sbt_done_next_day` is NULL) are retained,
+        -- since this is the exposure-characterization view. Consumers needing
+        -- next-day-outcome rows (e.g., 08_models.py day-0 SA) re-apply the
+        -- next-day-NOT-NULL filter inline at read time.
+        FROM cohort_merged_exposure_clean
         ANTI JOIN (SELECT DISTINCT hospitalization_id FROM nmb_excluded) USING (hospitalization_id)
         SELECT *
-        WHERE _nth_day >= 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL
+        WHERE _nth_day >= 0
         """
     )
-    return (cohort_merged_day0_final,)
+    return (cohort_merged_exposure_final,)
 
 
 @app.cell
-def _(SITE_NAME, cohort_merged_day0_final):
-    _df = cohort_merged_day0_final.df()
-    _path = f"output/{SITE_NAME}/analytical_dataset_day0.parquet"
+def _(SITE_NAME, cohort_merged_exposure_final):
+    _df = cohort_merged_exposure_final.df()
+    _path = f"output/{SITE_NAME}/exposure_dataset.parquet"
     _df.to_parquet(_path, index=False)
     _n_day0 = (_df['_nth_day'] == 0).sum()
+    _n_last = int(_df['_is_last_day'].sum())
+    _n_partial = int(_df['_partial_shift_flag'].sum())
     print(
         f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations, "
-        f"{_n_day0} day-0 rows)"
+        f"{_n_day0} day-0 rows, {_n_last} last-day rows, {_n_partial} partial-shift rows)"
     )
     return
 

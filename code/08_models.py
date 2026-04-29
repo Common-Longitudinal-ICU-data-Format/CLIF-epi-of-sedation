@@ -48,7 +48,7 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset.parquet")
+    cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
     print(f"Analytical dataset: {len(cohort_merged_final)} rows")
     return (cohort_merged_final,)
 
@@ -146,11 +146,14 @@ def _():
     ### Sensitivity (day-0 included) — `gee_summary_day0.csv`
 
     Same primary rate-parameterization GEE as the production cell above, but
-    fit on `analytical_dataset_day0.parquet` — the sibling that includes day 0
-    (the partial admission day before the first 7am, normally excluded by the
-    `_nth_day > 0` filter). Rate divisors in that dataset use
-    `NULLIF(n_hours_*, 0)` so partial-shift normalization is correct;
-    day-1+ rows are numerically identical to production.
+    fit on `exposure_dataset.parquet` — the exposure-characterization sibling
+    that retains day 0 (the partial admission day before the first 7am,
+    normally excluded by the `_nth_day > 0` filter) AND last-day rows. Rate
+    divisors in that dataset use `NULLIF(n_hours_*, 0)` so partial-shift
+    normalization is correct; day-1+ rows are numerically identical to
+    production. The next-day-outcome filter is applied inline below so the
+    day-0 SA model fits the same modeling cohort as production plus the day-0
+    rows.
 
     The diagnostic question this answers: does excluding day 0 contribute to
     the counterintuitive OR > 1 sign on dose-rate coefficients? If signs
@@ -165,7 +168,15 @@ def _():
 def _(SITE_NAME, pd):
     import statsmodels.formula.api as _smf_d0
     import statsmodels.api as _sm_d0
-    _df_day0 = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset_day0.parquet")
+    _df_day0 = pd.read_parquet(f"output/{SITE_NAME}/exposure_dataset.parquet")
+    # Apply the next-day-outcome filter that the exposure parquet doesn't
+    # apply globally (since exposure characterization wants last-day rows).
+    # This restores the day-0 SA cohort = production modeling cohort + day-0
+    # rows that have a next day.
+    _df_day0 = _df_day0[
+        _df_day0['sbt_done_next_day'].notna()
+        & _df_day0['success_extub_next_day'].notna()
+    ].reset_index(drop=True)
     _n_day0_rows = (_df_day0['_nth_day'] == 0).sum()
     print(f"[day-0] Loaded {len(_df_day0)} rows ({_n_day0_rows} are day-0 rows)")
     sbt_done_formula_d0 = """sbt_done_next_day ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +

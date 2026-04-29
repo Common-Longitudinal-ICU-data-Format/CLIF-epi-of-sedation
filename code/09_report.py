@@ -458,18 +458,18 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
-    # Up-titrated subcohort characteristics table (from
-    # code/descriptive/uptitrated_subcohort_characteristics.py).
-    # tableone writes a 2-col index (variable, level); MultiIndex header has
-    # already been flattened upstream.
+    # 6-way dose-pattern subgroup characteristics table (from
+    # code/descriptive/dose_pattern_subgroup_characteristics.py). One CSV
+    # per drug; the report shows propofol as the headline (and other drugs
+    # are downstream extensions).
     try:
         subcohort_df = pd.read_csv(
-            f"output_to_share/{SITE_NAME}/uptitrated_subcohort_characteristics.csv"
+            f"output_to_share/{SITE_NAME}/dose_pattern_subgroup_propofol.csv"
         ).fillna('')
     except FileNotFoundError:
         subcohort_df = None
     if subcohort_df is not None:
-        print(f"Subcohort table: {subcohort_df.shape}")
+        print(f"Dose-pattern subgroup table (propofol): {subcohort_df.shape}")
     return (subcohort_df,)
 
 
@@ -635,10 +635,10 @@ def _(
              "Mean Night-minus-day Dose Rate by ICU Day (±95% CI)"),
             (f"output_to_share/{SITE_NAME}/figures/night_day_diff_spread_by_icu_day.png",
              "Spread of Night-minus-day Dose Rate by ICU Day"),
-            (f"output_to_share/{SITE_NAME}/figures/pct_uptitrated_overall.png",
-             "Overall Nocturnal Up-titration Prevalence"),
-            (f"output_to_share/{SITE_NAME}/figures/pct_uptitrated_by_icu_day.png",
-             "Nocturnal Up-titration Prevalence by ICU Day"),
+            (f"output_to_share/{SITE_NAME}/figures/paradox_summary.png",
+             "Paradox Summary: Distribution Shape, Sign Split, Tail Balance"),
+            (f"output_to_share/{SITE_NAME}/figures/dose_pattern_persistence.png",
+             "Dose-Pattern Persistence and Day-to-Day Transitions"),
         ]
         for _path, _title in _uptitration_pages:
             if os.path.exists(_path):
@@ -648,18 +648,21 @@ def _(
                               [f"[Image not found: {_path}]",
                                "Run the corresponding script under code/descriptive/ to generate."])
 
-        # Page 12: Up-titrated vs stable subcohort characteristics (tableone).
-        # Thresholds: prop > 10 mcg/kg/min, fenteq > 25 mcg/hr, midazeq > 1 mg/hr
-        # (a day is "up-titrated" if ANY drug crosses its threshold).
+        # Page 12: Dose-pattern subgroup characteristics (propofol headline).
+        # Six groups around prop_dif_mcg_kg_min:
+        #   Markedly higher at day | Slightly higher at day | Equal, both zero
+        #   Equal, both non-zero    | Slightly higher at night | Markedly higher at night
+        # Threshold T = 10 mcg/kg/min for propofol.
         if subcohort_df is not None:
             add_stargazer_table(
                 _pdf,
                 subcohort_df.set_index(subcohort_df.columns[0]),
-                "Up-titrated vs Stable Patient-days: Characteristics",
+                "Dose-Pattern Subgroups (propofol): Characteristics",
                 notes=(
-                    "Up-titrated = any of prop > 10 mcg/kg/min, fenteq > 25 mcg/hr, "
-                    "midazeq > 1 mg/hr night-minus-day rate. Continuous vars "
-                    "report median [Q1,Q3] unless otherwise noted. "
+                    "Patient-days stratified by prop_dif_mcg_kg_min around "
+                    "T=10 mcg/kg/min, plus separate buckets for day=night=0 "
+                    "(off-drug both shifts) and day=night>0 (truly stable). "
+                    "Continuous vars report median [Q1,Q3] unless noted. "
                     "P-values: Welch's t-test / chi-sq / Kruskal–Wallis."
                 ),
                 fontsize=8,
@@ -667,9 +670,9 @@ def _(
         else:
             add_text_page(
                 _pdf,
-                "Up-titrated vs Stable Patient-days: Characteristics",
-                [f"[CSV not found: output_to_share/{SITE_NAME}/uptitrated_subcohort_characteristics.csv]",
-                 "Run code/descriptive/uptitrated_subcohort_characteristics.py to generate."],
+                "Dose-Pattern Subgroups (propofol): Characteristics",
+                [f"[CSV not found: output_to_share/{SITE_NAME}/dose_pattern_subgroup_propofol.csv]",
+                 "Run code/descriptive/dose_pattern_subgroup_characteristics.py to generate."],
             )
 
         # Page 13: Primary SBT GEE comparison

@@ -54,8 +54,8 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    analytical_df = pd.read_parquet(f"output/{SITE_NAME}/analytical_dataset.parquet")
-    print(f"Analytical dataset: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
+    analytical_df = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
+    print(f"Modeling dataset: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
     return (analytical_df,)
 
 

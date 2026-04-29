@@ -1,14 +1,22 @@
-"""Shared helpers for the nocturnal up-titration descriptive figures.
+"""Shared helpers for the diurnal-dose descriptive figures.
 
-All scripts under code/descriptive/ are pure-Python and consume
-output/analytical_dataset.parquet. This module centralizes:
+All scripts under code/descriptive/ are pure-Python and consume the
+exposure dataset (or, for the partial-shift audit specifically, the
+modeling dataset). This module centralizes:
 
-  - threshold definitions (fent > 25/hr, prop > 10/hr, midaz > 1/hr)
+  - threshold definitions (fent > 25/hr, prop > 10 mcg/kg/min, midaz > 1/hr)
   - drug label + color conventions (matching 07_descriptive.py)
   - day_n bucketing (1..7, "8+")
-  - dataset loader and figure saver
+  - dataset loaders (load_exposure() / load_modeling()) and figure saver
+  - 4-way and 6-way categorization helpers around ±threshold
 
 Edit here once to propagate across every figure.
+
+Terminology note: this module deliberately avoids the clinical term
+"up-titration"/"down-titration" (which implies goal-directed dose change).
+What we observe is purely descriptive — a higher dose at one shift than
+another, with no information about why. Group labels use neutral wording:
+"markedly higher at night" / "slightly higher at day" / etc.
 """
 
 from __future__ import annotations
@@ -43,7 +51,8 @@ SITE_NAME = _load_site_name()
 # ── Paths (project root is CWD by convention; matches 07_descriptive.py) ──
 # All outputs are site-scoped so multiple sites coexist on disk (see the
 # Makefile's SITE= flag). Phase-2 cross-site aggregation reads these dirs.
-ANALYTICAL_PARQUET = f"output/{SITE_NAME}/analytical_dataset.parquet"
+MODELING_PARQUET = f"output/{SITE_NAME}/modeling_dataset.parquet"
+EXPOSURE_PARQUET = f"output/{SITE_NAME}/exposure_dataset.parquet"
 FIGURES_DIR = f"output_to_share/{SITE_NAME}/figures"
 TABLES_DIR = f"output_to_share/{SITE_NAME}"
 
@@ -51,25 +60,29 @@ TABLES_DIR = f"output_to_share/{SITE_NAME}"
 # ── Drug-level constants ──────────────────────────────────────────────────
 DRUGS = ("prop", "fenteq", "midazeq")
 
-# Propofol uses the weight-adjusted diff column that prepare_diffs() computes
-# on load (mcg/kg/min). Fentanyl-eq and midazolam-eq use the raw hourly-rate
-# diffs from analytical_dataset.parquet directly.
+# Phase 2 (2026-04-27): propofol columns are now produced directly in
+# mcg/kg/min by 05_modeling_dataset.py — Stage A (clifpy) hands off
+# in /kg units thanks to the pre-attached weight column in 02_exposure.py,
+# so the descriptive layer no longer needs to divide by weight. Fentanyl-eq
+# and midazolam-eq still use raw hourly-rate diffs (no /kg conversion).
+# Column-name convention: `_mg_hr` = mg per hour; `_mcg_hr` = mcg per hour;
+# `_mcg_kg_min` = mcg per kg per minute (propofol only).
 DIFF_COLS = {
-    "prop": "prop_dif_kgmin",
-    "fenteq": "fenteq_dif",
-    "midazeq": "midazeq_dif",
+    "prop": "prop_dif_mcg_kg_min",
+    "fenteq": "fenteq_dif_mcg_hr",
+    "midazeq": "midazeq_dif_mg_hr",
 }
 
 DAY_COLS = {
-    "prop": "_prop_day",
-    "fenteq": "_fenteq_day",
-    "midazeq": "_midazeq_day",
+    "prop": "_prop_day_mcg_kg_min",
+    "fenteq": "_fenteq_day_mcg_hr",
+    "midazeq": "_midazeq_day_mg_hr",
 }
 
 NIGHT_COLS = {
-    "prop": "_prop_night",
-    "fenteq": "_fenteq_night",
-    "midazeq": "_midazeq_night",
+    "prop": "_prop_night_mcg_kg_min",
+    "fenteq": "_fenteq_night_mcg_hr",
+    "midazeq": "_midazeq_night_mg_hr",
 }
 
 # Clinically meaningful night-minus-day dose-rate cutoffs. Propofol uses a
@@ -100,6 +113,31 @@ DRUG_COLORS = {
     "midazeq": "mediumseagreen",
 }
 
+# Six-group dose-pattern labels (the user-requested split that separates
+# off-drug rows from real same-dose rows). Used by §5/§6 figures and the
+# paradox panel. Ordered so that the "Markedly higher at day" -> "Markedly
+# higher at night" axis reads left-to-right naturally on heatmaps.
+DOSE_PATTERN_LABELS = (
+    "Markedly higher at day",     # diff < -T
+    "Slightly higher at day",     # -T <= diff < 0
+    "Equal, both zero",           # day == 0 AND night == 0  (drug-holiday)
+    "Equal, both non-zero",       # diff == 0 AND day > 0    (truly stable)
+    "Slightly higher at night",   # 0 < diff <= +T
+    "Markedly higher at night",   # diff > +T
+)
+
+# Diverging palette tuned to the 6-way axis. Reds for night-higher, blues
+# for day-higher, neutral grays for the equal sub-cases (off-drug holiday
+# in lighter gray, truly-stable in darker gray since it's the rarer signal).
+DOSE_PATTERN_COLORS = {
+    "Markedly higher at day":     "#2166ac",  # dark blue
+    "Slightly higher at day":     "#92c5de",  # light blue
+    "Equal, both zero":           "#dddddd",  # light gray (off-drug)
+    "Equal, both non-zero":       "#9e9e9e",  # mid gray (truly-stable, rare)
+    "Slightly higher at night":   "#f4a582",  # light red
+    "Markedly higher at night":   "#b2182b",  # dark red
+}
+
 # Sensitivity knob on the weight upper bound applied inside prepare_diffs().
 # outlier_config.yaml already caps weight at 300 kg at ingestion; this env
 # var additionally clips at use-time so tightening sensitivity analyses
@@ -107,16 +145,46 @@ DRUG_COLORS = {
 # 300 requires editing the yaml and rerunning the upstream pipeline.
 MAX_WEIGHT_KG = float(os.getenv("MAX_WEIGHT_KG", "300"))
 
-# Diverging 4-color palette for the up-titration stacked bars.
-# Dark blue (big down) → light blue → light red → dark red (big up).
-# RdBu-inspired; keeps up-titrated tail in warm red for immediate reading.
+# Diverging 4-color palette for the night-vs-day stacked bars.
+# Dark blue (markedly higher at day) → light blue (slightly higher at day)
+# → light red (slightly higher at night) → dark red (markedly higher at night).
+# RdBu-inspired; keeps the night-higher tail in warm red for immediate reading.
 DIFF_BIN_COLORS = ["#2166ac", "#92c5de", "#f4a582", "#b2182b"]
 
 
 # ── Loaders + bucketing ───────────────────────────────────────────────────
+def load_modeling() -> pd.DataFrame:
+    """Load the modeling dataset (production outcome-modeling cohort).
+
+    Filtered to `_nth_day > 0 AND sbt_done_next_day IS NOT NULL AND
+    success_extub_next_day IS NOT NULL`. Drops day 0 and last day, so
+    every row has a well-defined next-day outcome. Use this for partial-
+    shift audits that should mirror what the production models see.
+    """
+    return pd.read_parquet(MODELING_PARQUET)
+
+
+def load_exposure() -> pd.DataFrame:
+    """Load the exposure dataset (full hospital-stay coverage).
+
+    Includes day 0 AND last day so the night-vs-day diurnal characterization
+    sees the full coverage of each patient's stay. Carries three flag
+    columns the figures use directly: `_partial_shift_flag`, `_is_first_day`,
+    `_is_last_day`. Default loader for every descriptive figure under this
+    module.
+    """
+    return pd.read_parquet(EXPOSURE_PARQUET)
+
+
 def load_analytical() -> pd.DataFrame:
-    """Load the analytical dataset from the default parquet path."""
-    return pd.read_parquet(ANALYTICAL_PARQUET)
+    """DEPRECATED — kept as a thin alias to load_modeling() for any straggler.
+
+    The Apr-2026 refactor split the old `analytical_dataset.parquet` into
+    `modeling_dataset.parquet` (this loader) and `exposure_dataset.parquet`
+    (the descriptive default; see `load_exposure`). New code should call
+    one of those two by name.
+    """
+    return load_modeling()
 
 
 def cap_day(df: pd.DataFrame, max_day: int = 7, col: str = "_nth_day") -> pd.DataFrame:
@@ -136,39 +204,71 @@ def cap_day(df: pd.DataFrame, max_day: int = 7, col: str = "_nth_day") -> pd.Dat
 
 
 def prepare_diffs(df: pd.DataFrame) -> pd.DataFrame:
-    """Add `prop_dif_kgmin` to `df` and return it.
+    """Pass-through for the propofol diff column.
 
-    Converts the existing mg/hr night-minus-day propofol rate into the
-    weight-adjusted mcg/kg/min convention used clinically at the bedside:
+    Phase 2 (2026-04-27): `prop_dif_mcg_kg_min` is now produced directly by
+    05_modeling_dataset.py — the upstream pipeline pre-attaches a project-
+    controlled weight column on each medication-admin row (skipping clifpy's
+    no-fallback ASOF), then converts propofol to mcg/kg/min preferred unit at
+    Stage A. The descriptive layer no longer needs to divide by weight.
 
-        mg/hr × 1000 mcg/mg / 60 min/hr / weight_kg  ≡  mcg/kg/min
-
-    Weight is clipped at MAX_WEIGHT_KG (env-var override; default 300) so
-    we can do tightening-direction sensitivity without re-running upstream.
-    Rows with missing weight propagate NaN, which downstream `.dropna()`
-    filters drop from the relevant analyses.
+    The function is kept as a thin pass-through so existing callers
+    (`night_day_diff_*`, `pct_night_vs_day_*`, `diff_tail_contribution`, etc.)
+    continue to work without changes. `MAX_WEIGHT_KG` is no longer applied
+    here; the weight clamp lives upstream in `config/outlier_config.yaml`.
     """
-    out = df.copy()
-    weight = out["weight_kg_asof_day_start"].clip(upper=MAX_WEIGHT_KG)
-    out["prop_dif_kgmin"] = out["prop_dif"] * 1000.0 / 60.0 / weight
-    return out
+    return df
 
 
-def categorize_diff(series: pd.Series, threshold: float) -> pd.Categorical:
-    """Return a 4-level ordered Categorical bucketing `series` around ±threshold.
+def categorize_diff_6way(
+    diff: pd.Series, day: pd.Series, night: pd.Series, threshold: float,
+) -> pd.Categorical:
+    """Return a 6-level ordered Categorical splitting the dose-pattern axis.
 
-    Buckets (default pd.cut right-inclusive): `(-inf, -T]`, `(-T, 0]`, `(0, T]`, `(T, inf]`.
-    Exact zero (very common — patient-days with no propofol change) lands in
-    `(-T, 0]` ("small down / no change"). Labels kept short for legend use.
+    Six neutral-terminology groups in fixed order (see DOSE_PATTERN_LABELS):
+
+        Markedly higher at day  (diff < -T)
+        Slightly higher at day  (-T <= diff < 0)
+        Equal, both zero        (day == 0 AND night == 0)        ← off-drug
+        Equal, both non-zero    (diff == 0 AND day > 0)          ← truly stable
+        Slightly higher at night (0 < diff <= +T)
+        Markedly higher at night (diff > +T)
+
+    The two `diff == 0` sub-cases are split intentionally: the off-drug-both-
+    shifts case is a drug-holiday day (very common for midazolam) and would
+    otherwise pollute the "Slightly higher at day" bucket via pd.cut's right-
+    inclusive default. Pass actual day/night columns (not just the diff) so
+    the split can read whether the equality came from 0=0 or X=X.
+
+    NaN handling: NaN rate on a shift means that shift had zero hours of
+    exposure (a partial-shift / coverage-artifact row, see
+    `_partial_shift_flag`). Such rows are TREATED AS ZERO-RATE on the missing
+    shift and re-classified accordingly, so partial-shift rows surface in
+    whichever bucket their finite-shift dose falls into rather than being
+    silently dropped. The `_partial_shift_flag` column carries the artifact
+    signal into figures' texture/overlay layer.
+
+    Returns NaN only for rows where BOTH day and night are NaN (which
+    shouldn't occur in this project's exposure_dataset).
     """
-    labels = [
-        f"< −{threshold}",
-        f"−{threshold} to 0",
-        f"0 to {threshold}",
-        f"> {threshold}",
-    ]
-    bins = [-np.inf, -threshold, 0, threshold, np.inf]
-    return pd.cut(series, bins=bins, labels=labels, ordered=True)
+    labels = list(DOSE_PATTERN_LABELS)
+    day_f = day.fillna(0).astype(float)
+    night_f = night.fillna(0).astype(float)
+    # Recompute diff from filled day/night so partial-shift rows are finite.
+    # Falls back to user-supplied diff when both day and night are present.
+    diff_use = night_f - day_f
+
+    out = pd.Series(pd.NA, index=diff_use.index, dtype="object")
+    valid = day.notna() | night.notna()  # at least one shift had observable data
+
+    out.loc[valid & (diff_use < -threshold)] = labels[0]                          # markedly day
+    out.loc[valid & (diff_use >= -threshold) & (diff_use < 0)] = labels[1]        # slightly day
+    out.loc[valid & (day_f == 0) & (night_f == 0)] = labels[2]                    # off-drug
+    out.loc[valid & (diff_use == 0) & (day_f > 0)] = labels[3]                    # truly-stable
+    out.loc[valid & (diff_use > 0) & (diff_use <= threshold)] = labels[4]         # slightly night
+    out.loc[valid & (diff_use > threshold)] = labels[5]                           # markedly night
+
+    return pd.Categorical(out, categories=labels, ordered=True)
 
 
 # ── Plotting helpers ──────────────────────────────────────────────────────
