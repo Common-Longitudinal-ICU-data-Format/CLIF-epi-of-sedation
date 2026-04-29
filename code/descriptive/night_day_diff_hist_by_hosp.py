@@ -136,7 +136,10 @@ def main() -> None:
         0.5, -0.04,
         "This is the headline aggregation in docs/descriptive_figures.md §5.4. The cohort mean here may swing "
         "in the opposite direction from the per-patient-day mean — that's the aggregation-paradox signal "
-        "(short-stay night-heavy days → fewer hospitalization-level data points). Glossary: §3.",
+        "(short-stay night-heavy days → fewer hospitalization-level data points). "
+        "Cohort: per-hospitalization mean rate-diff. Hospitalizations included if they have ≥ 1 day with "
+        "finite rate-diff; single-shift days drop within the per-hosp mean but don't disqualify the "
+        "hospitalization. Glossary: §3.",
         ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
     save_fig(fig, "night_day_diff_hist_by_hosp")

@@ -104,7 +104,10 @@ def main() -> None:
         0.5, -0.04,
         "Each bar = patient-days with diff in that bin. Histogram clipped to 1st-99th percentile. "
         "Counts in panel titles report patient-days above +T and below −T (the 6-group "
-        "Markedly-night and Markedly-day buckets). Glossary in docs/descriptive_figures.md §3.",
+        "Markedly-night and Markedly-day buckets). "
+        "Cohort: patient-day rate-diffs from the qualifying first IMV streak ≥ 24h. "
+        "Single-shift days dropped (rate-diff = NaN; can't be histogrammed). "
+        "Glossary in docs/descriptive_figures.md §3.",
         ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
     save_fig(fig, "night_day_diff_hist")

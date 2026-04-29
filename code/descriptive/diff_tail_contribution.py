@@ -164,7 +164,9 @@ def main() -> None:
         0.5, -0.02,
         "Per-panel title: cohort mean and median (over on-sedative patient-days), POS sum (Σ diff for diff>0), "
         "NEG sum (Σ |diff| for diff<0), net (= mean × n). Balanced POS ≈ NEG sums with fat tails on both sides "
-        "is the paradox mechanism. Glossary: docs/descriptive_figures.md §3.",
+        "is the paradox mechanism. "
+        "Cohort: patient-day rate-diffs (finite values only). Single-shift days dropped (rate-diff = NaN). "
+        "Glossary: docs/descriptive_figures.md §3.",
         ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
     save_fig(fig, "diff_tail_contribution")

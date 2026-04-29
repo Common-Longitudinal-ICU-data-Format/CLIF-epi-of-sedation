@@ -91,11 +91,11 @@ def _panel_a_stacked_histogram(ax, df: pd.DataFrame, drug: str) -> None:
     thr = THRESHOLDS[drug]
     series = df[diff_col]
 
-    # Drop the "Equal, both zero" rows from the histogram — they would all
+    # Drop the "Not receiving that day" rows from the histogram — they would all
     # collapse onto a single x=0 spike that drowns the rest of the shape.
     # Their count is reported in the annotation instead.
     cat = df["_pattern"]
-    drawable_mask = cat != "Equal, both zero"
+    drawable_mask = cat != "Not receiving that day"
     drawable = series[drawable_mask].dropna()
     if len(drawable) == 0:
         ax.text(0.5, 0.5, "no data", transform=ax.transAxes, ha="center", va="center")
@@ -111,7 +111,7 @@ def _panel_a_stacked_histogram(ax, df: pd.DataFrame, drug: str) -> None:
     stack_colors = []
     stack_labels = []
     for label in DOSE_PATTERN_LABELS:
-        if label == "Equal, both zero":
+        if label == "Not receiving that day":
             continue
         sub = df.loc[drawable_mask & (cat == label), diff_col].dropna()
         sub = sub[(sub >= lo) & (sub <= hi)]
@@ -140,7 +140,7 @@ def _panel_a_stacked_histogram(ax, df: pd.DataFrame, drug: str) -> None:
             transform=ax.transAxes, ha="right", va="top",
             fontsize=8, color="red")
 
-    n_dropped = int((cat == "Equal, both zero").sum())
+    n_dropped = int((cat == "Not receiving that day").sum())
     n_single = int(df["_single_shift_day"].fillna(False).sum())
     n_total = len(df)
     ax.text(

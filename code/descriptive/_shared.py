@@ -125,8 +125,8 @@ DRUG_COLORS = {
 DOSE_PATTERN_LABELS = (
     "Markedly higher at day",     # diff < -T
     "Slightly higher at day",     # -T <= diff < 0
-    "Equal, both zero",           # day == 0 AND night == 0  (drug-holiday)
-    "Equal, both non-zero",       # diff == 0 AND day > 0    (truly stable)
+    "Not receiving that day",           # day == 0 AND night == 0  (drug-holiday)
+    "Receiving and equal",       # diff == 0 AND day > 0    (truly stable)
     "Slightly higher at night",   # 0 < diff <= +T
     "Markedly higher at night",   # diff > +T
 )
@@ -137,24 +137,24 @@ DOSE_PATTERN_LABELS = (
 DOSE_PATTERN_COLORS = {
     "Markedly higher at day":     "#2166ac",  # dark blue
     "Slightly higher at day":     "#92c5de",  # light blue
-    "Equal, both zero":           "#dddddd",  # light gray (off-drug)
-    "Equal, both non-zero":       "#9e9e9e",  # mid gray (truly-stable, rare)
+    "Not receiving that day":           "#dddddd",  # light gray (off-drug)
+    "Receiving and equal":       "#9e9e9e",  # mid gray (truly-stable, rare)
     "Slightly higher at night":   "#f4a582",  # light red
     "Markedly higher at night":   "#b2182b",  # dark red
 }
 
 # Stack order for count-by-ICU-day bar charts. Differs from
-# DOSE_PATTERN_LABELS: the drug-holiday band ("Equal, both zero") is moved
+# DOSE_PATTERN_LABELS: the drug-holiday band ("Not receiving that day") is moved
 # to the TOP of the bar so total bar height = cohort survivors and the
 # on-drug zone (the 5 remaining areas) sits as a contiguous bottom block.
 # See descriptive_figures.md §6.0.
 COUNT_BAR_STACK_ORDER = (
     "Markedly higher at day",
     "Slightly higher at day",
-    "Equal, both non-zero",       # on-drug, no diff
+    "Receiving and equal",       # on-drug, no diff
     "Slightly higher at night",
     "Markedly higher at night",
-    "Equal, both zero",           # off-drug — placed last (top of bar)
+    "Not receiving that day",           # off-drug — placed last (top of bar)
 )
 
 # Sensitivity knob on the weight upper bound applied inside prepare_diffs().
@@ -248,8 +248,8 @@ def categorize_diff_6way(
 
         Markedly higher at day  (diff < -T)
         Slightly higher at day  (-T <= diff < 0)
-        Equal, both zero        (day == 0 AND night == 0)        ← off-drug
-        Equal, both non-zero    (diff == 0 AND day > 0)          ← truly stable
+        Not receiving that day        (day == 0 AND night == 0)        ← off-drug
+        Receiving and equal    (diff == 0 AND day > 0)          ← truly stable
         Slightly higher at night (0 < diff <= +T)
         Markedly higher at night (diff > +T)
 
@@ -288,16 +288,6 @@ def categorize_diff_6way(
     out.loc[valid & (diff_use > threshold)] = labels[5]                           # markedly night
 
     return pd.Categorical(out, categories=labels, ordered=True)
-
-
-def split_full_vs_single(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split a per-day frame into (full_coverage, single_shift) by `_single_shift_day`.
-
-    Companion figures (`*_hatched`, `*_split`) need both subsets to render the
-    artifact contribution; centralizing the split keeps the two scripts in lockstep.
-    """
-    is_single = df["_single_shift_day"].astype(bool)
-    return df.loc[~is_single].copy(), df.loc[is_single].copy()
 
 
 # ── Plotting helpers ──────────────────────────────────────────────────────

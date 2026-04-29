@@ -99,8 +99,10 @@ def main() -> None:
     fig.text(
         0.5, -0.03,
         "Each violin = distribution of diff for one ICU-day bin (width ∝ density at that y-level). "
-        "Sister figure to `night_day_diff_mean_by_icu_day.png` — narrowing violins left-to-right indicate "
-        "shift-to-shift dosing converging as patients stabilize. Glossary: docs/descriptive_figures.md §3.",
+        "Sister figure to `night_day_diff_combined_by_icu_day.png` — narrowing violins left-to-right "
+        "indicate shift-to-shift dosing converging as patients stabilize. "
+        "Cohort: patient-day rate-diffs by ICU day. Single-shift days dropped silently via `dropna()` "
+        "(rate-diff = NaN). Glossary: docs/descriptive_figures.md §3.",
         ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
     save_fig(fig, "night_day_diff_violin_by_icu_day")
