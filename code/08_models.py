@@ -63,174 +63,30 @@ def _(cohort_merged_final):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## GEE: SBT Done Next Day
+    ## Retired cells (2026-05-01)
+
+    Three standalone cells that fitted `sbt_done_next_day` as the primary
+    SBT outcome were retired in this round:
+
+    - **Standalone GEE for `sbt_done_next_day`** — produced
+      `gee_summary.csv` + `gee_covmat.csv`.
+    - **VIF diagnostic for the same SBT formula** — produced
+      `vif_sbt_rate.csv`.
+    - **Day-0 SA GEE** (refit on `exposure_dataset.parquet` with
+      day-0 rows included) — produced `gee_summary_day0.csv` +
+      `gee_covmat_day0.csv`.
+
+    `sbt_done_next_day` is no longer in `MODEL_CONFIGS`, so these
+    standalone cells produced orphan artifacts and noisy
+    cluster-robust-covariance warnings. SBT outcomes the team is now
+    reporting (sbt_elig, sbt_done_subira, sbt_done_abc, sbt_done_v2,
+    sbt_done_prefix) are fitted by the cross-product loop below and
+    appear in `model_comparison_*.csv` + `forest_*.png` artifacts.
+
+    Original code preserved in git history; see
+    `~/.claude/plans/2-related-tasks-around-memoized-hartmanis.md`
+    for the retire decision context.
     """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_final, pd):
-    import statsmodels.formula.api as _smf
-    import statsmodels.api as _sm
-    sbt_done_formula = """sbt_done_next_day ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
-    _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
-    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
-    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
-    """
-    gee_model = _smf.gee(formula=sbt_done_formula, groups='hospitalization_id', data=cohort_merged_final, family=_sm.families.Binomial())
-    gee_result = gee_model.fit()
-    print(gee_result.summary())
-    _summary_df = gee_result.summary().tables[1]
-    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/gee_summary.csv', index=False)
-    _cov_matrix = gee_result.cov_params()
-    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/gee_covmat.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/models/gee_summary.csv, gee_covmat.csv")
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ### Multicollinearity diagnostic (VIF) — `vif_sbt_rate.csv`
-
-    Variance inflation factor for each continuous regressor in the primary
-    rate-parameterization GEE. VIF_j = 1 / (1 − R²_j) where R²_j is from
-    regressing predictor *j* on all other predictors. Categorical dummies are
-    excluded — their VIF interpretation is awkward and they aren't the
-    suspected source of the OR-reversal pattern.
-
-    The six dose terms have a built-in linear-combination structure
-    (`*_dif_*` = night − day), so high VIF on any of them would flag that
-    redundancy as a candidate explanation for the counterintuitive OR > 1 sign
-    on `*_dif_*` coefficients post-Phase-4.
-
-    Rule of thumb: VIF > 5 is moderate, > 10 is severe, ≥ 20 is typically
-    enough to flip a coefficient sign.
-    """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_final, pd):
-    from patsy import dmatrix as _dmatrix
-    from statsmodels.stats.outliers_influence import (
-        variance_inflation_factor as _vif_fn,
-    )
-    _vif_terms = (
-        "prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
-        "_prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr + "
-        "ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + "
-        "nee_7am + nee_7pm + age + _nth_day + sofa_total + cci_score"
-    )
-    _X = _dmatrix(_vif_terms, data=cohort_merged_final, return_type='dataframe').dropna()
-    _vif_rows = []
-    for _i, _name in enumerate(_X.columns):
-        if _name == 'Intercept':
-            continue
-        _vif_rows.append({'term': _name, 'vif': _vif_fn(_X.values, _i)})
-    _vif_df = pd.DataFrame(_vif_rows).sort_values('vif', ascending=False)
-    _vif_path = f'output_to_share/{SITE_NAME}/models/vif_sbt_rate.csv'
-    _vif_df.to_csv(_vif_path, index=False)
-    print(_vif_df.to_string(index=False))
-    print(
-        f"Severe (VIF>10): {(_vif_df['vif'] > 10).sum()}; "
-        f"Moderate (5<VIF≤10): {((_vif_df['vif'] > 5) & (_vif_df['vif'] <= 10)).sum()}"
-    )
-    print(f"Saved {_vif_path}")
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ### Sensitivity (day-0 included) — `gee_summary_day0.csv`
-
-    Same primary rate-parameterization GEE as the production cell above, but
-    fit on `exposure_dataset.parquet` — the exposure-characterization sibling
-    that retains day 0 (the partial admission day before the first 7am,
-    normally excluded by the `_nth_day > 0` filter) AND last-day rows. Rate
-    divisors in that dataset use `NULLIF(n_hours_*, 0)` so single-shift
-    normalization is correct; day-1+ rows are numerically identical to
-    production. The next-day-outcome filter is applied inline below so the
-    day-0 SA model fits the same modeling cohort as production plus the day-0
-    rows.
-
-    The diagnostic question this answers: does excluding day 0 contribute to
-    the counterintuitive OR > 1 sign on dose-rate coefficients? If signs
-    persist on the day-0 fit, the issue is elsewhere (e.g., multicollinearity
-    per the VIF cell above). If signs flip, day-0 inclusion materially changes
-    the picture.
-    """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, pd):
-    import statsmodels.formula.api as _smf_d0
-    import statsmodels.api as _sm_d0
-    _df_day0 = pd.read_parquet(f"output/{SITE_NAME}/exposure_dataset.parquet")
-    # Apply the next-day-outcome filter that the exposure parquet doesn't
-    # apply globally (since exposure characterization wants last-day rows).
-    # This restores the day-0 SA cohort = production modeling cohort + day-0
-    # rows that have a next day.
-    _df_day0 = _df_day0[
-        _df_day0['sbt_done_next_day'].notna()
-        & _df_day0['success_extub_next_day'].notna()
-    ].reset_index(drop=True)
-    _n_day0_rows = (_df_day0['_nth_day'] == 0).sum()
-    print(f"[day-0] Loaded {len(_df_day0)} rows ({_n_day0_rows} are day-0 rows)")
-    sbt_done_formula_d0 = """sbt_done_next_day ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr +
-    _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr +
-    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
-    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
-    """
-    _gee_d0 = _smf_d0.gee(
-        formula=sbt_done_formula_d0,
-        groups='hospitalization_id',
-        data=_df_day0,
-        family=_sm_d0.families.Binomial(),
-    ).fit()
-    _summary_df = _gee_d0.summary().tables[1]
-    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/gee_summary_day0.csv', index=False)
-    _gee_d0.cov_params().to_csv(f'output_to_share/{SITE_NAME}/models/gee_covmat_day0.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/models/gee_summary_day0.csv, gee_covmat_day0.csv")
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ### Sensitivity (absolute amounts, per 12-h shift) — `gee_summary_amount.csv`
-
-    Same GEE structure as the rate-based production model above, but exposures
-    are total mg / mcg over each 12-hour shift (the pre-2026-04-24
-    parameterization). For full 12-hour shifts (everything in this dataset
-    post-filter), amount = rate × 12 exactly, so coefficients should match
-    the rate model up to a unit rescaling. Any larger discrepancy is a
-    data-quality canary.
-    """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_final, pd):
-    import statsmodels.formula.api as _smf_amt
-    import statsmodels.api as _sm_amt
-    sbt_done_formula_amt = """sbt_done_next_day ~ prop_dif_mcg_kg + fenteq_dif_mcg + midazeq_dif_mg +
-    _prop_day_mcg_kg + _midazeq_day_mg + _fenteq_day_mcg +
-    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
-    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
-    """
-    gee_model_amt = _smf_amt.gee(formula=sbt_done_formula_amt, groups='hospitalization_id', data=cohort_merged_final, family=_sm_amt.families.Binomial())
-    gee_result_amt = gee_model_amt.fit()
-    _summary_df = gee_result_amt.summary().tables[1]
-    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/gee_summary_amount.csv', index=False)
-    _cov_matrix = gee_result_amt.cov_params()
-    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/gee_covmat_amount.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/models/gee_summary_amount.csv, gee_covmat_amount.csv")
     return
 
 
@@ -271,44 +127,6 @@ def _(SITE_NAME, cohort_merged_final, pd):
     _cov_matrix = logit_result.cov_params()
     _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/logit_covmat.csv')
     print(f"Saved output_to_share/{SITE_NAME}/models/logit_summary.csv, logit_covmat.csv")
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ### Sensitivity (absolute amounts, per 12-h shift) — `logit_summary_amount.csv`
-
-    Mirror of the production logit above using the per-shift total exposures.
-    """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_final, pd):
-    import statsmodels.formula.api as _smf_amt
-    success_extub_formula_amt = """success_extub_next_day ~ prop_dif_mcg_kg + fenteq_dif_mcg + midazeq_dif_mg +
-    _prop_day_mcg_kg + _midazeq_day_mg + _fenteq_day_mcg +
-    ph_level_7am + ph_level_7pm + pf_level_7am + pf_level_7pm + nee_7am + nee_7pm +
-    age + _nth_day + sofa_total + cci_score + C(sex_category) + C(icu_type)
-    """
-    _logit_amt_cols = [
-        'prop_dif_mcg_kg', 'fenteq_dif_mcg', 'midazeq_dif_mg',
-        '_prop_day_mcg_kg', '_midazeq_day_mg', '_fenteq_day_mcg',
-        'ph_level_7am', 'ph_level_7pm', 'pf_level_7am', 'pf_level_7pm',
-        'nee_7am', 'nee_7pm', 'age', '_nth_day', 'sofa_total', 'cci_score',
-        'sex_category', 'icu_type', 'success_extub_next_day',
-        'hospitalization_id',
-    ]
-    _logit_amt_df = cohort_merged_final.dropna(subset=_logit_amt_cols)
-    logit_model_amt = _smf_amt.logit(formula=success_extub_formula_amt, data=_logit_amt_df)
-    logit_result_amt = logit_model_amt.fit(cov_type='cluster', cov_kwds={'groups': _logit_amt_df['hospitalization_id']})
-    _summary_df = logit_result_amt.summary().tables[1]
-    _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
-    _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/logit_summary_amount.csv', index=False)
-    _cov_matrix = logit_result_amt.cov_params()
-    _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/logit_covmat_amount.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/models/logit_summary_amount.csv, logit_covmat_amount.csv")
     return
 
 
@@ -358,30 +176,24 @@ def _():
     # Scales below: propofol "per 10 mcg/kg/min" matches typical pump
     # titration steps (5–25 mcg/kg/min increments).
     VAR_DISPLAY = {
-        # Exposures (day-night rate differences) — production
+        # Exposures (day-night rate differences)
         'prop_dif_mcg_kg_min': {'scale': 10,  'label': 'Δ propofol (per 10 mcg/kg/min)'},
         'fenteq_dif_mcg_hr':   {'scale': 10,  'label': 'Δ fentanyl eq (per 10 mcg/hr)'},
         'midazeq_dif_mg_hr':   {'scale': 0.1, 'label': 'Δ midazolam eq (per 0.1 mg/hr)'},
-        # Daytime absolute rates (production)
+        # Daytime absolute rates
         '_prop_day_mcg_kg_min': {'scale': 10,  'label': 'Daytime propofol (per 10 mcg/kg/min)'},
         '_fenteq_day_mcg_hr':   {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
         '_midazeq_day_mg_hr':   {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
-        # Sensitivity: absolute amounts per 12-h shift. For propofol, the
-        # absolute amount is now in mcg/kg (was mg). 720 mcg/kg over 12h
-        # ≈ 1 mcg/kg/min × 60 × 12; "per 120 mcg/kg" is comparable to
-        # "per 10 mcg/kg/min × 12 min ≈ 120" (rough order-of-magnitude match).
-        'prop_dif_mcg_kg': {'scale': 120, 'label': 'Δ propofol (per 120 mcg/kg over 12h)'},
-        'fenteq_dif_mcg':  {'scale': 120, 'label': 'Δ fentanyl eq (per 120 mcg over 12h)'},
-        'midazeq_dif_mg':  {'scale': 1.2, 'label': 'Δ midazolam eq (per 1.2 mg over 12h)'},
-        '_prop_day_mcg_kg': {'scale': 120, 'label': 'Daytime propofol (per 120 mcg/kg)'},
-        '_fenteq_day_mcg':  {'scale': 120, 'label': 'Daytime fentanyl eq (per 120 mcg)'},
-        '_midazeq_day_mg':  {'scale': 1.2, 'label': 'Daytime midazolam eq (per 1.2 mg)'},
-        # Other continuous covariates (unchanged)
+        # Other continuous covariates
         'age':          {'scale': 1,   'label': 'Age (per year)'},
         'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
         'sofa_total':   {'scale': 1,   'label': 'SOFA total (per point)'},
         'nee_7am':      {'scale': 0.1, 'label': 'NEE 7am (per 0.1 mcg/kg/min)'},
         'nee_7pm':      {'scale': 0.1, 'label': 'NEE 7pm (per 0.1 mcg/kg/min)'},
+        # Body habitus (sensitivity-spec-only covariates; only appear in the
+        # sofa_weight / sofa_bmi rows of the wide CSV, not in forest plots).
+        'weight_kg':    {'scale': 10,  'label': 'Weight (per 10 kg)'},
+        'bmi':          {'scale': 5,   'label': 'BMI (per 5 kg/m²)'},
     }
     return (VAR_DISPLAY,)
 
@@ -401,10 +213,13 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
             _df_scaled[_col] = _df_scaled[_col] / _info['scale']
 
     # ── Fit functions ──────────────────────────────────────────────────
+    # maxiter=100 raised from statsmodels defaults (Logit=35, GEE=60) so the
+    # RCS-extub-logit fit (~37 coefficients) has headroom to converge instead
+    # of stopping at the cap.
     def _fit_gee(formula, data):
         m = smf.gee(formula=formula, groups='hospitalization_id',
                     data=data, family=sm.families.Binomial())
-        return m.fit()
+        return m.fit(maxiter=100)
 
     def _fit_logit(formula, data):
         # Drop rows with NaN in any column referenced by the formula so the
@@ -418,10 +233,13 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         _d = data.dropna(subset=_names)
         m = smf.logit(formula=formula, data=_d)
         return m.fit(cov_type='cluster',
-                     cov_kwds={'groups': _d['hospitalization_id']})
+                     cov_kwds={'groups': _d['hospitalization_id']},
+                     maxiter=100)
 
     # ── Dimension 1: nested covariate sets (all include exposures) ────
-    # PRODUCTION parameterization: rate-based exposures (mg/hr, mcg/hr)
+    # Rate-based exposures (mcg/kg/min for propofol, mcg/hr for fentanyl,
+    # mg/hr for midazolam). Amount-based parameterization was retired in the
+    # 2026-04-29 model-update round — rate-only going forward.
     BASELINE = ("{{outcome}} ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
                 "age + C(sex_category) + C(icu_type) + cci_score")
     DAYDOSE = BASELINE + " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
@@ -433,9 +251,8 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # Wraps the 6 exposure variables in patsy's cr() transform for natural
     # cubic regression splines with df=4 (→ 3 basis columns per variable).
     # Non-exposure adjustment variables stay linear/categorical.
-    # Used for marginal-effect plots (curves can bend to reveal dose-response
-    # shape) but excluded from the wide comparison CSV — cr() basis coefficients
-    # aren't human-interpretable as OR-per-unit. See plan_rcs_exposures.md memory.
+    # Coefficients aren't human-interpretable as OR-per-unit, so the wide CSV
+    # excludes them; the forest plot summarizes via 10→90 percentile OR.
     SOFA_RCS = (
         "{{outcome}} ~ "
         "cr(prop_dif_mcg_kg_min, df=4) + cr(fenteq_dif_mcg_hr, df=4) + cr(midazeq_dif_mg_hr, df=4) + "
@@ -443,109 +260,98 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
-    # SENSITIVITY parameterization: absolute amounts (mg, mcg) per 12-h shift.
-    # Mirrors the production specs above with bare _mg / _mcg column names.
-    BASELINE_AMOUNT = ("{{outcome}} ~ prop_dif_mcg_kg + fenteq_dif_mcg + midazeq_dif_mg + "
-                       "age + C(sex_category) + C(icu_type) + cci_score")
-    DAYDOSE_AMOUNT = BASELINE_AMOUNT + " + _prop_day_mcg_kg + _midazeq_day_mg + _fenteq_day_mcg"
-    SOFA_AMOUNT = DAYDOSE_AMOUNT + " + sofa_total"
-    CLINICAL_AMOUNT = DAYDOSE_AMOUNT + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
-                                       "pf_level_7pm + nee_7am + nee_7pm")
-    SOFA_RCS_AMOUNT = (
-        "{{outcome}} ~ "
-        "cr(prop_dif_mcg_kg, df=4) + cr(fenteq_dif_mcg, df=4) + cr(midazeq_dif_mg, df=4) + "
-        "cr(_prop_day_mcg_kg, df=4) + cr(_fenteq_day_mcg, df=4) + cr(_midazeq_day_mg, df=4) + "
-        "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
-    )
+    # Body-habitus sensitivity siblings of SOFA. Hypothesis: propofol exposure
+    # is already mcg/kg/min (weight-normalized at the source), but if body
+    # habitus correlates with sedation practice (titration heuristics use
+    # visual habitus more than literal weight) AND with extubation success
+    # (BMI extremes both reduce success), the model needs explicit habitus
+    # adjustment to remove residual confounding. BMI subcohort attrition at
+    # MIMIC is large (height_cm sparsely charted) — _fit_logit's per-spec
+    # dropna handles it; the wide CSV's N column will surface it.
+    SOFA_WEIGHT = SOFA + " + weight_kg"
+    SOFA_BMI    = SOFA + " + bmi"
 
-    # Nested specs grouped by parameterization. Both lists share spec labels
-    # ('baseline', 'daydose', ...) so the wide-table builder can compare them
-    # side-by-side at the cost of a parameterization suffix on the filename.
-    COVARIATE_SPECS_BY_PARAM = {
-        'rate': [
-            {'label': 'baseline', 'formula': BASELINE},
-            {'label': 'daydose',  'formula': DAYDOSE},
-            {'label': 'sofa',     'formula': SOFA},
-            {'label': 'clinical', 'formula': CLINICAL},
-            {'label': 'sofa_rcs', 'formula': SOFA_RCS},
-        ],
-        'amount': [
-            {'label': 'baseline', 'formula': BASELINE_AMOUNT},
-            {'label': 'daydose',  'formula': DAYDOSE_AMOUNT},
-            {'label': 'sofa',     'formula': SOFA_AMOUNT},
-            {'label': 'clinical', 'formula': CLINICAL_AMOUNT},
-            {'label': 'sofa_rcs', 'formula': SOFA_RCS_AMOUNT},
-        ],
-    }
-
-    # ── Dimension 2: outcome x model type ─────────────────────────────
-    # Primary outcomes get fit in BOTH rate and amount parameterizations.
-    # SBT sensitivity siblings (anyprior / imv6h / prefix / 2min) are
-    # rate-only — rate↔amount agreement was already established at perfect
-    # ratio = 144.000 = 12² for the spec-literal primary, so triplicate
-    # amount fits for siblings would add no diagnostic information.
-    MODEL_CONFIGS = [
-        {'outcome': 'sbt_done_next_day',          'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'success_extub_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'success_extub_next_day',     'model_type': 'logit', 'fit_fn': _fit_logit},
-        # SBT sensitivity siblings (rate parameterization only)
-        {'outcome': 'sbt_done_anyprior_next_day', 'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'sbt_done_imv6h_next_day',    'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'sbt_done_prefix_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'sbt_done_2min_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'sbt_done_subira_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'sbt_done_abc_next_day',      'model_type': 'gee',   'fit_fn': _fit_gee},
+    COVARIATE_SPECS = [
+        {'label': 'baseline',    'formula': BASELINE},
+        {'label': 'daydose',     'formula': DAYDOSE},
+        {'label': 'sofa',        'formula': SOFA},
+        {'label': 'clinical',    'formula': CLINICAL},
+        {'label': 'sofa_rcs',    'formula': SOFA_RCS},
+        {'label': 'sofa_weight', 'formula': SOFA_WEIGHT},
+        {'label': 'sofa_bmi',    'formula': SOFA_BMI},
     ]
 
-    # Outcomes restricted to rate parameterization only (skip amount fit).
+    # ── Dimension 2: outcome x model type ─────────────────────────────
+    # Working baselines (preserved unchanged this round): sbt_done, sbt_done_abc,
+    # success_extub, _success_extub. v2 family (added in 2026-04-29 model-update
+    # round) lives alongside as challengers — same 5 covariate specs run against
+    # all 15 (outcome, model_type) configs.
+    # NOTE (2026-05-01): roster trimmed to the seven outcomes the team is
+    # actively reporting. Retired outcomes are kept as commented-out lines
+    # below for easy revert — paste them back into MODEL_CONFIGS to restore.
+    # Convention: SBT outcomes are GEE-only (cluster-robust logit removed
+    # by user direction); extubation outcomes keep both gee + logit.
+    MODEL_CONFIGS = [
+        # — extubation (gee + logit) —
+        {'outcome': 'success_extub_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'success_extub_next_day',     'model_type': 'logit', 'fit_fn': _fit_logit},
+        {'outcome': 'success_extub_v2_next_day',  'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'success_extub_v2_next_day',  'model_type': 'logit', 'fit_fn': _fit_logit},
+        # — SBT outcomes (gee only) —
+        {'outcome': 'sbt_done_prefix_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_subira_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_abc_next_day',      'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_elig_next_day',          'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_v2_next_day',       'model_type': 'gee',   'fit_fn': _fit_gee},
+        # — RETIRED 2026-05-01 (paste back into MODEL_CONFIGS to revert) —
+        # {'outcome': 'sbt_done_next_day',          'model_type': 'gee',   'fit_fn': _fit_gee},
+        # {'outcome': 'sbt_done_anyprior_next_day', 'model_type': 'gee',   'fit_fn': _fit_gee},
+        # {'outcome': 'sbt_done_imv6h_next_day',    'model_type': 'gee',   'fit_fn': _fit_gee},
+        # {'outcome': 'sbt_done_2min_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
+    ]
+
+    # Outcomes that are GEE-only siblings (skipped from marginal-effect plots
+    # to keep the figure roster from exploding; the forest plot covers them).
+    # 2026-05-01: trimmed to kept SBT siblings only.
     SBT_VARIANT_OUTCOMES = {
-        'sbt_done_anyprior_next_day',
-        'sbt_done_imv6h_next_day',
         'sbt_done_prefix_next_day',
-        'sbt_done_2min_next_day',
         'sbt_done_subira_next_day',
         'sbt_done_abc_next_day',
     }
 
-    # ── Cross-product loop: now also iterates over parameterization
-    # Key shape: (outcome, model_type, param) → {spec_label: result}
+    # ── Cross-product loop ─────────────────────────────────────────────
+    # Key shape: (outcome, model_type) → {spec_label: result}
     fitted = {}
-    for _param, _specs in COVARIATE_SPECS_BY_PARAM.items():
-        for _config in MODEL_CONFIGS:
-            # Variants are rate-only (see SBT_VARIANT_OUTCOMES comment above)
-            if _config['outcome'] in SBT_VARIANT_OUTCOMES and _param == 'amount':
-                continue
-            _key = (_config['outcome'], _config['model_type'], _param)
-            fitted[_key] = {}
-            for _spec in _specs:
-                _formula = _spec['formula'].replace('{{outcome}}', _config['outcome'])
-                try:
-                    _result = _config['fit_fn'](_formula, _df_scaled)
-                    fitted[_key][_spec['label']] = _result
-                    print(f"  OK: {_param} / {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
-                except Exception as e:
-                    print(f"  FAIL: {_param} / {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
+    for _config in MODEL_CONFIGS:
+        _key = (_config['outcome'], _config['model_type'])
+        fitted[_key] = {}
+        for _spec in COVARIATE_SPECS:
+            _formula = _spec['formula'].replace('{{outcome}}', _config['outcome'])
+            try:
+                _result = _config['fit_fn'](_formula, _df_scaled)
+                fitted[_key][_spec['label']] = _result
+                print(f"  OK: {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
+            except Exception as e:
+                print(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
     return MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fitted, np, re
 
 
 @app.cell
 def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
     # ── Long-format CSV (federated-friendly) ──────────────────────────
-    # Now carries a 'parameterization' column ('rate' vs 'amount') so the
-    # row identifier is (outcome, model_type, parameterization, sensitivity).
-    def _extract_long(result, label, outcome, model_type, parameterization):
+    # Row identifier: (outcome, model_type, sensitivity).
+    def _extract_long(result, label, outcome, model_type):
         _tbl = result.summary().tables[1]
         _row = pd.DataFrame(_tbl.data[1:], columns=_tbl.data[0])
         _row['sensitivity'] = label
         _row['outcome'] = outcome
         _row['model_type'] = model_type
-        _row['parameterization'] = parameterization
         return _row
 
     sa_results = []
-    for (_outcome, _mt, _param), _spec_dict in fitted.items():
+    for (_outcome, _mt), _spec_dict in fitted.items():
         for _label, _result in _spec_dict.items():
-            sa_results.append(_extract_long(_result, _label, _outcome, _mt, _param))
+            sa_results.append(_extract_long(_result, _label, _outcome, _mt))
     sa_all = pd.concat(sa_results, ignore_index=True)
     _sa_path = f'output_to_share/{SITE_NAME}/models/sensitivity_analysis.csv'
     sa_all.to_csv(_sa_path, index=False)
@@ -589,39 +395,41 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
         _tbl.index.name = 'Variable'
         return _tbl
 
-    # Filename convention: rate parameterization keeps the production file
-    # name unsuffixed (`model_comparison_sbt_gee.csv`); amount is sibling
-    # suffixed (`model_comparison_sbt_gee_amount.csv`). SBT sensitivity
-    # siblings get suffixed short-names so each variant gets its own
-    # CSV (otherwise all "sbt"-containing outcomes would collapse).
-    _OUTCOME_SHORT = {
-        'sbt_done_next_day':          'sbt',
-        'sbt_done_anyprior_next_day': 'sbt_anyprior',
-        'sbt_done_imv6h_next_day':    'sbt_imv6h',
-        'sbt_done_prefix_next_day':   'sbt_prefix',
-        'sbt_done_2min_next_day':     'sbt_2min',
-        'sbt_done_subira_next_day':   'sbt_subira',
-        'sbt_done_abc_next_day':      'sbt_abc',
-        'success_extub_next_day':     'extub',
+    # Filename convention (2026-05-01): use full outcome names with the
+    # `_next_day` suffix stripped. Older abbreviations (`sbt`, `extub`,
+    # etc.) replaced with explicit names per user direction. Retired
+    # outcomes preserved as commented-out lines for revert.
+    OUTCOME_SHORT = {
+        'success_extub_next_day':     'success_extub',
+        'success_extub_v2_next_day':  'success_extub_v2',
+        'sbt_done_prefix_next_day':   'sbt_done_prefix',
+        'sbt_done_subira_next_day':   'sbt_done_subira',
+        'sbt_done_abc_next_day':      'sbt_done_abc',
+        'sbt_elig_next_day':          'sbt_elig',
+        'sbt_done_v2_next_day':       'sbt_done_v2',
+        # — RETIRED 2026-05-01 (paste back into the dict to restore) —
+        # 'sbt_done_next_day':          'sbt_done',
+        # 'sbt_done_anyprior_next_day': 'sbt_done_anyprior',
+        # 'sbt_done_imv6h_next_day':    'sbt_done_imv6h',
+        # 'sbt_done_2min_next_day':     'sbt_done_2min',
     }
     for _config in MODEL_CONFIGS:
-        for _param in ['rate', 'amount']:
-            _key = (_config['outcome'], _config['model_type'], _param)
-            if _key not in fitted or not fitted[_key]:
-                continue
-            _outcome_short = _OUTCOME_SHORT.get(_config['outcome'], _config['outcome'])
-            _suffix = '' if _param == 'rate' else '_amount'
-            _fname = f"output_to_share/{SITE_NAME}/models/model_comparison_{_outcome_short}_{_config['model_type']}{_suffix}.csv"
-            # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
-            # as OR-per-unit. The RCS results are still exported in the long-format
-            # sensitivity_analysis.csv above, and visualized via marginal-effect plots.
-            _results_for_table = {
-                _k: _v for _k, _v in fitted[_key].items() if _k != 'sofa_rcs'
-            }
-            _wide = build_wide_table(_results_for_table)
-            _wide.to_csv(_fname)
-            print(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
-    return
+        _key = (_config['outcome'], _config['model_type'])
+        if _key not in fitted or not fitted[_key]:
+            continue
+        _outcome_short = OUTCOME_SHORT.get(_config['outcome'], _config['outcome'])
+        _fname = f"output_to_share/{SITE_NAME}/models/model_comparison_{_outcome_short}_{_config['model_type']}.csv"
+        # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
+        # as OR-per-unit. The RCS results are still exported in the long-format
+        # sensitivity_analysis.csv above, and summarized in the forest plot via
+        # the 10→90 percentile-OR rescaling.
+        _results_for_table = {
+            _k: _v for _k, _v in fitted[_key].items() if _k != 'sofa_rcs'
+        }
+        _wide = build_wide_table(_results_for_table)
+        _wide.to_csv(_fname)
+        print(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
+    return (OUTCOME_SHORT,)
 
 
 # ── Marginal Effect Plots ─────────────────────────────────────────────
@@ -647,7 +455,7 @@ def _():
 
 
 @app.cell
-def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
+def _(OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
     # `np` is inherited from the fitting cell (returned above) to avoid the
     # marimo "multiple definitions" error. `_plt` is private (underscore
     # prefix) so it doesn't collide with any future cell that imports plt.
@@ -670,6 +478,9 @@ def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted,
     Y_LABEL = {
         'sbt_done_next_day': 'Probability of Passing SBT',
         'success_extub_next_day': 'Probability of Successful Extubation',
+        'sbt_elig_next_day': 'Probability of SBT Eligibility',
+        'sbt_done_v2_next_day': 'Probability of Passing SBT (v2)',
+        'success_extub_v2_next_day': 'Probability of Successful Extubation (v2)',
     }
 
     def _build_reference_row(df_scaled):
@@ -796,7 +607,7 @@ def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted,
         )
         fig.tight_layout()
 
-        _outcome_short = 'sbt' if 'sbt' in outcome else 'extub'
+        _outcome_short = OUTCOME_SHORT.get(outcome, outcome)
         out_path = (
             f"output_to_share/{SITE_NAME}/models/"
             f"marginal_effects_{_outcome_short}_{model_type}_{spec_label}.png"
@@ -807,20 +618,13 @@ def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted,
         return out_path
 
     # Generate one 2×3 figure per (outcome, model_type, spec).
-    # PLOT_SPECS controls which spec(s) to plot. We generate BOTH the linear
-    # `sofa` spec AND the RCS `sofa_rcs` spec so reviewers can visually compare
-    # them — if the RCS curve looks straight, that's a "no nonlinearity detected"
-    # signal without needing a formal p-value threshold. Plotting both specs
-    # also gives a stronger methods story than pre-specifying one.
-    # To add/remove specs, edit PLOT_SPECS. Filenames encode the spec label.
-    # Only the 'rate' parameterization is plotted — amount-parameterized fits
-    # produce structurally identical curves up to x-axis units (rate × 12).
-    # SBT sensitivity siblings (anyprior / imv6h / prefix / 2min) are also
-    # skipped here — variants are compared via CSVs, not figures.
-    PLOT_SPECS = ['sofa', 'sofa_rcs']
-    for (_outcome, _mt, _param), _spec_dict in fitted.items():
-        if _param != 'rate':
-            continue
+    # 2026-05-01: linear `sofa` plots removed — RCS curves carry the
+    # nonlinearity signal and the linear form's straightness is implicit.
+    # PLOT_SPECS controls which spec(s) to plot.
+    # SBT sensitivity siblings (sbt_done_prefix / subira / abc) are skipped
+    # — variants are compared via the forest plot + wide CSVs, not curves.
+    PLOT_SPECS = ['sofa_rcs']
+    for (_outcome, _mt), _spec_dict in fitted.items():
         if _outcome in SBT_VARIANT_OUTCOMES:
             continue
         for _spec_label in PLOT_SPECS:
@@ -829,6 +633,248 @@ def _(SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted,
                     _spec_dict[_spec_label], _outcome, _mt, _spec_label
                 )
     return
+
+
+# ── Forest Plots (10→90 percentile-OR rescaling) ──────────────────────
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Forest Plots — 10→90 percentile OR per outcome
+
+    One PNG per (outcome × model_type). Each forest plot has 6 rows (3 night–day
+    diffs + 3 daytime rates) and 5 horizontal pointranges per row, color-coded
+    by spec (`baseline / daydose / sofa / clinical / sofa_rcs`). Every dot is on
+    the same OR scale: "OR for a shift from the 10th to 90th percentile of the
+    predictor's production-cohort distribution (zeros included; signed diffs
+    preserved)" — per the literature pattern (Kamdar et al. 2015).
+
+    **Linear specs** (`baseline / daydose / sofa / clinical`): rescaled
+    `OR = exp(β × (x90 − x10))` using the contrast-vector form so the same code
+    path works for the RCS spec.
+
+    **RCS spec** (`sofa_rcs`): single OR per predictor for x10→x90 shift,
+    computed via `predict_link(x90) − predict_link(x10)` with all other
+    covariates held at median/mode. Variance uses the delta method via
+    `(X_x90 − X_x10) @ V @ (X_x90 − X_x10)'`.
+
+    **Output**: `output_to_share/{site}/models/forest_{outcome_short}_{model_type}.png`
+    """)
+    return
+
+
+@app.cell
+def _(MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
+      cohort_merged_final, fitted, np, pd):
+    import matplotlib.pyplot as _plt
+    from patsy import dmatrix as _dmatrix
+
+    # 6 predictors in the user-specified row order: 3 diffs above, 3 daytimes below.
+    FOREST_PREDICTORS = [
+        ('prop_dif_mcg_kg_min',  'Δ propofol (mcg/kg/min)'),
+        ('fenteq_dif_mcg_hr',    'Δ fentanyl eq (mcg/hr)'),
+        ('midazeq_dif_mg_hr',    'Δ midazolam eq (mg/hr)'),
+        ('_prop_day_mcg_kg_min', 'Daytime propofol (mcg/kg/min)'),
+        ('_fenteq_day_mcg_hr',   'Daytime fentanyl eq (mcg/hr)'),
+        ('_midazeq_day_mg_hr',   'Daytime midazolam eq (mg/hr)'),
+    ]
+    SPEC_ORDER = ['baseline', 'daydose', 'sofa', 'clinical', 'sofa_rcs',
+                  'sofa_weight', 'sofa_bmi']
+    # 7 dots per predictor row: 5 original specs + 2 habitus siblings (cyan, olive).
+    SPEC_COLORS = {
+        'baseline':    '#5e3c99',
+        'daydose':     '#1f77b4',
+        'sofa':        '#2ca02c',
+        'clinical':    '#ff7f0e',
+        'sofa_rcs':    '#d62728',
+        'sofa_weight': '#17becf',  # cyan — body-habitus sibling 1
+        'sofa_bmi':    '#bcbd22',  # olive — body-habitus sibling 2
+    }
+
+    # ── Build PERCENTILE_REF: per-predictor (x10_raw, x90_raw, x10_scaled,
+    # x90_scaled) over the production cohort INCLUDING drug-holiday zeros.
+    # Computed once per site, reused across all (outcome, model_type) fits.
+    PERCENTILE_REF = {}
+    for _pred, _ in FOREST_PREDICTORS:
+        _vals = cohort_merged_final[_pred].dropna().to_numpy()
+        if len(_vals) == 0:
+            continue
+        _x10, _x90 = np.percentile(_vals, 10), np.percentile(_vals, 90)
+        _scale = VAR_DISPLAY.get(_pred, {}).get('scale', 1)
+        PERCENTILE_REF[_pred] = {
+            'x10_raw': _x10,
+            'x90_raw': _x90,
+            'x10_scaled': _x10 / _scale,
+            'x90_scaled': _x90 / _scale,
+            'delta_scaled': (_x90 - _x10) / _scale,
+        }
+    print("PERCENTILE_REF (raw clinical units, 10th and 90th percentiles):")
+    for _pred, _info in PERCENTILE_REF.items():
+        print(f"  {_pred:<24s}: x10={_info['x10_raw']:>+8.3f}, x90={_info['x90_raw']:>+8.3f}")
+
+    # Reference row (median for numeric, mode for categorical) over the
+    # SCALED dataset — same construction as the marginal-effects cell.
+    def _build_reference_row_scaled(df_scaled):
+        ref = df_scaled.median(numeric_only=True).to_dict()
+        for col in df_scaled.select_dtypes(include=['object', 'category']).columns:
+            ref[col] = df_scaled[col].mode().iloc[0]
+        return ref
+
+    _df_scaled_forest = cohort_merged_final.copy()
+    for _col, _info in VAR_DISPLAY.items():
+        if _col in _df_scaled_forest.columns and _info['scale'] != 1:
+            _df_scaled_forest[_col] = _df_scaled_forest[_col] / _info['scale']
+    REF_ROW = _build_reference_row_scaled(_df_scaled_forest)
+
+    def _or_10_to_90(fit, predictor):
+        """Return (OR, OR_lo, OR_hi) for a 10→90 percentile shift in `predictor`.
+
+        Works for BOTH linear specs (where the design matrix changes only on
+        the `predictor` column) and RCS specs (where 3 basis columns change
+        together via patsy's cr() expansion). The contrast vector
+        c = X_x90 − X_x10 captures the spec automatically; var(log_OR) =
+        c V c' is the delta method.
+        """
+        info = PERCENTILE_REF.get(predictor)
+        if info is None or info['x10_raw'] == info['x90_raw']:
+            return (np.nan, np.nan, np.nan)
+
+        # Build two new-data rows, predictor at x10_scaled vs x90_scaled.
+        nd_x10 = pd.DataFrame([REF_ROW])
+        nd_x90 = pd.DataFrame([REF_ROW])
+        nd_x10[predictor] = info['x10_scaled']
+        nd_x90[predictor] = info['x90_scaled']
+
+        # Re-evaluate the formula's design matrix on the new rows so cr()
+        # basis columns are recomputed at the new predictor value.
+        try:
+            di = fit.model.data.design_info
+            X_x10 = np.asarray(_dmatrix(di, nd_x10, return_type='matrix'))[0]
+            X_x90 = np.asarray(_dmatrix(di, nd_x90, return_type='matrix'))[0]
+        except Exception:
+            return (np.nan, np.nan, np.nan)
+
+        beta = fit.params.values
+        V = fit.cov_params().values
+        contrast = X_x90 - X_x10
+        # If the predictor isn't in the spec's design matrix, the contrast
+        # is all zeros → log_OR = 0 → OR = 1 with zero-width CI. That's a
+        # misleading display ("baseline shows null effect"); return NaN so
+        # the forest plot skips that dot instead.
+        if np.allclose(contrast, 0):
+            return (np.nan, np.nan, np.nan)
+        log_or = float(contrast @ beta)
+        var_log_or = float(contrast @ V @ contrast)
+        if var_log_or < 0:
+            return (np.nan, np.nan, np.nan)
+        se = np.sqrt(var_log_or)
+        return (
+            float(np.exp(log_or)),
+            float(np.exp(log_or - 1.96 * se)),
+            float(np.exp(log_or + 1.96 * se)),
+        )
+
+    # ── Build long-format result table (one row per outcome×model_type×spec×predictor).
+    forest_rows = []
+    for (_outcome, _mt), _spec_dict in fitted.items():
+        for _spec_label, _result in _spec_dict.items():
+            for _pred, _ in FOREST_PREDICTORS:
+                _or, _or_lo, _or_hi = _or_10_to_90(_result, _pred)
+                forest_rows.append({
+                    'outcome': _outcome,
+                    'model_type': _mt,
+                    'spec': _spec_label,
+                    'predictor': _pred,
+                    'OR': _or,
+                    'OR_lo': _or_lo,
+                    'OR_hi': _or_hi,
+                })
+    forest_df = pd.DataFrame(forest_rows)
+    _forest_csv = f'output_to_share/{SITE_NAME}/models/forest_data.csv'
+    forest_df.to_csv(_forest_csv, index=False)
+    print(f"Saved {_forest_csv} ({len(forest_df)} rows)")
+
+    # ── Render one PNG per (outcome, model_type) ─────────────────────
+    def plot_forest(rows_df, outcome, model_type, site, predictors, percentile_ref, out_path):
+        fig, ax = _plt.subplots(figsize=(9.5, 7.0))
+        n_specs = len(SPEC_ORDER)
+        # vertical jitter within each predictor row, ±0.18
+        jitter = np.linspace(-0.20, 0.20, n_specs)
+
+        ymin, ymax = -0.6, len(predictors) - 0.4
+        for i, (pred, pred_label) in enumerate(predictors):
+            y_base = len(predictors) - 1 - i  # top-to-bottom: first predictor at top
+            for j, spec in enumerate(SPEC_ORDER):
+                _row = rows_df[
+                    (rows_df['outcome'] == outcome)
+                    & (rows_df['model_type'] == model_type)
+                    & (rows_df['spec'] == spec)
+                    & (rows_df['predictor'] == pred)
+                ]
+                if _row.empty:
+                    continue
+                _r = _row.iloc[0]
+                if not (np.isfinite(_r['OR']) and np.isfinite(_r['OR_lo']) and np.isfinite(_r['OR_hi'])):
+                    continue
+                _y = y_base + jitter[j]
+                ax.errorbar(
+                    _r['OR'], _y,
+                    xerr=[[_r['OR'] - _r['OR_lo']], [_r['OR_hi'] - _r['OR']]],
+                    fmt='o', color=SPEC_COLORS[spec], markersize=4,
+                    capsize=2, elinewidth=1.0, label=spec if i == 0 else None,
+                )
+
+        # y-axis: predictor labels with x10/x90 annotation
+        ytick_labels = []
+        ytick_pos = []
+        for i, (pred, pred_label) in enumerate(predictors):
+            y_base = len(predictors) - 1 - i
+            info = percentile_ref.get(pred, {})
+            x10 = info.get('x10_raw', np.nan)
+            x90 = info.get('x90_raw', np.nan)
+            ytick_labels.append(f"{pred_label}\nx10={x10:+.2f}, x90={x90:+.2f}")
+            ytick_pos.append(y_base)
+        ax.set_yticks(ytick_pos)
+        ax.set_yticklabels(ytick_labels, fontsize=8)
+        ax.set_ylim(ymin, ymax)
+
+        ax.set_xscale('log')
+        ax.set_xlim(0.5, 2.0)
+        ax.axvline(1.0, color='dimgray', linewidth=0.8, linestyle='--', zorder=0)
+        ax.set_xlabel('Odds ratio (10th → 90th percentile shift, log scale, clipped to [0.5, 2.0])', fontsize=9)
+        ax.set_title(f"{outcome} — {site} ({model_type.upper()})", fontsize=11)
+        ax.grid(True, axis='x', linewidth=0.4, alpha=0.4, zorder=0)
+
+        # Legend (one entry per spec, deduplicated). Place above the plot.
+        handles, labels = ax.get_legend_handles_labels()
+        seen = set()
+        dedup = [(h, l) for h, l in zip(handles, labels) if not (l in seen or seen.add(l))]
+        if dedup:
+            ax.legend(
+                [h for h, _ in dedup], [l for _, l in dedup],
+                loc='upper center', bbox_to_anchor=(0.5, 1.10),
+                ncol=len(dedup), fontsize=8, frameon=False,
+            )
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200, bbox_inches='tight', facecolor='white')
+        _plt.close(fig)
+
+    for _config in MODEL_CONFIGS:
+        _outcome = _config['outcome']
+        _mt = _config['model_type']
+        _outcome_short = OUTCOME_SHORT.get(_outcome, _outcome)
+        _out_path = (
+            f"output_to_share/{SITE_NAME}/models/"
+            f"forest_{_outcome_short}_{_mt}.png"
+        )
+        plot_forest(
+            forest_df, _outcome, _mt, SITE_NAME,
+            FOREST_PREDICTORS, PERCENTILE_REF, _out_path,
+        )
+        print(f"Saved: {_out_path}")
+    return (FOREST_PREDICTORS, PERCENTILE_REF, forest_df)
 
 
 if __name__ == "__main__":

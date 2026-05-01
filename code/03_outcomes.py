@@ -307,6 +307,165 @@ def _(sbt_t1, sbt_t2):
     return (sbt_t3,)
 
 
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## v2 Outcome Definitions (ABT-RISE-style alternatives)
+
+    Parallel implementations of intubation/extubation event detection
+    (`_*_v2`), SBT delivery (`sbt_done_v2` — 2-min sustained FLIP), and
+    SBT eligibility (`sbt_elig`). Existing outcomes are preserved unchanged
+    as the working baselines; the v2 family runs alongside as challengers
+    so the modeling cell can fit both and pick whichever performs better.
+
+    **Simplifications from the ABT-RISE reference doc**:
+
+    - **Stability gates for `sbt_elig`** use only row-level FiO2 ≤ 0.5 AND
+      PEEP ≤ 8 (both available in `resp_processed_bf.parquet`). The full
+      ABT-RISE spec also gates on NEE ≤ 0.2 mcg/kg/min and SpO2 ≥ 88 — those
+      are computed at the daily level (`nee_7am`/`nee_7pm`) but not at
+      `recorded_dttm` row level in this project. Defer to a follow-up round
+      if v2 outcomes show promise.
+
+    - **`sbt_done_v2`** fires on 2-min sustained FLIPs (PS ≤ 8 AND PEEP ≤ 8)
+      without the prior-mode-controlled requirement of the spec-literal
+      `sbt_done`. The ABT-RISE 5-min secondary is subsumed by the 2-min
+      primary at our row-level resolution.
+
+    - **State-machine extubation** (`_extub_1st_v2`) uses the consensus
+      windows `CONSENSUS_INTUB_WINDOW_MIN = 15` and
+      `CONSENSUS_EXTUB_WINDOW_MIN = 30`, with tracheostomy as a sentinel
+      that closes any open episode and stops further counting.
+    """)
+    return
+
+
+@app.cell
+def _():
+    import numpy as np
+
+    CONSENSUS_INTUB_WINDOW_MIN = 15
+    CONSENSUS_EXTUB_WINDOW_MIN = 30
+
+    def count_intubations_v2(group):
+        """ABT-RISE consensus-window state machine over a per-hosp resp slice.
+
+        Input: a DataFrame slice with columns `recorded_dttm`,
+        `device_category`, `tracheostomy` for ONE hospitalization, sorted
+        ascending by `recorded_dttm`.
+
+        Output: a DataFrame indexed identically to `group` with three
+        binary columns:
+          `_intub_event_v2`: 1 on the first row of each new IMV episode
+              (after a 15-min consensus window).
+          `_extub_event_v2`: 1 on the first row patient leaves IMV
+              (after a 30-min consensus window confirming non-reversion).
+          `_trach_event_v2`: 1 on the row where tracheostomy first appears.
+
+        Rules (per the reference doc lines 96–179):
+          - Direct-to-trach: if a tracheostomy row precedes any IMV row,
+            count zero IMV episodes (mark only `_trach_event_v2 = 1`).
+          - Tracheostomy sentinel: any later trach event closes the open
+            episode (firing `_extub_event_v2` if mid-IMV, then `_trach`)
+            and halts further state-machine processing for that patient.
+          - Consensus windows: a transition is only confirmed once the
+            new state has been sustained for ≥ window_min minutes; if the
+            new state reverts within the window, the transition is aborted
+            and no event is fired.
+        """
+        n = len(group)
+        out = pd.DataFrame(
+            {'_intub_event_v2': 0, '_extub_event_v2': 0, '_trach_event_v2': 0},
+            index=group.index,
+        )
+        if n == 0:
+            return out
+
+        is_imv = group['device_category'].eq('imv').to_numpy()
+        has_trach = group['tracheostomy'].eq(1).to_numpy()
+        dttm = group['recorded_dttm'].to_numpy()
+
+        # Direct-to-trach rule: trach appears before any IMV row.
+        first_trach = np.argmax(has_trach) if has_trach.any() else -1
+        first_imv = np.argmax(is_imv) if is_imv.any() else -1
+        if first_trach >= 0 and (first_imv < 0 or first_trach < first_imv):
+            out.iloc[first_trach, out.columns.get_loc('_trach_event_v2')] = 1
+            return out
+
+        state = 'pre'  # pre / intub_candidate / on_imv / off_imv_candidate / off_imv
+        intub_cand_i = None
+        extub_cand_i = None
+
+        for i in range(n):
+            if has_trach[i]:
+                # Trach sentinel: close any open extub-pending state, then halt.
+                if state == 'off_imv_candidate' and extub_cand_i is not None:
+                    out.iloc[extub_cand_i, out.columns.get_loc('_extub_event_v2')] = 1
+                elif state in ('on_imv', 'intub_candidate'):
+                    # Patient went straight from IMV to trach — count as extub
+                    # event at the trach row (so the IMV episode has a closure).
+                    out.iloc[i, out.columns.get_loc('_extub_event_v2')] = 1
+                out.iloc[i, out.columns.get_loc('_trach_event_v2')] = 1
+                return out
+
+            if state == 'pre':
+                if is_imv[i]:
+                    intub_cand_i = i
+                    state = 'intub_candidate'
+            elif state == 'intub_candidate':
+                if not is_imv[i]:
+                    state = 'pre'
+                    intub_cand_i = None
+                else:
+                    mins = (dttm[i] - dttm[intub_cand_i]) / np.timedelta64(1, 'm')
+                    if mins >= CONSENSUS_INTUB_WINDOW_MIN:
+                        out.iloc[intub_cand_i, out.columns.get_loc('_intub_event_v2')] = 1
+                        state = 'on_imv'
+                        intub_cand_i = None
+            elif state == 'on_imv':
+                if not is_imv[i]:
+                    extub_cand_i = i
+                    state = 'off_imv_candidate'
+            elif state == 'off_imv_candidate':
+                if is_imv[i]:
+                    state = 'on_imv'
+                    extub_cand_i = None
+                else:
+                    mins = (dttm[i] - dttm[extub_cand_i]) / np.timedelta64(1, 'm')
+                    if mins >= CONSENSUS_EXTUB_WINDOW_MIN:
+                        out.iloc[extub_cand_i, out.columns.get_loc('_extub_event_v2')] = 1
+                        state = 'off_imv'
+                        extub_cand_i = None
+            elif state == 'off_imv':
+                if is_imv[i]:
+                    intub_cand_i = i
+                    state = 'intub_candidate'
+
+        # Trailing partial states (window not consummated by end of stream):
+        # leave as no-event. Conservative — partial transitions don't fire.
+        return out
+
+    return (count_intubations_v2, np)
+
+
+@app.cell
+def _(count_intubations_v2, pd, resp_p):
+    # Apply state machine per hospitalization. group_keys=False preserves the
+    # original index so we can concat back to resp_p without realignment.
+    _sorted = resp_p.sort_values(['hospitalization_id', 'recorded_dttm']).reset_index(drop=True)
+    _events = _sorted.groupby('hospitalization_id', group_keys=False).apply(
+        count_intubations_v2
+    )
+    resp_p_v2 = pd.concat([_sorted, _events], axis=1)
+    print(
+        f"resp_p_v2: {len(resp_p_v2)} rows | "
+        f"_intub_event_v2 fired on {int(resp_p_v2['_intub_event_v2'].sum())} rows | "
+        f"_extub_event_v2 fired on {int(resp_p_v2['_extub_event_v2'].sum())} rows | "
+        f"_trach_event_v2 fired on {int(resp_p_v2['_trach_event_v2'].sum())} rows"
+    )
+    return (resp_p_v2,)
+
+
 @app.cell
 def _(sbt_t3):
     # IMV-streak duration metadata for the sbt_done_imv6h variant. Split out
@@ -379,6 +538,78 @@ def _(sbt_t3):
 
 
 @app.cell
+def _(resp_p_v2, sbt_t4):
+    # sbt_t5_v2: join sbt_t4's columns with the v2 state-machine event flags
+    # from resp_p_v2 + compute v2 cumulative event flags (first event per
+    # hospitalization), v2 stability flag (FiO2 ≤ 0.5 AND PEEP ≤ 8 row-level
+    # gates — NEE/SpO2 deferred per docstring), and v2 eligibility (stability
+    # AND IMV streak ≥ 6 h).
+    sbt_t5_v2 = mo.sql(
+        f"""
+        FROM sbt_t4
+        LEFT JOIN resp_p_v2 USING (hospitalization_id, recorded_dttm)
+        SELECT sbt_t4.*
+            -- COALESCE the v2 event flags so missing-from-resp_p_v2 rows
+            -- (shouldn't happen but defensive) become 0.
+            , _intub_event_v2: COALESCE(resp_p_v2._intub_event_v2, 0)
+            , _extub_event_v2: COALESCE(resp_p_v2._extub_event_v2, 0)
+            , _trach_event_v2: COALESCE(resp_p_v2._trach_event_v2, 0)
+            -- First-occurrence flags via cumulative SUM windows
+            , _extub_cum_v2: SUM(COALESCE(resp_p_v2._extub_event_v2, 0)) OVER w
+            , _extub_1st_v2: CASE
+                WHEN COALESCE(resp_p_v2._extub_event_v2, 0) = 1
+                    AND SUM(COALESCE(resp_p_v2._extub_event_v2, 0)) OVER w = 1
+                THEN 1 ELSE 0 END
+            , _trach_cum_v2: SUM(COALESCE(resp_p_v2._trach_event_v2, 0)) OVER w
+            , _trach_v2: CASE
+                WHEN COALESCE(resp_p_v2._trach_event_v2, 0) = 1
+                    AND SUM(COALESCE(resp_p_v2._trach_event_v2, 0)) OVER w = 1
+                THEN 1 ELSE 0 END
+            -- v2 row-level stability gate (FiO2 + PEEP only; NEE/SpO2 deferred).
+            -- Treat NULL as fail (COALESCE to a value above the threshold).
+            , _stable_v2: CASE
+                WHEN COALESCE(sbt_t4.fio2_set, 999) <= 0.5
+                    AND COALESCE(sbt_t4.peep_set, 999) <= 8
+                THEN 1 ELSE 0 END
+            -- v2 eligibility: stability AND IMV streak ≥ 6 h (360 min).
+            -- _imv_streak_minutes is NULL on non-IMV rows, so eligibility
+            -- only fires while patient is currently on IMV.
+            , _eligible_v2: CASE
+                WHEN sbt_t4._imv_streak_minutes >= 360
+                    AND CASE
+                        WHEN COALESCE(sbt_t4.fio2_set, 999) <= 0.5
+                            AND COALESCE(sbt_t4.peep_set, 999) <= 8
+                        THEN 1 ELSE 0 END = 1
+                THEN 1 ELSE 0 END
+        WINDOW w AS (PARTITION BY sbt_t4.hospitalization_id ORDER BY sbt_t4.recorded_dttm)
+        """
+    )
+    return (sbt_t5_v2,)
+
+
+@app.cell
+def _(sbt_t5_v2):
+    # Compute v2 fail-extub: re-intub event within 24h after _extub_1st_v2 fires.
+    # Mirror of sbt_t3's existing _fail_extub but using v2 event flags.
+    sbt_t5_v2_w_fail = mo.sql(
+        f"""
+        FROM sbt_t5_v2 AS a
+        SELECT a.*
+            , _fail_extub_v2: CASE
+                WHEN a._extub_1st_v2 = 1 AND EXISTS (
+                    SELECT 1
+                    FROM sbt_t5_v2 AS b
+                    WHERE b.hospitalization_id = a.hospitalization_id
+                      AND b._intub_event_v2 = 1
+                      AND b.recorded_dttm > a.recorded_dttm
+                      AND b.recorded_dttm <= a.recorded_dttm + INTERVAL 24 HOUR
+                ) THEN 1 ELSE 0 END
+        """
+    )
+    return (sbt_t5_v2_w_fail,)
+
+
+@app.cell
 def _(sbt_t3):
     sbt_all_blocks = mo.sql(
         f"""
@@ -423,17 +654,17 @@ def _():
 
 
 @app.cell
-def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t4):
-    # NOTE: this cell reads from `sbt_t4` (NOT `sbt_t3`) so it has access to
-    # the IMV-streak duration columns (`_lag_imv_streak_minutes`) needed by
-    # the imv6h variant AND the per-variant block-duration columns
-    # (`_block_duration_mins_subira`, `_block_duration_mins_abc`) needed by
-    # the new Subira/ABC variants. sbt_t4 includes all of sbt_t3's columns
-    # via `FROM sbt_t3 SELECT *` so all existing references still resolve.
+def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
+    # NOTE: this cell now reads from `sbt_t5_v2_w_fail` (aliased back to
+    # `sbt_t4` for column-reference compatibility), which carries all of
+    # sbt_t4's columns PLUS the v2 event flags + eligibility flag from the
+    # ABT-RISE-style alternative implementations. Existing `sbt_t4.<col>`
+    # references continue to resolve; new v2 columns are accessible via the
+    # same alias.
     sbt_outcomes = mo.sql(
         f"""
         -- Final SBT outcomes with code status and discharge info
-        FROM sbt_t4
+        FROM sbt_t5_v2_w_fail AS sbt_t4
         LEFT JOIN sbt_all_blocks_w_duration AS b
             ON sbt_t4.hospitalization_id = b.hospitalization_id
             AND sbt_t4._block_id = b._block_id
@@ -538,7 +769,47 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t4):
             , _success_extub: CASE
                 WHEN _extub_1st = 1 AND _withdrawl_lst = 0 AND _fail_extub = 0
                 THEN 1 ELSE 0 END
-        WHERE (sbt_t4.tracheostomy = 0 OR sbt_t4._trach_1st = 1)
+            -- ── v2 outcome family (ABT-RISE-style alternatives, 2026-04-29) ──
+            -- sbt_done_v2: 2-min sustained FLIP (PS ≤ 8 AND PEEP ≤ 8) without
+            -- the prior_mode_controlled gate of the spec-literal sbt_done.
+            -- Reuses the existing _block_duration_mins + _sbt_state from sbt_t1
+            -- (the block-partition logic is the same; only the duration cutoff
+            -- and the prior-mode gate differ).
+            , sbt_done_v2: CASE
+                WHEN _block_duration_mins >= 2
+                    AND sbt_t4._sbt_state = 1
+                    AND sbt_t4._lag_sbt_state = 0
+                THEN 1 ELSE 0 END
+            -- sbt_elig: per-row eligibility flag (FiO2 ≤ 0.5 + PEEP ≤ 8 +
+            -- IMV ≥ 6 h). NEE ≤ 0.2 and SpO2 ≥ 88 gates from ABT-RISE are
+            -- deferred — those signals live at daily granularity in this
+            -- project (nee_7am / nee_7pm), not at recorded_dttm. Aggregating
+            -- per-row eligibility to daily via MAX gives a binary "eligible
+            -- at any point this day" outcome.
+            , sbt_elig: sbt_t4._eligible_v2
+            -- v2 extubation outcome family. The successful-extubation
+            -- predicate (`_success_extub_v2`) is identical to the current
+            -- `_success_extub` per user direction — only the underlying
+            -- first-extubation event detector changes (state-machine v2
+            -- vs. cumulative-extub v1).
+            , sbt_t4._extub_1st_v2
+            , sbt_t4._trach_v2
+            , sbt_t4._fail_extub_v2
+            , _withdrawl_lst_v2: CASE
+                WHEN sbt_t4._extub_1st_v2 = 1
+                    AND TRIM(LOWER(code_status_category)) != 'full'
+                    AND TRIM(LOWER(discharge_category)) IN ('hospice', 'expired')
+                THEN 1 ELSE 0 END
+            , _success_extub_v2: CASE
+                WHEN sbt_t4._extub_1st_v2 = 1
+                    AND CASE
+                        WHEN sbt_t4._extub_1st_v2 = 1
+                            AND TRIM(LOWER(code_status_category)) != 'full'
+                            AND TRIM(LOWER(discharge_category)) IN ('hospice', 'expired')
+                        THEN 1 ELSE 0 END = 0
+                    AND sbt_t4._fail_extub_v2 = 0
+                THEN 1 ELSE 0 END
+        WHERE (sbt_t4.tracheostomy = 0 OR sbt_t4._trach_1st = 1 OR sbt_t4._trach_v2 = 1)
         ORDER BY sbt_t4.hospitalization_id, event_dttm
         """
     )
@@ -588,6 +859,14 @@ def _(sbt_outcomes):
             , _fail_extub: MAX(_fail_extub)
             , _extub_1st: MAX(_extub_1st)
             , _withdrawl_lst: MAX(_withdrawl_lst)
+            -- v2 outcome family
+            , sbt_done_v2: MAX(sbt_done_v2)
+            , sbt_elig: MAX(sbt_elig)
+            , _extub_1st_v2: MAX(_extub_1st_v2)
+            , _trach_v2: MAX(_trach_v2)
+            , _fail_extub_v2: MAX(_fail_extub_v2)
+            , _withdrawl_lst_v2: MAX(_withdrawl_lst_v2)
+            , _success_extub_v2: MAX(_success_extub_v2)
         GROUP BY hospitalization_id, _dh
         """
     )
@@ -616,6 +895,14 @@ def _(cohort_hrly_grids_f, sbt_outcomes_hrly):
             , _fail_extub: COALESCE(s._fail_extub, 0)
             , _extub_1st: COALESCE(s._extub_1st, 0)
             , _withdrawl_lst: COALESCE(s._withdrawl_lst, 0)
+            -- v2 outcome family
+            , sbt_done_v2: COALESCE(s.sbt_done_v2, 0)
+            , sbt_elig: COALESCE(s.sbt_elig, 0)
+            , _extub_1st_v2: COALESCE(s._extub_1st_v2, 0)
+            , _trach_v2: COALESCE(s._trach_v2, 0)
+            , _fail_extub_v2: COALESCE(s._fail_extub_v2, 0)
+            , _withdrawl_lst_v2: COALESCE(s._withdrawl_lst_v2, 0)
+            , _success_extub_v2: COALESCE(s._success_extub_v2, 0)
         ORDER BY g.hospitalization_id, g.event_dttm
         """
     )
@@ -641,6 +928,14 @@ def _(cohort_sbt_outcomes_hrly):
             , _fail_extub: MAX(_fail_extub)
             , _extub_1st: MAX(_extub_1st)
             , _withdrawl_lst: MAX(_withdrawl_lst)
+            -- v2 outcome family
+            , sbt_done_v2: MAX(sbt_done_v2)
+            , sbt_elig: MAX(sbt_elig)
+            , _extub_1st_v2: MAX(_extub_1st_v2)
+            , _trach_v2: MAX(_trach_v2)
+            , _fail_extub_v2: MAX(_fail_extub_v2)
+            , _withdrawl_lst_v2: MAX(_withdrawl_lst_v2)
+            , _success_extub_v2: MAX(_success_extub_v2)
         GROUP BY hospitalization_id, _nth_day
         ORDER BY hospitalization_id, _nth_day
         """

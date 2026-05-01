@@ -212,6 +212,16 @@ def _(
         , sbt_done_subira_next_day: LEAD(o.sbt_done_subira) OVER w
         , _sbt_done_abc_today: o.sbt_done_abc
         , sbt_done_abc_next_day: LEAD(o.sbt_done_abc) OVER w
+        -- v2 outcome family (ABT-RISE-style alternative implementations,
+        -- 2026-04-29 model-update round). sbt_elig is genuinely new; the
+        -- v2 sbt_done / extub variants run alongside the working baselines
+        -- so the modeling cell can fit both and the forest plot can compare.
+        , _sbt_elig_today: o.sbt_elig
+        , sbt_elig_next_day: LEAD(o.sbt_elig) OVER w
+        , _sbt_done_v2_today: o.sbt_done_v2
+        , sbt_done_v2_next_day: LEAD(o.sbt_done_v2) OVER w
+        , _success_extub_v2_today: o._success_extub_v2
+        , success_extub_v2_next_day: LEAD(o._success_extub_v2) OVER w
         -- NOTE: Dose columns below are per-hour RATES (mg/hr or mcg/hr),
         -- computed as shift totals ÷ 12 (hours per shift). Valid because the
         -- filter (_nth_day > 0 AND outcome-columns non-null) guarantees
@@ -349,14 +359,22 @@ def _():
        `_nth_day > 0 AND sbt_done_next_day IS NOT NULL AND success_extub_next_day IS NOT NULL`
        to just `_nth_day >= 0`. Day 0 and last day are now both included.
 
-    3. Adds three flag columns so descriptive figures can stratify
+    3. Adds four flag columns so descriptive figures can stratify
        visualizations natively:
        - `_single_shift_day` = `True` when one shift had zero hours of
          coverage (e.g., intubation after 7 PM → `n_hours_day = 0` on day 0).
          Strictly the zero-hour case; short-but-nonzero shifts are unflagged.
-       - `_is_first_day` = `True` when `_nth_day == 0`.
-       - `_is_last_day` = `True` when `sbt_done_next_day` is NULL (no next
-         observation for that patient in the dataset).
+       - `_is_first_day` = `True` when `_nth_day == MIN(_nth_day) OVER w`,
+         i.e., the row with the smallest `_nth_day` per hospitalization. This
+         catches hospitalizations whose IMV streak begins exactly at 7:00 AM
+         (whose first row is numbered `_nth_day = 1` not `0` by the upstream
+         `add_day_shift_id` helper).
+       - `_is_last_day` = `True` when `LEAD(_nth_day) OVER w IS NULL`, i.e.,
+         the row with the largest `_nth_day` per hospitalization. Defined on
+         the ordering column (not on `sbt_done`) so it can never multi-fire.
+       - `_rel_day` = `_nth_day - MIN(_nth_day) OVER w` — days since the
+         hospitalization's first cohort row. Use this for ICU-day-N figure
+         x-bins to get monotonic cohort attrition.
 
     All three are computed in this cell; consumers don't need to re-derive
     them. The amount columns (`_prop_day_mcg_kg`, etc.) are kept as-is — for
@@ -409,8 +427,29 @@ def _(
         , o._nth_day
         -- Exposure-characterization flags (computed once here so descriptive
         -- figures don't have to re-derive them across N scripts).
-        , _is_first_day: (o._nth_day = 0)
-        , _is_last_day: (LEAD(o.sbt_done) OVER w IS NULL)
+        -- _is_first_day catches the 506 (MIMIC) / 376 (UCMC) hospitalizations
+        -- whose IMV streak begins exactly at 7:00 AM and therefore have their
+        -- first row labeled `_nth_day = 1` (not 0) by `_utils.add_day_shift_id`.
+        -- MIN(_nth_day) per hosp recovers the per-streak first day regardless
+        -- of whether it's literally numbered 0 or 1.
+        -- KNOWN ISSUE: this is a workaround for a bug in _utils.add_day_shift_id;
+        -- see docs/descriptive_figures.md §6.9.1 for the full writeup and the
+        -- proper-fix path. Revisit before the next manuscript revision.
+        , _is_first_day: (o._nth_day = MIN(o._nth_day) OVER w)
+        -- _is_last_day uses LEAD(_nth_day) instead of LEAD(sbt_done) — the
+        -- former depends only on the partition ordering column and can never
+        -- multi-fire, while the latter would over-count if any mid-sequence
+        -- row had a NULL sbt_done.
+        , _is_last_day: (LEAD(o._nth_day) OVER w IS NULL)
+        -- _rel_day = days since each hospitalization's first cohort row.
+        -- Use this for ICU-day-N figure x-bins so day 0 is uniformly "first
+        -- day in the cohort" rather than "calendar day 0", giving monotonic
+        -- cohort attrition. Becomes redundant if §6.9.1's proper fix lands.
+        , _rel_day: (o._nth_day - MIN(o._nth_day) OVER w)
+        -- TODO (§6.9.2): add `_full_shift_day := (s.n_hours_day = 12 AND
+        -- s.n_hours_night = 12)` so the trimmed-shift class becomes flag-
+        -- separable from full-shift days. Currently both lump under
+        -- `_single_shift_day = False`.
         , _single_shift_day: (COALESCE(s.n_hours_day, 0) = 0
                                 OR COALESCE(s.n_hours_night, 0) = 0)
         , _sbt_done_today: o.sbt_done
@@ -429,6 +468,13 @@ def _(
         , sbt_done_subira_next_day: LEAD(o.sbt_done_subira) OVER w
         , _sbt_done_abc_today: o.sbt_done_abc
         , sbt_done_abc_next_day: LEAD(o.sbt_done_abc) OVER w
+        -- v2 outcome family (ABT-RISE-style alternatives, 2026-04-29).
+        , _sbt_elig_today: o.sbt_elig
+        , sbt_elig_next_day: LEAD(o.sbt_elig) OVER w
+        , _sbt_done_v2_today: o.sbt_done_v2
+        , sbt_done_v2_next_day: LEAD(o.sbt_done_v2) OVER w
+        , _success_extub_v2_today: o._success_extub_v2
+        , success_extub_v2_next_day: LEAD(o._success_extub_v2) OVER w
         -- N-hours-aware rate columns. NULLIF(n_hours_*, 0) yields NULL when
         -- the patient had zero hours on that shift (e.g., extubation occurred
         -- exactly at 7am), which then propagates through the arithmetic to a

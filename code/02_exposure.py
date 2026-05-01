@@ -10,7 +10,7 @@
 
 import marimo
 
-__generated_with = "0.21.0"
+__generated_with = "0.22.5"
 app = marimo.App(sql_output="native")
 
 with app.setup:
@@ -201,12 +201,13 @@ def _(cont_sed_deduped, duckdb, vitals_df):
 
 
 @app.cell
-def _(
-    cont_sed,
-    cont_sed_with_weight,
-    convert_dose_units_by_med_category,
-    vitals_df,
-):
+def _(cont_sed_with_weight):
+    cont_sed_with_weight
+    return
+
+
+@app.cell
+def _(cont_sed, cont_sed_with_weight, convert_dose_units_by_med_category):
     # Preferred unit for propofol changed to mcg/kg/min (Phase 2): pump-native
     # /kg/min input passes through with only amount/time scaling — no weight
     # multiplication/division at the conversion layer for the dominant
@@ -221,7 +222,7 @@ def _(
     }
     _cont_sed_converted, _cont_sed_convert_summary = convert_dose_units_by_med_category(
         cont_sed_with_weight,
-        vitals_df=vitals_df,
+        # vitals_df=vitals_df,
         preferred_units=_cont_sed_preferred_units,
         override=True,
     )
@@ -238,6 +239,8 @@ def _(
     )
 
     cont_sed.df = _cont_sed_converted
+
+    _cont_sed_converted
     return
 
 
@@ -302,9 +305,9 @@ def _():
 
 
 @app.cell
-def _(cont_sed_wg, duckdb):
-    cont_sed_t1 = duckdb.sql(
-        """
+def _(cont_sed_wg):
+    cont_sed_t1 = mo.sql(
+        f"""
         -- Forward-fill continuous sedation rates and compute duration between events
         FROM cont_sed_wg g
         SELECT hospitalization_id, event_dttm, _dh, _hr
@@ -373,6 +376,12 @@ def _(cont_sed_t3, duckdb):
     return (cont_sed_dose_by_hr,)
 
 
+@app.cell
+def _(cont_sed_dose_by_hr):
+    cont_sed_dose_by_hr
+    return
+
+
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -412,7 +421,7 @@ def _(
 ):
     _intm_sed_deduped = remove_meds_duplicates(intm_sed.df)
     _n_removed = len(intm_sed.df) - len(_intm_sed_deduped)
-    print(f"Removed {_n_removed} ({_n_removed / len(intm_sed.df):.2%}) duplicates by MAR action")
+    # print(f"Removed {_n_removed} ({_n_removed / len(intm_sed.df):.2%}) duplicates by MAR action")
 
     _intm_sed_preferred_units = {
         'propofol': 'mg',

@@ -640,8 +640,8 @@ def _(
              "Night-minus-day Dose Rate: Histogram per Patient-day"),
             (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_hist_by_hosp.png",
              "Night-minus-day Dose Rate: Histogram per Hospitalization"),
-            (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_mean_by_icu_day.png",
-             "Mean Night-minus-day Dose Rate by ICU Day (±95% CI)"),
+            (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_combined_by_icu_day.png",
+             "Night-minus-day Dose Rate by ICU Day — Mean + Signed IQR"),
             (f"output_to_share/{SITE_NAME}/descriptive/night_day_diff_violin_by_icu_day.png",
              "Spread of Night-minus-day Dose Rate by ICU Day (violin)"),
             (f"output_to_share/{SITE_NAME}/descriptive/dose_pattern_6group_count_by_icu_day.png",
@@ -842,6 +842,48 @@ def _(
                     f"Marginal Effects (RCS) — {_label}",
                     [
                         f"[Image not found: {_me_path}]",
+                        "Run 08_models.py to generate.",
+                    ],
+                )
+
+        # Forest plots (10→90 percentile-OR rescaling, all 5 specs on one axis).
+        # New in 2026-04-29 model-update round. Each PNG = one outcome × model_type;
+        # 6 predictor rows (3 night-day diffs + 3 daytime rates) × 5 spec dots
+        # color-coded baseline / daydose / sofa / clinical / sofa_rcs. Single OR
+        # per dot for "10th→90th percentile shift" of the predictor's
+        # production-cohort distribution (zeros included; signed diffs preserved).
+        for _label, _outcome_short, _mt in [
+            # Working primaries
+            ('SBT Done Next Day (GEE)',                        'sbt',       'gee'),
+            ('Successful Extubation Next Day (GEE)',           'extub',     'gee'),
+            ('Successful Extubation Next Day (Logit)',         'extub',     'logit'),
+            # SBT sensitivity siblings (sbt_done_abc is the working baseline)
+            ('SBT Done — anyprior (GEE)',                      'sbt_anyprior', 'gee'),
+            ('SBT Done — imv6h (GEE)',                         'sbt_imv6h', 'gee'),
+            ('SBT Done — prefix (GEE)',                        'sbt_prefix','gee'),
+            ('SBT Done — 2min (GEE)',                          'sbt_2min',  'gee'),
+            ('SBT Done — Subira (GEE)',                        'sbt_subira','gee'),
+            ('SBT Done — ABC [working baseline] (GEE)',        'sbt_abc',   'gee'),
+            # v2 family (ABT-RISE-style alternatives)
+            ('SBT Eligible Next Day [v2] (GEE)',               'sbt_elig',  'gee'),
+            ('SBT Eligible Next Day [v2] (Logit)',             'sbt_elig',  'logit'),
+            ('SBT Done Next Day [v2] (GEE)',                   'sbt_v2',    'gee'),
+            ('SBT Done Next Day [v2] (Logit)',                 'sbt_v2',    'logit'),
+            ('Successful Extubation Next Day [v2] (GEE)',      'extub_v2',  'gee'),
+            ('Successful Extubation Next Day [v2] (Logit)',    'extub_v2',  'logit'),
+        ]:
+            _fp_path = (
+                f"output_to_share/{SITE_NAME}/models/"
+                f"forest_{_outcome_short}_{_mt}.png"
+            )
+            if os.path.exists(_fp_path):
+                add_image_page(_pdf, _fp_path, f"Forest plot (10→90 percentile OR) — {_label}")
+            else:
+                add_text_page(
+                    _pdf,
+                    f"Forest plot — {_label}",
+                    [
+                        f"[Image not found: {_fp_path}]",
                         "Run 08_models.py to generate.",
                     ],
                 )
