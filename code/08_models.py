@@ -192,6 +192,7 @@ def _():
         '_midazeq_day_any': {'scale': 1, 'label': 'Any daytime midazolam eq (yes/no)'},
         # Other continuous covariates
         'age':          {'scale': 1,   'label': 'Age (per year)'},
+        '_nth_day':     {'scale': 1,   'label': 'Day on IMV (per day)'},
         'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
         'sofa_total':   {'scale': 1,   'label': 'SOFA total (per point)'},
         'nee_7am':      {'scale': 0.1, 'label': 'NEE 7am (per 0.1 mcg/kg/min)'},
@@ -247,7 +248,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # mg/hr for midazolam). Amount-based parameterization was retired in the
     # 2026-04-29 model-update round — rate-only going forward.
     BASELINE = ("{{outcome}} ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
-                "age + C(sex_category) + C(icu_type) + cci_score")
+                "age + _nth_day + C(sex_category) + C(icu_type) + cci_score")
     # DAYDOSE adds two-part (hurdle) daytime exposure: a binary indicator for
     # ANY daytime drug + the continuous rate. The indicator absorbs the zero-
     # mass selection signal (clinician chose to keep the patient on the drug
@@ -293,15 +294,28 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     for _v, _k in _knots_by_var.items():
         print(f"  {_v:<24s}: {_k if _k is not None else 'fallback df=4 (<100 nonzero)'}")
 
+    # Map the 3 daytime continuous-rate predictors to their hurdle indicators.
+    # The cr() basis on these gets interaction-multiplied by the indicator so the
+    # basis evaluates to 0 on indicator=0 rows, removing the 62%-zero pile-up
+    # from the basis design and stabilizing cluster-robust V. For diff terms,
+    # there's no hurdle indicator (signed predictors), so cr() applies as-is.
+    HURDLE_INDICATORS = {
+        '_prop_day_mcg_kg_min': '_prop_day_any',
+        '_fenteq_day_mcg_hr':   '_fenteq_day_any',
+        '_midazeq_day_mg_hr':   '_midazeq_day_any',
+    }
+
     def _cr_term(v):
         k = _knots_by_var[v]
-        return f"cr({v}, df=4)" if k is None else f"cr({v}, knots={k})"
+        base = f"cr({v}, df=4)" if k is None else f"cr({v}, knots={k})"
+        ind = HURDLE_INDICATORS.get(v)
+        return f"{base}:{ind}" if ind else base
 
     SOFA_RCS = (
         "{{outcome}} ~ "
         + " + ".join(_cr_term(v) for v in _RCS_VARS) + " + "
         "_prop_day_any + _fenteq_day_any + _midazeq_day_any + "
-        "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
+        "age + _nth_day + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
     # Body-habitus sensitivity siblings of SOFA. Hypothesis: propofol exposure
@@ -377,7 +391,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
                 print(f"  OK: {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
             except Exception as e:
                 print(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
-    return MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fitted, np, re
+    return HURDLE_INDICATORS, MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fitted, np, re
 
 
 @app.cell
@@ -499,7 +513,7 @@ def _():
 
 
 @app.cell
-def _(OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
+def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, fitted, np, pd):
     # `np` is inherited from the fitting cell (returned above) to avoid the
     # marimo "multiple definitions" error. `_plt` is private (underscore
     # prefix) so it doesn't collide with any future cell that imports plt.
@@ -544,6 +558,13 @@ def _(OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged
     def _marginal_prediction(result, ref_row, focal_col, scaled_grid):
         """Run result.get_prediction for a grid holding everything else constant.
 
+        For daytime continuous-rate predictors paired with a hurdle indicator
+        (sofa_rcs uses `cr(rate, knots=...):indicator`), force the indicator
+        to 1 across the entire grid so the basis-times-indicator term actually
+        evaluates the dose-response shape. Otherwise the indicator stays at
+        REF_ROW's median (typically 0), the basis term is zero everywhere on
+        the grid, and the curve renders flat with a full-y-axis CI ribbon.
+
         Returns (prob, ci_lo, ci_hi) all in probability space. statsmodels has
         TWO different `summary_frame()` column schemes depending on the model
         family — verified at statsmodels/base/_prediction_inference.py lines
@@ -558,6 +579,9 @@ def _(OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged
         """
         new_data = pd.DataFrame([ref_row] * len(scaled_grid))
         new_data[focal_col] = scaled_grid
+        _ind = HURDLE_INDICATORS.get(focal_col)
+        if _ind is not None:
+            new_data[_ind] = 1
         pred = result.get_prediction(new_data)
         sf = pred.summary_frame()
         if 'mean' in sf.columns:
@@ -709,7 +733,7 @@ def _():
 
 
 @app.cell
-def _(MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
+def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
       cohort_merged_final, fitted, np, pd):
     import matplotlib.pyplot as _plt
     from patsy import dmatrix as _dmatrix
@@ -743,13 +767,20 @@ def _(MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
     }
 
     # ── Build PERCENTILE_REF: per-predictor (x10_raw, x90_raw, x10_scaled,
-    # x90_scaled) over the production cohort INCLUDING drug-holiday zeros.
-    # Computed once per site, reused across all (outcome, model_type) fits.
+    # x90_scaled). Default: full cohort distribution (zeros included). For
+    # daytime continuous-rate predictors paired with a hurdle indicator, use
+    # the NON-ZERO subset — the forest cell for those predictors then reports
+    # "intensity 10→90 OR among the exposed," cleanly separated from the
+    # selection effect captured by the indicator's own forest row.
     PERCENTILE_REF = {}
     for _pred, _ in FOREST_PREDICTORS:
         _vals = cohort_merged_final[_pred].dropna().to_numpy()
         if len(_vals) == 0:
             continue
+        if _pred in HURDLE_INDICATORS:
+            _vals = _vals[_vals != 0]
+            if len(_vals) == 0:
+                continue
         _x10, _x90 = np.percentile(_vals, 10), np.percentile(_vals, 90)
         _scale = VAR_DISPLAY.get(_pred, {}).get('scale', 1)
         PERCENTILE_REF[_pred] = {
@@ -758,10 +789,12 @@ def _(MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
             'x10_scaled': _x10 / _scale,
             'x90_scaled': _x90 / _scale,
             'delta_scaled': (_x90 - _x10) / _scale,
+            'subset': 'non-zero' if _pred in HURDLE_INDICATORS else 'all',
         }
     print("PERCENTILE_REF (raw clinical units, 10th and 90th percentiles):")
     for _pred, _info in PERCENTILE_REF.items():
-        print(f"  {_pred:<24s}: x10={_info['x10_raw']:>+8.3f}, x90={_info['x90_raw']:>+8.3f}")
+        _tag = f"  [{_info['subset']}]" if _info['subset'] == 'non-zero' else ''
+        print(f"  {_pred:<24s}: x10={_info['x10_raw']:>+8.3f}, x90={_info['x90_raw']:>+8.3f}{_tag}")
 
     # Reference row (median for numeric, mode for categorical) over the
     # SCALED dataset — same construction as the marginal-effects cell.
@@ -795,6 +828,16 @@ def _(MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
         nd_x90 = pd.DataFrame([REF_ROW])
         nd_x10[predictor] = info['x10_scaled']
         nd_x90[predictor] = info['x90_scaled']
+        # If the predictor is paired with a hurdle indicator (sofa_rcs spec
+        # uses `cr(rate, knots=...):indicator`), force indicator=1 at both
+        # endpoints so the basis-times-indicator contrast captures the
+        # intensity-among-exposed effect. Otherwise the indicator stays at
+        # REF_ROW's median (typically 0), the contrast on the basis-times-
+        # indicator term is trivially 0, and OR comes out 1.0 with broken CI.
+        _ind = HURDLE_INDICATORS.get(predictor)
+        if _ind is not None:
+            nd_x10[_ind] = 1
+            nd_x90[_ind] = 1
 
         # Re-evaluate the formula's design matrix on the new rows so cr()
         # basis columns are recomputed at the new predictor value.
