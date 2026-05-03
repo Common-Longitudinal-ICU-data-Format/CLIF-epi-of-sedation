@@ -378,10 +378,14 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
-    # Model comparison tables (from 08_models.py)
+    # Model comparison tables (from 08_models.py).
+    # Filename convention changed 2026-05-01 in 08_models.py — `extub` →
+    # `success_extub` to match the OUTCOME_SHORT mapping. SBT primary
+    # (`sbt_done_next_day`) was retired in the same commit, so we read
+    # the surviving Apr 29 file by its original short name.
     sbt_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_gee.csv", index_col=0)
-    extub_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_extub_gee.csv", index_col=0)
-    extub_logit_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_extub_logit.csv", index_col=0)
+    extub_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_success_extub_gee.csv", index_col=0)
+    extub_logit_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_success_extub_logit.csv", index_col=0)
     print(f"SBT GEE: {sbt_gee_df.shape}, Extub GEE: {extub_gee_df.shape}, Extub Logit: {extub_logit_df.shape}")
     return extub_gee_df, extub_logit_df, sbt_gee_df
 

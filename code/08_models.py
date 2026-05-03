@@ -184,6 +184,12 @@ def _():
         '_prop_day_mcg_kg_min': {'scale': 10,  'label': 'Daytime propofol (per 10 mcg/kg/min)'},
         '_fenteq_day_mcg_hr':   {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
         '_midazeq_day_mg_hr':   {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
+        # Hurdle binaries: any daytime exposure (yes/no). scale=1 keeps the
+        # column 0/1 — the regression OR (= 10→90 OR when ≥10% of rows are 1)
+        # is interpretable as "odds ratio for any exposure vs none."
+        '_prop_day_any':   {'scale': 1, 'label': 'Any daytime propofol (yes/no)'},
+        '_fenteq_day_any': {'scale': 1, 'label': 'Any daytime fentanyl eq (yes/no)'},
+        '_midazeq_day_any': {'scale': 1, 'label': 'Any daytime midazolam eq (yes/no)'},
         # Other continuous covariates
         'age':          {'scale': 1,   'label': 'Age (per year)'},
         'cci_score':    {'scale': 1,   'label': 'Charlson CCI (per point)'},
@@ -242,21 +248,59 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # 2026-04-29 model-update round — rate-only going forward.
     BASELINE = ("{{outcome}} ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
                 "age + C(sex_category) + C(icu_type) + cci_score")
-    DAYDOSE = BASELINE + " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
+    # DAYDOSE adds two-part (hurdle) daytime exposure: a binary indicator for
+    # ANY daytime drug + the continuous rate. The indicator absorbs the zero-
+    # mass selection signal (clinician chose to keep the patient on the drug
+    # at all); the continuous rate then reflects dose-response among exposed.
+    # See `docs/uptitration_paradox_investigation.md` and plan H17.
+    DAYDOSE = BASELINE + (" + _prop_day_any + _fenteq_day_any + _midazeq_day_any"
+                          " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr")
     SOFA = DAYDOSE + " + sofa_total"
     CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
                           "pf_level_7pm + nee_7am + nee_7pm")
 
     # RCS (restricted cubic splines) variant of the sofa spec.
     # Wraps the 6 exposure variables in patsy's cr() transform for natural
-    # cubic regression splines with df=4 (→ 3 basis columns per variable).
+    # cubic regression splines with 3 internal knots → 4 basis columns per variable.
     # Non-exposure adjustment variables stay linear/categorical.
     # Coefficients aren't human-interpretable as OR-per-unit, so the wide CSV
     # excludes them; the forest plot summarizes via 10→90 percentile OR.
+    #
+    # NOTE (2026-05-01): Knots are computed from the NON-ZERO subset's
+    # quartiles instead of `df=4` (which uses whole-vector quartiles). Daytime
+    # exposures are ~62% exact zero in the cohort; whole-vector p25 and p50
+    # both collapse to 0, producing a degenerate cr() basis whose cluster-
+    # robust covariance has negative eigenvalues for basis directions —
+    # surfaced as empty OR rows in `forest_data.csv`. Non-zero quartiles
+    # place knots within the active dose range; basis at x=0 becomes a
+    # constant column absorbed by the intercept.
+    _RCS_VARS = [
+        'prop_dif_mcg_kg_min', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
+        '_prop_day_mcg_kg_min', '_fenteq_day_mcg_hr', '_midazeq_day_mg_hr',
+    ]
+
+    def _nz_quartile_knots(s):
+        nz = s[s != 0].dropna().to_numpy()
+        if len(nz) < 100:
+            return None
+        return [round(float(k), 6) for k in np.percentile(nz, [25, 50, 75])]
+
+    # Compute knots from `_df_scaled` (the dataset actually fed to fits) so the
+    # values are in the same scaled units patsy sees at fit/predict time —
+    # raw units would trip cr()'s upper-bound check (knots > observed max).
+    _knots_by_var = {v: _nz_quartile_knots(_df_scaled[v]) for v in _RCS_VARS}
+    print("RCS knots from non-zero quartiles (in scaled units, per VAR_DISPLAY['scale']):")
+    for _v, _k in _knots_by_var.items():
+        print(f"  {_v:<24s}: {_k if _k is not None else 'fallback df=4 (<100 nonzero)'}")
+
+    def _cr_term(v):
+        k = _knots_by_var[v]
+        return f"cr({v}, df=4)" if k is None else f"cr({v}, knots={k})"
+
     SOFA_RCS = (
         "{{outcome}} ~ "
-        "cr(prop_dif_mcg_kg_min, df=4) + cr(fenteq_dif_mcg_hr, df=4) + cr(midazeq_dif_mg_hr, df=4) + "
-        "cr(_prop_day_mcg_kg_min, df=4) + cr(_fenteq_day_mcg_hr, df=4) + cr(_midazeq_day_mg_hr, df=4) + "
+        + " + ".join(_cr_term(v) for v in _RCS_VARS) + " + "
+        "_prop_day_any + _fenteq_day_any + _midazeq_day_any + "
         "age + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
@@ -670,7 +714,10 @@ def _(MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
     import matplotlib.pyplot as _plt
     from patsy import dmatrix as _dmatrix
 
-    # 6 predictors in the user-specified row order: 3 diffs above, 3 daytimes below.
+    # 9 predictors in the user-specified row order: 3 diffs, 3 daytime continuous,
+    # 3 daytime hurdle binaries. The hurdle row pairs with the continuous row above
+    # — together they decompose the daytime-level effect into "any exposure
+    # (selection)" + "dose given exposed (intensity)."
     FOREST_PREDICTORS = [
         ('prop_dif_mcg_kg_min',  'Δ propofol (mcg/kg/min)'),
         ('fenteq_dif_mcg_hr',    'Δ fentanyl eq (mcg/hr)'),
@@ -678,6 +725,9 @@ def _(MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
         ('_prop_day_mcg_kg_min', 'Daytime propofol (mcg/kg/min)'),
         ('_fenteq_day_mcg_hr',   'Daytime fentanyl eq (mcg/hr)'),
         ('_midazeq_day_mg_hr',   'Daytime midazolam eq (mg/hr)'),
+        ('_prop_day_any',        'Any daytime propofol (yes/no)'),
+        ('_fenteq_day_any',      'Any daytime fentanyl eq (yes/no)'),
+        ('_midazeq_day_any',     'Any daytime midazolam eq (yes/no)'),
     ]
     SPEC_ORDER = ['baseline', 'daydose', 'sofa', 'clinical', 'sofa_rcs',
                   'sofa_weight', 'sofa_bmi']
