@@ -5,14 +5,22 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "clifpy>=0.3.1",
+    "clifpy @ git+https://github.com/Common-Longitudinal-ICU-data-Format/clifpy.git@improve-med-unit-converter-apr2026",
     "duckdb>=1.4.1",
     "ipykernel>=6.30.0",
     "marimo>=0.21.0",
     "pandas>=2.3.1",
     "polars>=1.34.0",
+    "plotly>=5.22.0",
     "ruff>=0.15.6",
     "sqlglot>=30.0.1",
     "statsmodels>=0.14.5",
     "tableone>=0.9.5",
+]
+
+[dependency-groups]
+dev = [
+    # QC trajectory viewer (`make qc`) — see code/qc/trajectory_viewer.py
+    "dash>=2.17.0",
+    "dash-bootstrap-components>=1.6.0",
 ]

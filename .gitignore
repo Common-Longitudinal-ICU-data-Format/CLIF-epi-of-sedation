@@ -1,4 +1,7 @@
 /docs/*.docx
+.dev/
+*.pptx
+*.png
 
 .sedation/
 */__marimo__/*
@@ -299,6 +302,10 @@ output/
 results/
 figures/
 plots/
+
+# Pre-SBT-fix baseline snapshot (used for A/B comparison of SBT semantics
+# change in 03_outcomes.py). Lives only on disk, never committed.
+baseline_pre_sbt_fix/
 
 # Log files
 *.log
