@@ -51,17 +51,13 @@ def _():
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
 
-    # CRITICAL: pin the DuckDB session timezone to UTC.
-    #
-    # `event_dttm` is stored UTC-tz-aware (see 01_cohort.py:178-183, where
-    # site_tz="" + timezone="UTC" keeps values UTC). DuckDB's `extract` and
-    # `date_trunc` on a TIMESTAMP WITH TIME ZONE return components in the
-    # SESSION timezone, which defaults to the system local zone (e.g.
-    # America/Chicago on this machine). Without this SET, `extract('hour' …)`
-    # returns the local hour while pandas `.dt.hour` returns the UTC hour —
-    # producing a 5–6h shift that mis-classifies day/night and shatters
-    # _nth_day boundaries.
-    duckdb.execute("SET TimeZone = 'UTC'")
+    # All timestamps in this script are tz-aware: cohort_hrly_grids.parquet
+    # arrives site-tz tagged (per 01_cohort.py's retag_to_local_tz boundary);
+    # clifpy-loaded admin/recorded times are UTC tz-aware. Local-hour
+    # extraction uses explicit `AT TIME ZONE '{SITE_TZ}'` per query (see
+    # cont_sed_wg / intm_sed_wg cells), so DuckDB's session timezone is
+    # never read — no `SET TimeZone` here. The pytest at
+    # tests/test_timezone.py asserts session-tz invariance.
 
     CONFIG_PATH = "config/config.json"
     co = ClifOrchestrator(config_path=CONFIG_PATH)
@@ -81,9 +77,10 @@ def _(CONFIG_PATH, get_config_or_params):
     # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    SITE_TZ = cfg['timezone']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
-    return (SITE_NAME,)
+    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    return SITE_NAME, SITE_TZ
 
 
 @app.cell
@@ -327,7 +324,7 @@ def _():
 
 
 @app.cell
-def _(cohort_hrly_grids_f, cont_sed_w):
+def _(SITE_TZ, cohort_hrly_grids_f, cont_sed_w):
     # FULL JOIN with hourly grid: the grid side anchors the timeline at hour
     # boundaries so forward-fill below can propagate dose rates across hours
     # with no admin event. We subset the grid to just the join keys —
@@ -335,12 +332,12 @@ def _(cohort_hrly_grids_f, cont_sed_w):
     # `_shift`/`_nth_day`/etc. on cohort_hrly_grids_f are re-joined later at
     # the per-hour merge step (sed_dose_by_hr).
     #
-    # `_dh`/`_hr` derived in SQL from `event_dttm` (non-NULL after USING-coalesce
-    # FULL JOIN). DuckDB session timezone is UTC (set in imports cell), so
-    # `extract('hour' …)` and `date_trunc('hour', …)` on UTC tz-aware
-    # `event_dttm` produce the SAME values as pandas `.dt.hour` /
-    # `.dt.floor('h')`. Without `SET TimeZone = 'UTC'` they would diverge
-    # by the local→UTC offset (e.g., 5–6h on America/Chicago).
+    # `_dh`/`_hr` derived from `event_dttm AT TIME ZONE '{SITE_TZ}'` — explicit
+    # local-tz extraction, session-tz-independent. `event_dttm` may arrive as
+    # site-tz tagged (from cohort_hrly_grids.parquet, post 01_cohort retag) or
+    # as UTC tz-aware (from cont_sed_w via clifpy load); DuckDB normalizes both
+    # to TIMESTAMPTZ internally and `AT TIME ZONE` operates on the underlying
+    # instant, so the result is correct regardless of which path supplied the row.
     cont_sed_wg = mo.sql(
         f"""
         WITH grid AS (
@@ -352,8 +349,8 @@ def _(cohort_hrly_grids_f, cont_sed_w):
         SELECT
             * EXCLUDE (event_dttm)
             , event_dttm
-            , _dh: date_trunc('hour', event_dttm)
-            , _hr: extract('hour' FROM event_dttm)::INT
+            , _dh: date_trunc('hour', event_dttm AT TIME ZONE '{SITE_TZ}')
+            , _hr: extract('hour' FROM event_dttm AT TIME ZONE '{SITE_TZ}')::INT
         ORDER BY hospitalization_id, event_dttm
         """
     )
@@ -582,10 +579,10 @@ def _():
 
 
 @app.cell
-def _(cohort_hrly_grids_f, intm_sed_w):
+def _(SITE_TZ, cohort_hrly_grids_f, intm_sed_w):
     # FULL JOIN with hourly grid — same pattern as cont_sed_wg (subset grid
-    # to join keys, derive `_dh`/`_hr` from event_dttm in SQL). Session
-    # timezone is UTC (imports cell), matching the column tz.
+    # to join keys, derive `_dh`/`_hr` from `event_dttm AT TIME ZONE site_tz`
+    # for explicit, session-tz-independent local-hour extraction).
     intm_sed_wg = mo.sql(
         f"""
         WITH grid AS (
@@ -597,8 +594,8 @@ def _(cohort_hrly_grids_f, intm_sed_w):
         SELECT
             * EXCLUDE (event_dttm)
             , event_dttm
-            , _dh: date_trunc('hour', event_dttm)
-            , _hr: extract('hour' FROM event_dttm)::INT
+            , _dh: date_trunc('hour', event_dttm AT TIME ZONE '{SITE_TZ}')
+            , _hr: extract('hour' FROM event_dttm AT TIME ZONE '{SITE_TZ}')::INT
         ORDER BY hospitalization_id, event_dttm
         """
     )

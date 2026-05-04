@@ -20,6 +20,11 @@ with app.setup:
     from pathlib import Path
     # sys.path.insert(0, str(Path(__file__).parent))
     RERUN_WATERFALL = False
+    # Hoisted into setup so any cell can call it without re-importing
+    # (marimo flags duplicate top-level imports across cells as
+    # cross-cell shadowing). retag_to_local_tz is a pure metadata-only
+    # tz_convert helper used at every parquet-write boundary.
+    from _utils import retag_to_local_tz
 
 
 @app.cell(hide_code=True)
@@ -58,14 +63,15 @@ def _(CONFIG_PATH, get_config_or_params):
     # section in .dev/CLAUDE.md).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    SITE_TZ = cfg['timezone']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     # Path B++ refactor: descriptive (night-vs-day) artifacts under
     # {site}/descriptive/, modeling-cohort artifacts (incl. CONSORT) under
     # {site}/models/. Both flat — no nested figures/.
     os.makedirs(f"output_to_share/{SITE_NAME}/descriptive", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
-    return (SITE_NAME,)
+    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    return SITE_NAME, SITE_TZ
 
 
 @app.cell(hide_code=True)
@@ -132,6 +138,7 @@ def _():
 def _(
     CONFIG_PATH,
     SITE_NAME,
+    SITE_TZ,
     apply_outlier_handling,
     hosp_ids_w_icu_stays,
     pd,
@@ -187,6 +194,14 @@ def _(
             cohort_resp, outlier_config_path="config/outlier_config.yaml"
         )
         cohort_resp_p = cohort_resp.waterfall(bfill=True)
+        # Re-tag UTC tz-aware recorded_dttm → site-local tz-aware before
+        # persisting. Pre-waterfall data must stay UTC (waterfall reentry
+        # compat); the retag at the parquet-write boundary is the project
+        # convention for `output/{site}/*.parquet`. See _utils.py for the
+        # helper and tests/test_timezone.py for invariants.
+        cohort_resp_p.df = retag_to_local_tz(
+            cohort_resp_p.df, ["recorded_dttm"], SITE_TZ
+        )
         cohort_resp_p.df.to_parquet(resp_processed_path)
         resp_p = cohort_resp_p.df
     else:
@@ -421,11 +436,16 @@ def _(cohort_imv_streaks):
 
 
 @app.cell
-def _(cohort_hrly_grids):
+def _(SITE_TZ, cohort_hrly_grids):
     from _utils import add_day_shift_id
 
     _grids_df = cohort_hrly_grids.df()
-    cohort_hrly_grids_f = add_day_shift_id(_grids_df)
+    # Pass site_tz so `_hr` / `_shift` / `_nth_day` reflect the local
+    # clinical clock (7am-7pm local) rather than UTC (the legacy default
+    # 'UTC' produced ~1am-1pm Central, miscoloring every shift-stratified
+    # downstream output). Function uses explicit AT TIME ZONE in SQL — no
+    # session-tz dependency. See tests/test_timezone.py for invariants.
+    cohort_hrly_grids_f = add_day_shift_id(_grids_df, site_tz=SITE_TZ)
     assert len(cohort_hrly_grids_f) == len(_grids_df), 'length altered by add_day_shift_id'
     print(f"Hourly grid rows: {len(cohort_hrly_grids_f)}")
     return (cohort_hrly_grids_f,)
@@ -528,6 +548,7 @@ def _():
 @app.cell
 def _(
     SITE_NAME,
+    SITE_TZ,
     cohort_hosp_ids,
     cohort_hrly_grids_f,
     cohort_imv_streaks,
@@ -609,6 +630,19 @@ def _(
     _grids_df_kept = cohort_hrly_grids_f[
         cohort_hrly_grids_f['hospitalization_id'].isin(_kept_set)
     ]
+
+    # Re-tag UTC tz-aware *_dttm columns → site-local tz-aware before
+    # persisting. Project convention for output/{site}/*.parquet is
+    # site-local tz-tagged so downstream consumers (02-09, qc, agg) read
+    # pre-converted local-tz values without an extra tz_convert call.
+    # `_dh` (in `cohort_hrly_grids_f`) stays naive — derived bucket label.
+    # See _utils.retag_to_local_tz docstring + tests/test_timezone.py.
+    _streaks_df_kept = retag_to_local_tz(
+        _streaks_df_kept,
+        ['_start_dttm', '_end_dttm', '_last_observed_dttm', '_trach_dttm', '_next_start_dttm'],
+        SITE_TZ,
+    )
+    _grids_df_kept = retag_to_local_tz(_grids_df_kept, ['event_dttm'], SITE_TZ)
 
     _streaks_df_kept.to_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
     _grids_df_kept.to_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")

@@ -53,9 +53,10 @@ def _(CONFIG_PATH, get_config_or_params):
     # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    SITE_TZ = cfg['timezone']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
-    return (SITE_NAME,)
+    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    return SITE_NAME, SITE_TZ
 
 
 @app.cell(hide_code=True)
@@ -840,13 +841,19 @@ def _():
 
 
 @app.cell
-def _(sbt_outcomes):
+def _(SITE_TZ, sbt_outcomes):
     sbt_outcomes_hrly = mo.sql(
         f"""
-        -- Aggregate SBT outcomes per hospitalization-hour
+        -- Aggregate SBT outcomes per hospitalization-hour.
+        -- `_dh` derived via `event_dttm AT TIME ZONE site_tz` so the result
+        -- is naive local — matches cohort_hrly_grids' `_dh` for the LEFT
+        -- JOIN below. event_dttm here is UTC tz-aware (sbt_outcomes inherits
+        -- from resp_p; resp_processed_bf.parquet predates the tz reflag in
+        -- 01 and stays UTC for waterfall reentry compat). Both sides of the
+        -- downstream join must be naive local TIMESTAMP with the same value.
         FROM sbt_outcomes
         SELECT hospitalization_id
-            , _dh: date_trunc('hour', event_dttm)
+            , _dh: date_trunc('hour', event_dttm AT TIME ZONE '{SITE_TZ}')
             , sbt_done: MAX(sbt_done)
             , sbt_done_anyprior: MAX(sbt_done_anyprior)
             , sbt_done_imv6h: MAX(sbt_done_imv6h)
