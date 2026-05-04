@@ -11,7 +11,7 @@
 import marimo
 
 __generated_with = "0.22.5"
-app = marimo.App(sql_output="native")
+app = marimo.App(width="columns", sql_output="native")
 
 with app.setup:
     import marimo as mo
@@ -130,6 +130,7 @@ def _(apply_outlier_handling, cohort_hosp_ids):
 def _(cohort_hosp_ids):
     from clifpy import MedicationAdminContinuous
 
+    # TODO: why are we using this instead of the duckdb-cenetered data loader from clifpy?
     cont_sed = MedicationAdminContinuous.from_file(
         config_path='config/config.json',
         columns=[
@@ -156,64 +157,79 @@ def _(cohort_hosp_ids):
 
 
 @app.cell
+def _(cont_sed):
+    cont_sed.df
+    return
+
+
+@app.cell
 def _(cont_sed, remove_meds_duplicates):
     cont_sed_deduped = remove_meds_duplicates(cont_sed.df)
     _n_removed = len(cont_sed.df) - len(cont_sed_deduped)
     print(f"Removed {_n_removed} ({_n_removed / len(cont_sed.df):.2%}) duplicates by MAR action")
+    # we are throwing off
     return (cont_sed_deduped,)
 
 
 @app.cell
-def _(cont_sed_deduped, duckdb, vitals_df):
-    # Phase 2 weight override: pre-attach a project-controlled `weight_kg`
-    # column on each admin row BEFORE handing off to clifpy. Per
-    # clifpy/utils/unit_converter.py:717-719, clifpy only runs its own ASOF
-    # when `weight_kg` isn't already a column on med_df, so this override
-    # skips clifpy's no-fallback per-admin ASOF entirely (the path that
-    # produced the silent /kg-factor-dropped bug — see
-    # code/qc/weight_audit_README.md §5).
-    #
-    # Strategy: per-admin ASOF backward-join to most-recent prior weight
-    # (same temporal logic as clifpy), with fallback to the patient's
-    # first-ever weight (admission fallback). The weight-QC drop list at
-    # 01_cohort.py guarantees every kept patient has ≥1 weight, so the
-    # admission fallback is never NULL.
-    #
-    # Stays lazy as a DuckDBPyRelation — feeds directly into
-    # convert_dose_units_by_med_category(return_rel=True) below.
-    cont_sed_with_weight = duckdb.sql("""
+def _(cont_sed_deduped, vitals_df):
+    cont_sed_with_weight = mo.sql(
+        f"""
+        -- Phase 2 weight override: pre-attach a project-controlled `weight_kg`
+        -- column on each admin row BEFORE handing off to clifpy. Per
+        -- clifpy/utils/unit_converter.py:717-719, clifpy only runs its own ASOF
+        -- when `weight_kg` isn't already a column on med_df, so this override
+        -- skips clifpy's no-fallback per-admin ASOF entirely (the path that
+        -- produced the silent /kg-factor-dropped bug — see
+        -- code/qc/weight_audit_README.md §5).
+        --
+        -- Strategy: per-admin ASOF backward-join to most-recent prior weight
+        -- (same temporal logic as clifpy), with fallback to the patient's
+        -- first-ever weight (admission fallback). The weight-QC drop list at
+        -- 01_cohort.py guarantees every kept patient has ≥1 weight, so the
+        -- admission fallback is never NULL.
+        --
+        -- Stays lazy as a DuckDBPyRelation — feeds directly into
+        -- convert_dose_units_by_med_category(return_rel=True) below.
         WITH weights AS (
-            FROM vitals_df
-            SELECT hospitalization_id, recorded_dttm
-                , weight_kg: vital_value
-            WHERE vital_category = 'weight_kg' AND vital_value IS NOT NULL
-        )
-        , first_w AS (
-            FROM weights
-            SELECT hospitalization_id, _admit_weight: weight_kg
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY hospitalization_id ORDER BY recorded_dttm
-            ) = 1
-        )
-        , asof_w AS (
-            FROM cont_sed_deduped m
-            ASOF LEFT JOIN weights v
-              ON m.hospitalization_id = v.hospitalization_id
-              AND v.recorded_dttm <= m.admin_dttm
-            SELECT m.*
-                , _asof_weight: v.weight_kg
-        )
-        FROM asof_w a
-        LEFT JOIN first_w f USING (hospitalization_id)
-        SELECT a.* EXCLUDE (_asof_weight)
-            , weight_kg: COALESCE(a._asof_weight, f._admit_weight)
-            , _weight_source: CASE
-                WHEN a._asof_weight IS NOT NULL THEN 'per_admin_asof'
-                WHEN f._admit_weight IS NOT NULL THEN 'admission_fallback'
-                ELSE 'null'
-                END
-        ORDER BY a.hospitalization_id, a.admin_dttm
-    """)
+                FROM vitals_df
+                SELECT hospitalization_id, recorded_dttm
+                    , weight_kg: vital_value
+                WHERE vital_category = 'weight_kg' AND vital_value IS NOT NULL
+            )
+            , first_w AS (
+                FROM weights
+                SELECT hospitalization_id, _admit_weight: weight_kg
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY hospitalization_id ORDER BY recorded_dttm
+                ) = 1
+            )
+            , asof_w AS (
+                FROM cont_sed_deduped m
+                ASOF LEFT JOIN weights v
+                  ON m.hospitalization_id = v.hospitalization_id
+                  AND v.recorded_dttm <= m.admin_dttm
+                SELECT m.*
+                    , _asof_weight: v.weight_kg
+            )
+            FROM asof_w a
+            LEFT JOIN first_w f USING (hospitalization_id)
+            SELECT a.* EXCLUDE (_asof_weight)
+                , weight_kg: COALESCE(a._asof_weight, f._admit_weight)
+                , _weight_source: CASE
+                    WHEN a._asof_weight IS NOT NULL THEN 'per_admin_asof'
+                    WHEN f._admit_weight IS NOT NULL THEN 'admission_fallback'
+                    ELSE 'null'
+                    END
+            ORDER BY a.hospitalization_id, a.admin_dttm
+        """
+    )
+    return (cont_sed_with_weight,)
+
+
+@app.cell
+def _(cont_sed_with_weight, duckdb):
+    # NOTE: notice how these 2 cells are now split off into one that is purely mo.sql and the other (below) for qaqc
 
     # Diagnostics: pull only scalars (no full materialization).
     _diag = duckdb.sql("""
@@ -231,7 +247,7 @@ def _(cont_sed_deduped, duckdb, vitals_df):
         print(f"  WARNING: {_n_null:,} admins NULL after fallback — "
               "these patients should have been in weight-QC drop list. "
               "Check 01_cohort.py applied the drop.")
-    return (cont_sed_with_weight,)
+    return
 
 
 @app.cell
@@ -276,7 +292,7 @@ def _(cont_sed_convert_summary):
 
 
 @app.cell
-def _(apply_outlier_handling, cont_sed, cont_sed_converted_rel, duckdb):
+def _(cont_sed, cont_sed_converted_rel, duckdb):
     # Materialize once at the clifpy outlier-handling boundary.
     # `apply_outlier_handling` reads `table_obj.df` and mutates it in-place
     # (clifpy/utils/outlier_handler.py), so a pandas DataFrame is required here.
@@ -285,6 +301,7 @@ def _(apply_outlier_handling, cont_sed, cont_sed_converted_rel, duckdb):
     # holding the post-conversion values, with the originals preserved as
     # `_original`. Done in SQL via column aliasing before the .df() so we
     # avoid a separate pandas .rename() pass.
+    # FIXME: this cell should use mo.sql directly if that makes sense
     cont_sed.df = duckdb.sql("""
         FROM cont_sed_converted_rel
         SELECT
@@ -294,6 +311,11 @@ def _(apply_outlier_handling, cont_sed, cont_sed_converted_rel, duckdb):
             , med_dose: med_dose_converted
             , med_dose_unit: med_dose_unit_converted
     """).df()
+    return
+
+
+@app.cell
+def _(apply_outlier_handling, cont_sed):
     apply_outlier_handling(cont_sed, outlier_config_path='config/outlier_config.yaml')
     cont_sed_converted = cont_sed.df
     print(f"{len(cont_sed_converted)} rows in cont_sed_converted")
@@ -499,6 +521,9 @@ def _(intm_sed, remove_meds_duplicates):
     intm_sed_deduped = remove_meds_duplicates(intm_sed.df)
     _n_removed = len(intm_sed.df) - len(intm_sed_deduped)
     print(f"Removed {_n_removed} ({_n_removed / len(intm_sed.df):.2%}) duplicates by MAR action")
+    # NOTE: here we are removing 25% of entries in MIMIC
+    # let's some QC functions here to display what are the ones being removed look like b/c it is a relatively high removal rate
+    # can adapt functions from /Users/wliao0504/code/clif/pyCLIF/dev/check_mar_duplicates_dev.ipynb
     return (intm_sed_deduped,)
 
 
@@ -609,6 +634,7 @@ def _(duckdb, intm_sed_wg):
     # SUM-per-hour, `propofol_mg_intm` represents total mg delivered that
     # hour from intermittent admin, so the column name gains the `_hr_`
     # segment. pandas.rename silently skips missing keys.
+    # FIXME: this is a clear violation of the pattern -- why are we materiliazing and renaming? whats the advantage in renaming by pandas? cant we rename within SQL?
     intm_sed_dose_by_hr = duckdb.sql(
         """
         FROM intm_sed_wg
