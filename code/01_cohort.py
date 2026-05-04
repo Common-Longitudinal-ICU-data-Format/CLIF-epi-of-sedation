@@ -137,28 +137,51 @@ def _(
     pd,
 ):
     from clifpy import RespiratorySupport
+    from clifpy.utils.io import load_data
 
     resp_processed_path = f"output/{SITE_NAME}/resp_processed_bf.parquet"
 
     if not os.path.exists(resp_processed_path) or RERUN_WATERFALL:
-        cohort_resp = RespiratorySupport.from_file(
+        # Load via clifpy.utils.io.load_data with site_tz="" to skip the
+        # default UTC→site_tz conversion. clifpy's standard `from_file` path
+        # would convert to site_tz via DuckDB's `timezone(site_tz, col)`,
+        # which RETURNS A NAIVE TIMESTAMP (no tz metadata) — leaving us with
+        # tz-naive Central wall-clock values. clifpy's waterfall scaffold
+        # builder then forces tz-aware UTC, the dtype mismatch silently
+        # downgrades recorded_dttm to object after concat, and pandas 2.3+
+        # raises a strict-Categorical TypeError on the subsequent sort_values.
+        # Bypass that path: load raw UTC (tz-aware) directly so the waterfall
+        # gets compatible dtypes throughout.
+        _resp_columns = [
+            "hospitalization_id",
+            "recorded_dttm",
+            "device_name",
+            "device_category",
+            "mode_name",
+            "mode_category",
+            "fio2_set",
+            "peep_set",
+            "pressure_support_set",
+            "resp_rate_set",
+            "tidal_volume_set",
+            "peak_inspiratory_pressure_set",
+            "tracheostomy",
+        ]
+        import json as _json
+        with open(CONFIG_PATH) as _cfg_f:
+            _cfg = _json.load(_cfg_f)
+        _resp_df_raw = load_data(
+            "respiratory_support",
             config_path=CONFIG_PATH,
-            columns=[
-                "hospitalization_id",
-                "recorded_dttm",
-                "device_name",
-                "device_category",
-                "mode_name",
-                "mode_category",
-                "fio2_set",
-                "peep_set",
-                "pressure_support_set",
-                "resp_rate_set",
-                "tidal_volume_set",
-                "peak_inspiratory_pressure_set",
-                "tracheostomy",
-            ],
+            columns=_resp_columns,
             filters={"hospitalization_id": hosp_ids_w_icu_stays},
+            site_tz="",  # Skip auto-conversion; values stay as UTC tz-aware
+        )
+        cohort_resp = RespiratorySupport(
+            data_directory=_cfg["data_directory"],
+            filetype=_cfg.get("filetype", "parquet"),
+            timezone="UTC",
+            data=_resp_df_raw,
         )
         apply_outlier_handling(
             cohort_resp, outlier_config_path="config/outlier_config.yaml"
