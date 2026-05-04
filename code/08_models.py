@@ -142,13 +142,19 @@ def _():
 
     1. **baseline**: age + sex + ICU type + CCI
 
-    2. **daydose**: baseline + daytime absolute dose rates (`_prop_day_mcg_kg_min`, `_fenteq_day_mcg_hr`, `_midazeq_day_mg_hr`)
+    2. **daydose_nohurdle**: baseline + daytime absolute dose rates only (no
+       hurdle indicators) — pre-H17 form, single linear coefficient per drug.
 
-    3. **sofa**: daydose + `sofa_total`
+    3. **daydose**: baseline + 24h hurdle indicators (`_prop_any` etc.) +
+       daytime absolute dose rates — two-part hurdle decomposition.
 
-    4. **clinical**: daydose + pH/P/F levels + NEE at 7am/7pm
+    4. **sofa**: daydose + `sofa_total`
+
+    5. **clinical**: daydose + pH/P/F levels + NEE at 7am/7pm
 
     `sofa` and `clinical` are siblings (both extend `daydose`).
+    `daydose_nohurdle` is a sensitivity sibling of `daydose` — same
+    daytime-rate predictors, just without the hurdle indicators.
 
     **Outputs:**
 
@@ -259,6 +265,17 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # See `docs/uptitration_paradox_investigation.md` and plan H17.
     DAYDOSE = BASELINE + (" + _prop_any + _fenteq_any + _midazeq_any"
                           " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr")
+    # DAYDOSE_NOHURDLE: reverses the hurdle decomposition. Same daytime-rate
+    # covariates as DAYDOSE but WITHOUT the 3 binary indicators
+    # (`_prop_any`, `_fenteq_any`, `_midazeq_any`). This is the pre-H17 form
+    # — a single linear coefficient per drug that absorbs BOTH the
+    # selection-vs-not-selected contrast AND the dose-given-exposed
+    # contrast. Reported as a side-by-side sensitivity so the manuscript
+    # can show what the day-level effect looks like when we don't
+    # separately model the "any exposure" hurdle.
+    DAYDOSE_NOHURDLE = BASELINE + (
+        " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
+    )
     SOFA = DAYDOSE + " + sofa_total"
     CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
                           "pf_level_7pm + nee_7am + nee_7pm")
@@ -333,13 +350,14 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     SOFA_BMI    = SOFA + " + bmi"
 
     COVARIATE_SPECS = [
-        {'label': 'baseline',    'formula': BASELINE},
-        {'label': 'daydose',     'formula': DAYDOSE},
-        {'label': 'sofa',        'formula': SOFA},
-        {'label': 'clinical',    'formula': CLINICAL},
-        {'label': 'sofa_rcs',    'formula': SOFA_RCS},
-        {'label': 'sofa_weight', 'formula': SOFA_WEIGHT},
-        {'label': 'sofa_bmi',    'formula': SOFA_BMI},
+        {'label': 'baseline',         'formula': BASELINE},
+        {'label': 'daydose_nohurdle', 'formula': DAYDOSE_NOHURDLE},
+        {'label': 'daydose',          'formula': DAYDOSE},
+        {'label': 'sofa',             'formula': SOFA},
+        {'label': 'clinical',         'formula': CLINICAL},
+        {'label': 'sofa_rcs',         'formula': SOFA_RCS},
+        {'label': 'sofa_weight',      'formula': SOFA_WEIGHT},
+        {'label': 'sofa_bmi',         'formula': SOFA_BMI},
     ]
 
     # ── Dimension 2: outcome x model type ─────────────────────────────
@@ -756,17 +774,18 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
         ('_fenteq_any',          'Any fentanyl eq use (24h, yes/no)'),
         ('_midazeq_any',         'Any midazolam eq use (24h, yes/no)'),
     ]
-    SPEC_ORDER = ['baseline', 'daydose', 'sofa', 'clinical', 'sofa_rcs',
-                  'sofa_weight', 'sofa_bmi']
-    # 7 dots per predictor row: 5 original specs + 2 habitus siblings (cyan, olive).
+    SPEC_ORDER = ['baseline', 'daydose_nohurdle', 'daydose', 'sofa', 'clinical',
+                  'sofa_rcs', 'sofa_weight', 'sofa_bmi']
+    # 8 dots per predictor row: 6 main specs + 2 habitus siblings (cyan, olive).
     SPEC_COLORS = {
-        'baseline':    '#5e3c99',
-        'daydose':     '#1f77b4',
-        'sofa':        '#2ca02c',
-        'clinical':    '#ff7f0e',
-        'sofa_rcs':    '#d62728',
-        'sofa_weight': '#17becf',  # cyan — body-habitus sibling 1
-        'sofa_bmi':    '#bcbd22',  # olive — body-habitus sibling 2
+        'baseline':         '#5e3c99',
+        'daydose_nohurdle': '#9467bd',  # purple — pre-hurdle sensitivity
+        'daydose':          '#1f77b4',
+        'sofa':             '#2ca02c',
+        'clinical':         '#ff7f0e',
+        'sofa_rcs':         '#d62728',
+        'sofa_weight':      '#17becf',  # cyan — body-habitus sibling 1
+        'sofa_bmi':         '#bcbd22',  # olive — body-habitus sibling 2
     }
 
     # ── Build PERCENTILE_REF: per-predictor (x10_raw, x90_raw, x10_scaled,
