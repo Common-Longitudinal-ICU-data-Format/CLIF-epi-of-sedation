@@ -184,12 +184,14 @@ def _():
         '_prop_day_mcg_kg_min': {'scale': 10,  'label': 'Daytime propofol (per 10 mcg/kg/min)'},
         '_fenteq_day_mcg_hr':   {'scale': 10,  'label': 'Daytime fentanyl eq (per 10 mcg/hr)'},
         '_midazeq_day_mg_hr':   {'scale': 0.1, 'label': 'Daytime midazolam eq (per 0.1 mg/hr)'},
-        # Hurdle binaries: any daytime exposure (yes/no). scale=1 keeps the
-        # column 0/1 — the regression OR (= 10→90 OR when ≥10% of rows are 1)
-        # is interpretable as "odds ratio for any exposure vs none."
-        '_prop_day_any':   {'scale': 1, 'label': 'Any daytime propofol (yes/no)'},
-        '_fenteq_day_any': {'scale': 1, 'label': 'Any daytime fentanyl eq (yes/no)'},
-        '_midazeq_day_any': {'scale': 1, 'label': 'Any daytime midazolam eq (yes/no)'},
+        # Hurdle binaries: any 24h exposure (day OR night, yes/no). scale=1
+        # keeps the column 0/1 — the regression OR (= 10→90 OR when ≥10% of
+        # rows are 1) is interpretable as "odds ratio for any exposure vs
+        # none." 24h indicator (vs daytime-only) avoids misclassifying
+        # night-only-sedated patients as non-users.
+        '_prop_any':   {'scale': 1, 'label': 'Any propofol use (day or night, yes/no)'},
+        '_fenteq_any': {'scale': 1, 'label': 'Any fentanyl eq use (day or night, yes/no)'},
+        '_midazeq_any': {'scale': 1, 'label': 'Any midazolam eq use (day or night, yes/no)'},
         # Other continuous covariates
         'age':          {'scale': 1,   'label': 'Age (per year)'},
         '_nth_day':     {'scale': 1,   'label': 'Day on IMV (per day)'},
@@ -249,12 +251,13 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # 2026-04-29 model-update round — rate-only going forward.
     BASELINE = ("{{outcome}} ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
                 "age + _nth_day + C(sex_category) + C(icu_type) + cci_score")
-    # DAYDOSE adds two-part (hurdle) daytime exposure: a binary indicator for
-    # ANY daytime drug + the continuous rate. The indicator absorbs the zero-
-    # mass selection signal (clinician chose to keep the patient on the drug
-    # at all); the continuous rate then reflects dose-response among exposed.
+    # DAYDOSE adds two-part (hurdle) exposure: a 24h binary indicator (day
+    # OR night) for any drug use + the continuous daytime rate. The indicator
+    # absorbs the zero-mass selection signal (clinician chose to keep the
+    # patient on the drug at all in last 24h); the continuous daytime rate
+    # then reflects dose-response among daytime-exposed.
     # See `docs/uptitration_paradox_investigation.md` and plan H17.
-    DAYDOSE = BASELINE + (" + _prop_day_any + _fenteq_day_any + _midazeq_day_any"
+    DAYDOSE = BASELINE + (" + _prop_any + _fenteq_any + _midazeq_any"
                           " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr")
     SOFA = DAYDOSE + " + sofa_total"
     CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
@@ -300,9 +303,9 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # from the basis design and stabilizing cluster-robust V. For diff terms,
     # there's no hurdle indicator (signed predictors), so cr() applies as-is.
     HURDLE_INDICATORS = {
-        '_prop_day_mcg_kg_min': '_prop_day_any',
-        '_fenteq_day_mcg_hr':   '_fenteq_day_any',
-        '_midazeq_day_mg_hr':   '_midazeq_day_any',
+        '_prop_day_mcg_kg_min': '_prop_any',
+        '_fenteq_day_mcg_hr':   '_fenteq_any',
+        '_midazeq_day_mg_hr':   '_midazeq_any',
     }
 
     def _cr_term(v):
@@ -314,7 +317,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     SOFA_RCS = (
         "{{outcome}} ~ "
         + " + ".join(_cr_term(v) for v in _RCS_VARS) + " + "
-        "_prop_day_any + _fenteq_day_any + _midazeq_day_any + "
+        "_prop_any + _fenteq_any + _midazeq_any + "
         "age + _nth_day + C(sex_category) + C(icu_type) + cci_score + sofa_total"
     )
 
@@ -749,9 +752,9 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
         ('_prop_day_mcg_kg_min', 'Daytime propofol (mcg/kg/min)'),
         ('_fenteq_day_mcg_hr',   'Daytime fentanyl eq (mcg/hr)'),
         ('_midazeq_day_mg_hr',   'Daytime midazolam eq (mg/hr)'),
-        ('_prop_day_any',        'Any daytime propofol (yes/no)'),
-        ('_fenteq_day_any',      'Any daytime fentanyl eq (yes/no)'),
-        ('_midazeq_day_any',     'Any daytime midazolam eq (yes/no)'),
+        ('_prop_any',            'Any propofol use (24h, yes/no)'),
+        ('_fenteq_any',          'Any fentanyl eq use (24h, yes/no)'),
+        ('_midazeq_any',         'Any midazolam eq use (24h, yes/no)'),
     ]
     SPEC_ORDER = ['baseline', 'daydose', 'sofa', 'clinical', 'sofa_rcs',
                   'sofa_weight', 'sofa_bmi']

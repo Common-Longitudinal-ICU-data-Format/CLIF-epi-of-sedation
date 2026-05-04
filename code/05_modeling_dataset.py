@@ -243,12 +243,14 @@ def _(
         , _midazeq_day_mg_hr:   COALESCE(s.midazeq_day_mg, 0) / 12.0
         , _midazeq_night_mg_hr: COALESCE(s.midazeq_night_mg, 0) / 12.0
         -- Hurdle binaries: did the patient receive ANY of this drug during the
-        -- 7am–7pm daytime shift? Pairs with the continuous rate column above
-        -- so the daytime-level effect can be decomposed into "any exposure"
-        -- (selection / clinician choice) vs. "dose given exposed" (intensity).
-        , _prop_day_any:   CAST(COALESCE(s.prop_day_mcg_kg, 0)   > 0 AS INTEGER)
-        , _fenteq_day_any: CAST(COALESCE(s.fenteq_day_mcg, 0)   > 0 AS INTEGER)
-        , _midazeq_day_any: CAST(COALESCE(s.midazeq_day_mg, 0)  > 0 AS INTEGER)
+        -- past 24h (day OR night shift)? Pairs with the continuous daytime-rate
+        -- column above so the daytime-level effect can be decomposed into "any
+        -- 24h exposure" (selection / clinician choice) vs. "daytime dose given
+        -- exposed" (intensity). The 24h indicator (vs daytime-only) avoids
+        -- misclassifying night-only-sedated patients as non-users.
+        , _prop_any:   CAST(COALESCE(s.prop_day_mcg_kg, 0)   > 0 OR COALESCE(s.prop_night_mcg_kg, 0)   > 0 AS INTEGER)
+        , _fenteq_any: CAST(COALESCE(s.fenteq_day_mcg, 0)    > 0 OR COALESCE(s.fenteq_night_mcg, 0)    > 0 AS INTEGER)
+        , _midazeq_any: CAST(COALESCE(s.midazeq_day_mg, 0)   > 0 OR COALESCE(s.midazeq_night_mg, 0)    > 0 AS INTEGER)
         , prop_dif_mcg_kg_min: (COALESCE(s.prop_night_mcg_kg, 0) - COALESCE(s.prop_day_mcg_kg, 0)) / 12.0 / 60.0
         , fenteq_dif_mcg_hr:  (COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)) / 12.0
         , midazeq_dif_mg_hr:  (COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)) / 12.0
@@ -496,9 +498,9 @@ def _(
         , _midazeq_day_mg_hr:   COALESCE(s.midazeq_day_mg, 0)   / NULLIF(s.n_hours_day, 0)
         , _midazeq_night_mg_hr: COALESCE(s.midazeq_night_mg, 0) / NULLIF(s.n_hours_night, 0)
         -- Hurdle binaries (kept identical to the production query above)
-        , _prop_day_any:   CAST(COALESCE(s.prop_day_mcg_kg, 0)   > 0 AS INTEGER)
-        , _fenteq_day_any: CAST(COALESCE(s.fenteq_day_mcg, 0)   > 0 AS INTEGER)
-        , _midazeq_day_any: CAST(COALESCE(s.midazeq_day_mg, 0)  > 0 AS INTEGER)
+        , _prop_any:   CAST(COALESCE(s.prop_day_mcg_kg, 0)   > 0 OR COALESCE(s.prop_night_mcg_kg, 0)   > 0 AS INTEGER)
+        , _fenteq_any: CAST(COALESCE(s.fenteq_day_mcg, 0)    > 0 OR COALESCE(s.fenteq_night_mcg, 0)    > 0 AS INTEGER)
+        , _midazeq_any: CAST(COALESCE(s.midazeq_day_mg, 0)   > 0 OR COALESCE(s.midazeq_night_mg, 0)    > 0 AS INTEGER)
         , prop_dif_mcg_kg_min: (COALESCE(s.prop_night_mcg_kg, 0) / NULLIF(s.n_hours_night, 0) / 60.0)
                              - (COALESCE(s.prop_day_mcg_kg, 0)   / NULLIF(s.n_hours_day, 0)   / 60.0)
         , fenteq_dif_mcg_hr: (COALESCE(s.fenteq_night_mcg, 0) / NULLIF(s.n_hours_night, 0))

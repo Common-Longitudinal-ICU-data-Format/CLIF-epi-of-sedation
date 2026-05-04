@@ -265,4 +265,7 @@ tables:
         max: 255
       weight_kg:
         min: 30
-        max: 1100
+        # 300 kg comfortably covers ICU morbid obesity (>99.99th percentile).
+        # Values above typically indicate lb↔kg unit-entry errors (e.g., a 710 kg
+        # record seen in practice = 325 kg physical weight charted as lb).
+        max: 300
