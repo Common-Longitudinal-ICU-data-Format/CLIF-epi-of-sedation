@@ -4,7 +4,7 @@
 #     "marimo",
 #     "clifpy>=0.3.1",
 #     "duckdb>=1.4.1",
-#     "pandas>=2.3.1",
+#     "polars>=1.34.0",
 # ]
 # ///
 
@@ -17,8 +17,16 @@ with app.setup:
     import marimo as mo
     import os
     import sys
+    import logging
     from pathlib import Path
     # sys.path.insert(0, str(Path(__file__).parent))
+
+    # Module-level logger singleton (per logging_integration_guide.md §2-3:
+    # hardcoded short name, not __name__). Visible in every cell. The
+    # `clifpy.epi_sedation.exposure` resolved name groups this script's
+    # log lines under the project namespace.
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.exposure")
 
 
 @app.cell(hide_code=True)
@@ -30,23 +38,22 @@ def _():
     for the IMV cohort identified in 01_cohort.
 
     Pipeline follows `pyCLIF/docs/duckdb_perf_guide.md`: stay lazy as
-    `DuckDBPyRelation`s, materialize only at clifpy interface boundaries
-    (load, outlier handling) and at terminal parquet writes. Juncture
-    relations are exposed under public (no-underscore) names so they can
-    be inspected interactively in the marimo UI.
+    `DuckDBPyRelation`s, materialize only at the parquet-write boundary.
+    Vendored DuckDB outlier handler (`code/_outlier_handler.py`) replaces
+    `apply_outlier_handling` so the chain doesn't have to round-trip through
+    `Table.from_file`'s pandas attribute.
     """)
     return
 
 
 @app.cell
 def _():
-    from clifpy import ClifOrchestrator
-    import pandas as pd
+    from clifpy import load_data, setup_logging
     import duckdb
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
     from clifpy.utils.config import get_config_or_params
-    from clifpy.utils import apply_outlier_handling
     from _utils import remove_meds_duplicates
+    from _outlier_handler import apply_outlier_handling_duckdb
 
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
@@ -60,40 +67,59 @@ def _():
     # tests/test_timezone.py asserts session-tz invariance.
 
     CONFIG_PATH = "config/config.json"
-    co = ClifOrchestrator(config_path=CONFIG_PATH)
     return (
         CONFIG_PATH,
-        apply_outlier_handling,
+        apply_outlier_handling_duckdb,
         convert_dose_units_by_med_category,
         duckdb,
         get_config_or_params,
-        pd,
+        load_data,
         remove_meds_duplicates,
+        setup_logging,
     )
 
 
 @app.cell
-def _(CONFIG_PATH, get_config_or_params):
+def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     SITE_TZ = cfg['timezone']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    # Per-site log separation: each site writes to output/{site}/logs/
+    # clifpy_all.log + clifpy_errors.log. setup_logging is idempotent; we
+    # call it explicitly here (instead of via ClifOrchestrator's __init__
+    # side effect) so the output_directory is site-scoped.
+    setup_logging(output_directory=f"output/{SITE_NAME}")
+    logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
     return SITE_NAME, SITE_TZ
 
 
 @app.cell
-def _(SITE_NAME, pd):
-    cohort_hrly_grids_f = pd.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
-    print(f"Hourly grid rows: {len(cohort_hrly_grids_f)}")
+def _(SITE_NAME, duckdb):
+    # Lazy parquet read — DuckDB scans on demand. The grid is site-tz tagged
+    # at write time by 01_cohort's retag_to_local_tz boundary, so event_dttm
+    # carries the correct local tz on disk; downstream SQL still uses
+    # AT TIME ZONE for explicit local-hour extraction.
+    cohort_hrly_grids_f = duckdb.sql(
+        f"FROM 'output/{SITE_NAME}/cohort_hrly_grids.parquet' SELECT *"
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        _n = cohort_hrly_grids_f.count("*").fetchone()[0]
+        logger.debug(f"Hourly grid rows: {_n:,}")
+    else:
+        logger.info("Hourly grid loaded as lazy relation")
     return (cohort_hrly_grids_f,)
 
 
 @app.cell
-def _(cohort_hrly_grids_f):
-    cohort_hosp_ids = cohort_hrly_grids_f['hospitalization_id'].unique().tolist()
-    print(f"Cohort hospitalizations: {len(cohort_hosp_ids)}")
+def _(cohort_hrly_grids_f, duckdb):
+    cohort_hosp_ids = [
+        r[0] for r in duckdb.sql(
+            "FROM cohort_hrly_grids_f SELECT DISTINCT hospitalization_id"
+        ).fetchall()
+    ]
+    logger.info(f"Cohort hospitalizations: {len(cohort_hosp_ids):,}")
     return (cohort_hosp_ids,)
 
 
@@ -109,30 +135,40 @@ def _():
 
 
 @app.cell
-def _(apply_outlier_handling, cohort_hosp_ids):
-    from clifpy import Vitals
-
-    vitals = Vitals.from_file(
+def _(apply_outlier_handling_duckdb, cohort_hosp_ids, load_data):
+    # `load_data(return_rel=True)` returns a bare DuckDBPyRelation — lazy,
+    # session-tz-independent (per duckdb_perf_guide §11.1, the vendored
+    # DuckDB outlier handler replaces clifpy's Table-object-bound
+    # apply_outlier_handling so the whole chain stays unmaterialized).
+    vitals_rel = load_data(
+        'vitals',
         config_path='config/config.json',
+        return_rel=True,
         columns=['hospitalization_id', 'recorded_dttm', 'vital_category', 'vital_value'],
         filters={
             'vital_category': ['weight_kg'],
-            'hospitalization_id': cohort_hosp_ids
-        }
+            'hospitalization_id': cohort_hosp_ids,
+        },
     )
-    apply_outlier_handling(vitals, outlier_config_path='config/outlier_config.yaml')
-    vitals_df = vitals.df
-    print(f"Vitals (weight_kg) rows: {len(vitals_df)}")
-    return (vitals_df,)
+    vitals_rel = apply_outlier_handling_duckdb(
+        vitals_rel, 'vitals', 'config/outlier_config.yaml',
+    )
+    logger.info("Vitals (weight_kg): lazy relation built")
+    return (vitals_rel,)
 
 
 @app.cell
-def _(cohort_hosp_ids):
-    from clifpy import MedicationAdminContinuous
-
-    # TODO: why are we using this instead of the duckdb-cenetered data loader from clifpy?
-    cont_sed = MedicationAdminContinuous.from_file(
+def _(cohort_hosp_ids, duckdb, load_data):
+    # Same pattern as vitals: lazy load with clifpy column/filter pushdown,
+    # then NULL-dose drop in SQL. clifpy's `from_file` filters dict only
+    # supports IN-list semantics, so the IS NOT NULL gate is applied here
+    # rather than at the load layer. The cohort + med_category pushdown
+    # above already narrows the parquet scan dramatically, so the remaining
+    # cost is a single-column predicate on the filtered subset.
+    cont_sed_rel = load_data(
+        'medication_admin_continuous',
         config_path='config/config.json',
+        return_rel=True,
         columns=[
             'hospitalization_id', 'admin_dttm', 'med_name', 'med_category',
             'med_dose', 'med_dose_unit', 'mar_action_name', 'mar_action_category',
@@ -142,37 +178,68 @@ def _(cohort_hosp_ids):
             'hospitalization_id': cohort_hosp_ids,
         }
     )
-
-    # Drop NULL doses at the source. clifpy's `from_file` filters dict only
-    # supports IN-list semantics, so we apply IS NOT NULL post-load. The
-    # cohort + med_category pushdown above already narrows the scan
-    # dramatically, so the remaining cost is a single-column scan over the
-    # filtered subset.
-    _n_before = len(cont_sed.df)
-    cont_sed.df = cont_sed.df[cont_sed.df['med_dose'].notna()].reset_index(drop=True)
-    _n_dropped = _n_before - len(cont_sed.df)
-    print(f"Continuous sedation records: {len(cont_sed.df)} "
-          f"(dropped {_n_dropped} NULL-dose rows out of {_n_before})")
-    return (cont_sed,)
+    cont_sed_rel = duckdb.sql("FROM cont_sed_rel WHERE med_dose IS NOT NULL")
+    if logger.isEnabledFor(logging.DEBUG):
+        _n = cont_sed_rel.count("*").fetchone()[0]
+        logger.debug(f"Continuous sedation: {_n:,} non-null-dose rows")
+    else:
+        logger.info("Continuous sedation: lazy relation built")
+    return (cont_sed_rel,)
 
 
 @app.cell
-def _(cont_sed):
-    cont_sed.df
+def _(cont_sed_rel):
+    cont_sed_rel
     return
 
 
 @app.cell
-def _(cont_sed, remove_meds_duplicates):
-    cont_sed_deduped = remove_meds_duplicates(cont_sed.df)
-    _n_removed = len(cont_sed.df) - len(cont_sed_deduped)
-    print(f"Removed {_n_removed} ({_n_removed / len(cont_sed.df):.2%}) duplicates by MAR action")
-    # we are throwing off
+def _(cont_sed_rel, duckdb, remove_meds_duplicates):
+    cont_sed_deduped = remove_meds_duplicates(cont_sed_rel)
+    # Summary count is always logged (single scalar query, cheap). The
+    # per-mar_action_name combo breakdown below is DEBUG-gated.
+    _n_before = cont_sed_rel.count("*").fetchone()[0]
+    _n_after = cont_sed_deduped.count("*").fetchone()[0]
+    _n_removed = _n_before - _n_after
+    _pct = _n_removed / _n_before * 100 if _n_before else 0.0
+    logger.info(
+        f"cont_sed dedup: removed {_n_removed:,} ({_pct:.2f}%) "
+        f"({_n_before:,} → {_n_after:,})"
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        # MAR-dedup QC (F5): surface top mar_action_name combos in the
+        # duplicate clusters. Lazy scalar query — never materializes the
+        # row-level frame. Adapted from
+        # pyCLIF/dev/check_mar_duplicates_dev.ipynb.
+        _rows = duckdb.sql("""
+            WITH dups AS (
+                FROM cont_sed_rel
+                SELECT *
+                    , _grp_size: COUNT(*) OVER (
+                        PARTITION BY hospitalization_id, admin_dttm, med_category
+                    )
+                QUALIFY _grp_size > 1
+            )
+            , combos AS (
+                FROM dups
+                SELECT
+                    hospitalization_id, admin_dttm, med_category
+                    , combo: STRING_AGG(mar_action_name, '; ' ORDER BY mar_action_name)
+                GROUP BY 1, 2, 3
+            )
+            FROM combos
+            SELECT combo, n_groups: COUNT(*)
+            GROUP BY combo
+            ORDER BY n_groups DESC
+            LIMIT 10
+        """).fetchall()
+        for _combo, _n_groups in _rows:
+            logger.debug(f"  cont_sed dup combo [{_combo}]: {_n_groups:,} groups")
     return (cont_sed_deduped,)
 
 
 @app.cell
-def _(cont_sed_deduped, vitals_df):
+def _(cont_sed_deduped, vitals_rel):
     cont_sed_with_weight = mo.sql(
         f"""
         -- Phase 2 weight override: pre-attach a project-controlled `weight_kg`
@@ -192,7 +259,7 @@ def _(cont_sed_deduped, vitals_df):
         -- Stays lazy as a DuckDBPyRelation — feeds directly into
         -- convert_dose_units_by_med_category(return_rel=True) below.
         WITH weights AS (
-                FROM vitals_df
+                FROM vitals_rel
                 SELECT hospitalization_id, recorded_dttm
                     , weight_kg: vital_value
                 WHERE vital_category = 'weight_kg' AND vital_value IS NOT NULL
@@ -229,9 +296,10 @@ def _(cont_sed_deduped, vitals_df):
 
 @app.cell
 def _(cont_sed_with_weight, duckdb):
-    # NOTE: notice how these 2 cells are now split off into one that is purely mo.sql and the other (below) for qaqc
-
-    # Diagnostics: pull only scalars (no full materialization).
+    # Diagnostics on the lazy weight-attached relation (per perf-guide §11.6:
+    # scalar diagnostics without breaking the lazy DAG). The SUM-over-CASE
+    # query touches the relation independently; cont_sed_with_weight
+    # continues downstream untouched.
     _diag = duckdb.sql("""
         FROM cont_sed_with_weight
         SELECT
@@ -240,13 +308,16 @@ def _(cont_sed_with_weight, duckdb):
             , SUM(CASE WHEN _weight_source = 'admission_fallback' THEN 1 ELSE 0 END) AS n_fallback
     """).fetchone()
     _n_total, _n_null, _n_fallback = _diag
-    print(f"Pre-attached weight on {_n_total:,} admins")
-    print(f"  per_admin_asof: {_n_total - _n_fallback - _n_null:,}")
-    print(f"  admission_fallback: {_n_fallback:,}")
+    logger.info(f"Pre-attached weight on {_n_total:,} admins")
+    logger.info(f"  per_admin_asof: {_n_total - _n_fallback - _n_null:,}")
+    logger.info(f"  admission_fallback: {_n_fallback:,}")
     if _n_null > 0:
-        print(f"  WARNING: {_n_null:,} admins NULL after fallback — "
-              "these patients should have been in weight-QC drop list. "
-              "Check 01_cohort.py applied the drop.")
+        # WARNING for the fallback-failure path. Don't embed the literal
+        # "WARNING:" prefix — the EmojiFormatter handles per-level prefixes.
+        logger.warning(
+            f"{_n_null:,} admins NULL after fallback — these patients should "
+            "have been in weight-QC drop list. Check 01_cohort.py applied the drop."
+        )
     return
 
 
@@ -292,17 +363,13 @@ def _(cont_sed_convert_summary):
 
 
 @app.cell
-def _(cont_sed, cont_sed_converted_rel, duckdb):
-    # Materialize once at the clifpy outlier-handling boundary.
-    # `apply_outlier_handling` reads `table_obj.df` and mutates it in-place
-    # (clifpy/utils/outlier_handler.py), so a pandas DataFrame is required here.
-    #
-    # Project convention: keep the clifpy-named columns (med_dose, med_dose_unit)
-    # holding the post-conversion values, with the originals preserved as
-    # `_original`. Done in SQL via column aliasing before the .df() so we
-    # avoid a separate pandas .rename() pass.
-    # FIXME: this cell should use mo.sql directly if that makes sense
-    cont_sed.df = duckdb.sql("""
+def _(cont_sed_converted_rel):
+    # Promote `_converted` columns to canonical names (med_dose,
+    # med_dose_unit) and preserve originals as `_original`. Pure SQL,
+    # lazy. The vendored outlier handler in the next cell operates on the
+    # promoted (preferred-unit) values — matching the YAML config keys.
+    cont_sed_renamed = mo.sql(
+        f"""
         FROM cont_sed_converted_rel
         SELECT
             * EXCLUDE (med_dose, med_dose_unit, med_dose_converted, med_dose_unit_converted)
@@ -310,30 +377,61 @@ def _(cont_sed, cont_sed_converted_rel, duckdb):
             , med_dose_unit_original: med_dose_unit
             , med_dose: med_dose_converted
             , med_dose_unit: med_dose_unit_converted
-    """).df()
-    return
+        """
+    )
+    return (cont_sed_renamed,)
 
 
 @app.cell
-def _(apply_outlier_handling, cont_sed):
-    apply_outlier_handling(cont_sed, outlier_config_path='config/outlier_config.yaml')
-    cont_sed_converted = cont_sed.df
-    print(f"{len(cont_sed_converted)} rows in cont_sed_converted")
+def _(apply_outlier_handling_duckdb, cont_sed_renamed):
+    # Vendored DuckDB outlier handler — operates on a DuckDBPyRelation,
+    # returns a lazy relation. Replaces clifpy's pandas-based
+    # apply_outlier_handling (per duckdb_perf_guide §11.1).
+    cont_sed_outliered = apply_outlier_handling_duckdb(
+        cont_sed_renamed,
+        'medication_admin_continuous',
+        'config/outlier_config.yaml',
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        _n = cont_sed_outliered.count("*").fetchone()[0]
+        logger.debug(f"cont_sed post-outlier: {_n:,} rows")
+    else:
+        logger.info("cont_sed post-outlier: lazy relation built")
+    return (cont_sed_outliered,)
+
+
+@app.cell
+def _(cont_sed_outliered):
+    cont_sed_outliered
     return
 
 
 @app.cell
 def _():
-    # Pivot continuous sedation to wide format (one column per drug_unit).
+    # Pivot continuous sedation to wide format. F4 fix: the column-name
+    # builder embeds the post-aggregation unit (`_hr_`) directly so the
+    # SUM-per-hour step downstream produces final names without any
+    # pandas .rename() pass (per duckdb_perf_guide §11.2 — dynamic
+    # PIVOT_WIDER columns block post-pivot SQL aliasing).
+    #
+    # Mid-pipeline naming caveat: between forward-fill and SUM-per-hour,
+    # column names will say `_hr_cont` while values are still per-minute
+    # rates. Mirrors a pre-F4 inverse lie (`_min_cont` after
+    # multiplication-by-duration). Names match values only at the final
+    # per-hour aggregation step.
+    #
     # NOTE: stop events forced to dose=0 so forward-fill doesn't propagate
     # stale rates (audit H1).
     cont_sed_w = mo.sql(
         f"""
         WITH t1 AS (
-        FROM cont_sed_converted
+        FROM cont_sed_outliered
         SELECT hospitalization_id
             , admin_dttm AS event_dttm
-            , med_category_unit: med_category || '_' || REPLACE(med_dose_unit, '/', '_') || '_cont'
+            , med_category_unit:
+                med_category || '_'
+                || REPLACE(REPLACE(med_dose_unit, '/min', ''), '/', '_')
+                || '_hr_cont'
             , med_dose: CASE WHEN mar_action_category IN ('stop', 'not_given') THEN 0 ELSE med_dose END
         )
         PIVOT_WIDER t1
@@ -354,12 +452,13 @@ def _(SITE_TZ, cohort_hrly_grids_f, cont_sed_w):
     # `_shift`/`_nth_day`/etc. on cohort_hrly_grids_f are re-joined later at
     # the per-hour merge step (sed_dose_by_hr).
     #
-    # `_dh`/`_hr` derived from `event_dttm AT TIME ZONE '{SITE_TZ}'` — explicit
-    # local-tz extraction, session-tz-independent. `event_dttm` may arrive as
-    # site-tz tagged (from cohort_hrly_grids.parquet, post 01_cohort retag) or
-    # as UTC tz-aware (from cont_sed_w via clifpy load); DuckDB normalizes both
-    # to TIMESTAMPTZ internally and `AT TIME ZONE` operates on the underlying
-    # instant, so the result is correct regardless of which path supplied the row.
+    # `_dh`/`_hr` derived from `event_dttm AT TIME ZONE '{SITE_TZ}'` —
+    # explicit local-tz extraction, session-tz-independent. `event_dttm` may
+    # arrive as site-tz tagged (from cohort_hrly_grids.parquet, post
+    # 01_cohort retag) or as UTC tz-aware (from cont_sed_w via clifpy load);
+    # DuckDB normalizes both to TIMESTAMPTZ internally and `AT TIME ZONE`
+    # operates on the underlying instant, so the result is correct
+    # regardless of which path supplied the row.
     cont_sed_wg = mo.sql(
         f"""
         WITH grid AS (
@@ -414,10 +513,10 @@ def _(cont_sed_wg):
 
 
 @app.cell
-def _(cont_sed_filled, duckdb):
+def _(cont_sed_filled):
     # Coalesce null sedation rates to 0 (stop events + pre-first-admin grid rows).
-    cont_sed_zeroed = duckdb.sql(
-        """
+    cont_sed_zeroed = mo.sql(
+        f"""
         FROM cont_sed_filled
         SELECT hospitalization_id, event_dttm, _dh, _hr, _duration
             , COALESCE(COLUMNS('_cont'), 0)
@@ -427,10 +526,10 @@ def _(cont_sed_filled, duckdb):
 
 
 @app.cell
-def _(cont_sed_zeroed, duckdb):
+def _(cont_sed_zeroed):
     # Multiply rate by duration (minutes) → total dose per inter-event interval.
-    cont_sed_per_event = duckdb.sql(
-        """
+    cont_sed_per_event = mo.sql(
+        f"""
         FROM cont_sed_zeroed
         SELECT hospitalization_id, event_dttm, _dh, _hr, _duration
             , COLUMNS('_cont') * _duration
@@ -440,36 +539,22 @@ def _(cont_sed_zeroed, duckdb):
 
 
 @app.cell
-def _(cont_sed_per_event, duckdb):
-    # Aggregate continuous dose by hour, then rename cols to reflect the
-    # post-aggregation unit. Rates are mg/min (or mcg/min) pre-sum, but after
-    # SUM-per-hour the values represent total mg (or mcg) delivered in that
-    # hour — so `_mg_min_cont` → `_mg_hr_cont` (2026-04-24 unit convention).
-    #
-    # The dynamic `PIVOT_WIDER` upstream means we don't know which `_cont`
-    # columns exist until runtime (e.g., a cohort with no propofol records
-    # has no `propofol_mcg_kg_min_cont`). pandas.rename silently skips
-    # missing keys; SQL aliases would error on absent columns. So we
-    # materialize here and rename in pandas — a small one-time pass on the
-    # already-aggregated frame.
-    cont_sed_dose_by_hr = duckdb.sql(
-        """
+def _(cont_sed_per_event):
+    # Aggregate continuous dose by hour. Column names already carry the
+    # post-aggregation `_hr_` unit suffix (set at pivot-construction time
+    # in cont_sed_w), so no rename is needed — the SQL output IS the final
+    # relation. Per duckdb_perf_guide §11.2 (dynamic PIVOT_WIDER columns
+    # block post-pivot SQL aliasing; push the desired names into the
+    # upstream column-builder).
+    cont_sed_dose_by_hr = mo.sql(
+        f"""
         FROM cont_sed_per_event
         SELECT hospitalization_id, _dh, _hr
             , SUM(COLUMNS('_cont'))
         GROUP BY hospitalization_id, _dh, _hr
         ORDER BY hospitalization_id, _dh
         """
-    ).df().rename(columns={
-        # Propofol: mcg/kg/min input × _duration (min) summed by hour
-        # → mcg/kg total in that hour = mcg/kg/hr rate.
-        'propofol_mcg_kg_min_cont':  'propofol_mcg_kg_hr_cont',
-        # Other drugs unchanged: unweighted mg or mcg per minute → per hour.
-        'fentanyl_mcg_min_cont':     'fentanyl_mcg_hr_cont',
-        'midazolam_mg_min_cont':     'midazolam_mg_hr_cont',
-        'hydromorphone_mg_min_cont': 'hydromorphone_mg_hr_cont',
-        'lorazepam_mg_min_cont':     'lorazepam_mg_hr_cont',
-    })
+    )
     return (cont_sed_dose_by_hr,)
 
 
@@ -491,11 +576,11 @@ def _():
 
 
 @app.cell
-def _(cohort_hosp_ids):
-    from clifpy import MedicationAdminIntermittent
-
-    intm_sed = MedicationAdminIntermittent.from_file(
+def _(cohort_hosp_ids, duckdb, load_data):
+    intm_sed_rel = load_data(
+        'medication_admin_intermittent',
         config_path='config/config.json',
+        return_rel=True,
         columns=[
             'hospitalization_id', 'admin_dttm', 'med_name', 'med_category',
             'med_dose', 'med_dose_unit', 'mar_action_name', 'mar_action_category',
@@ -503,34 +588,68 @@ def _(cohort_hosp_ids):
         filters={
             'med_category': ['hydromorphone', 'fentanyl', 'lorazepam', 'midazolam', 'propofol'],
             'hospitalization_id': cohort_hosp_ids,
-            'mar_action_category': ['given', 'bolus', 'other']
+            # 'mar_action_category': ['given', 'bolus', 'other'],
         }
     )
-
-    # Drop NULL doses at the source — same rationale as continuous sed above.
-    _n_before = len(intm_sed.df)
-    intm_sed.df = intm_sed.df[intm_sed.df['med_dose'].notna()].reset_index(drop=True)
-    _n_dropped = _n_before - len(intm_sed.df)
-    print(f"Intermittent sedation records: {len(intm_sed.df)} "
-          f"(dropped {_n_dropped} NULL-dose rows out of {_n_before})")
-    return (intm_sed,)
+    intm_sed_rel = duckdb.sql("FROM intm_sed_rel WHERE med_dose IS NOT NULL")
+    if logger.isEnabledFor(logging.DEBUG):
+        _n = intm_sed_rel.count("*").fetchone()[0]
+        logger.debug(f"Intermittent sedation: {_n:,} non-null-dose rows")
+    else:
+        logger.info("Intermittent sedation: lazy relation built")
+    return (intm_sed_rel,)
 
 
 @app.cell
-def _(intm_sed, remove_meds_duplicates):
-    intm_sed_deduped = remove_meds_duplicates(intm_sed.df)
-    _n_removed = len(intm_sed.df) - len(intm_sed_deduped)
-    print(f"Removed {_n_removed} ({_n_removed / len(intm_sed.df):.2%}) duplicates by MAR action")
-    # NOTE: here we are removing 25% of entries in MIMIC
-    # let's some QC functions here to display what are the ones being removed look like b/c it is a relatively high removal rate
-    # can adapt functions from /Users/wliao0504/code/clif/pyCLIF/dev/check_mar_duplicates_dev.ipynb
+def _(duckdb, intm_sed_rel, remove_meds_duplicates):
+    intm_sed_deduped = remove_meds_duplicates(intm_sed_rel)
+    # Summary always at INFO so MIMIC's high removal rate is visible by
+    # default; the per-combo breakdown is DEBUG-gated.
+    _n_before = intm_sed_rel.count("*").fetchone()[0]
+    _n_after = intm_sed_deduped.count("*").fetchone()[0]
+    _n_removed = _n_before - _n_after
+    _pct = _n_removed / _n_before * 100 if _n_before else 0.0
+    logger.info(
+        f"intm_sed dedup: removed {_n_removed:,} ({_pct:.2f}%) "
+        f"({_n_before:,} → {_n_after:,})"
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        # MIMIC's intermittent table has historically shown ~25% removal
+        # rate (vs UCMC ~few%), suggesting systematic same-timestamp
+        # duplicates from the dual-charting pattern (see
+        # pyCLIF/dev/check_mar_duplicates_dev.ipynb). Surface the top
+        # mar_action_name combos here.
+        _rows = duckdb.sql("""
+            WITH dups AS (
+                FROM intm_sed_rel
+                SELECT *
+                    , _grp_size: COUNT(*) OVER (
+                        PARTITION BY hospitalization_id, admin_dttm, med_category
+                    )
+                QUALIFY _grp_size > 1
+            )
+            , combos AS (
+                FROM dups
+                SELECT
+                    hospitalization_id, admin_dttm, med_category
+                    , combo: STRING_AGG(mar_action_name, '; ' ORDER BY mar_action_name)
+                GROUP BY 1, 2, 3
+            )
+            FROM combos
+            SELECT combo, n_groups: COUNT(*)
+            GROUP BY combo
+            ORDER BY n_groups DESC
+            LIMIT 10
+        """).fetchall()
+        for _combo, _n_groups in _rows:
+            logger.debug(f"  intm_sed dup combo [{_combo}]: {_n_groups:,} groups")
     return (intm_sed_deduped,)
 
 
 @app.cell
-def _(convert_dose_units_by_med_category, intm_sed_deduped, vitals_df):
+def _(convert_dose_units_by_med_category, intm_sed_deduped, vitals_rel):
     # Intermittent: bolus mg/dose with no defined duration. Targets are
-    # weight-free amount units; vitals_df is needed when a source row carries
+    # weight-free amount units; vitals_rel is needed when a source row carries
     # a /kg qualifier. Stay lazy via return_rel=True; convert_summary is the
     # surface that confirms the unit map for each category.
     _intm_sed_preferred_units = {
@@ -542,7 +661,7 @@ def _(convert_dose_units_by_med_category, intm_sed_deduped, vitals_df):
     }
     intm_sed_converted_rel, intm_sed_convert_summary = convert_dose_units_by_med_category(
         intm_sed_deduped,
-        vitals_df=vitals_df,
+        vitals_df=vitals_rel,
         preferred_units=_intm_sed_preferred_units,
         override=True,
         return_rel=True,
@@ -557,11 +676,11 @@ def _(intm_sed_convert_summary):
 
 
 @app.cell
-def _(apply_outlier_handling, duckdb, intm_sed, intm_sed_converted_rel):
-    # Materialize once at the outlier-handling boundary — same pattern as
-    # cont_sed. SQL aliasing promotes `_converted` columns to canonical
-    # names before .df() so we avoid a separate pandas rename pass.
-    intm_sed.df = duckdb.sql("""
+def _(intm_sed_converted_rel):
+    # Same alias-rename as cont_sed: promote `_converted` columns to
+    # canonical names (med_dose, med_dose_unit) for the outlier handler.
+    intm_sed_renamed = mo.sql(
+        f"""
         FROM intm_sed_converted_rel
         SELECT
             * EXCLUDE (med_dose, med_dose_unit, med_dose_converted, med_dose_unit_converted)
@@ -569,29 +688,49 @@ def _(apply_outlier_handling, duckdb, intm_sed, intm_sed_converted_rel):
             , med_dose_unit_original: med_dose_unit
             , med_dose: med_dose_converted
             , med_dose_unit: med_dose_unit_converted
-    """).df()
-    apply_outlier_handling(intm_sed, outlier_config_path='config/outlier_config.yaml')
-    intm_sed_converted = intm_sed.df
-    print(f"{len(intm_sed_converted)} rows in intm_sed_converted")
-    return (intm_sed_converted,)
+        """
+    )
+    return (intm_sed_renamed,)
 
 
 @app.cell
-def _(intm_sed_converted):
-    intm_sed_converted
+def _(apply_outlier_handling_duckdb, intm_sed_renamed):
+    intm_sed_outliered = apply_outlier_handling_duckdb(
+        intm_sed_renamed,
+        'medication_admin_intermittent',
+        'config/outlier_config.yaml',
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        _n = intm_sed_outliered.count("*").fetchone()[0]
+        logger.debug(f"intm_sed post-outlier: {_n:,} rows")
+    else:
+        logger.info("intm_sed post-outlier: lazy relation built")
+    return (intm_sed_outliered,)
+
+
+@app.cell
+def _(intm_sed_outliered):
+    intm_sed_outliered
     return
 
 
 @app.cell
 def _():
-    # Pivot intermittent sedation to wide format; zero out not_given doses.
+    # Pivot intermittent sedation to wide format. F4 fix: the column-name
+    # builder embeds `_hr_intm` directly so the SUM-per-hour step
+    # downstream produces final names without rename. After SUM-per-hour,
+    # `propofol_mg_hr_intm` represents total mg delivered that hour from
+    # intermittent admin.
     intm_sed_w = mo.sql(
         f"""
         WITH t1 AS (
-        FROM intm_sed_converted
+        FROM intm_sed_outliered
         SELECT hospitalization_id
             , admin_dttm AS event_dttm
-            , med_category_unit: med_category || '_' || REPLACE(med_dose_unit, '/', '_') || '_intm'
+            , med_category_unit:
+                med_category || '_'
+                || REPLACE(med_dose_unit, '/', '_')
+                || '_hr_intm'
             , med_dose: CASE WHEN mar_action_category = 'not_given' THEN 0 ELSE med_dose END
         )
         PIVOT_WIDER t1
@@ -601,6 +740,12 @@ def _():
         """
     )
     return (intm_sed_w,)
+
+
+@app.cell
+def _(intm_sed_w):
+    intm_sed_w.df()
+    return
 
 
 @app.cell
@@ -628,28 +773,19 @@ def _(SITE_TZ, cohort_hrly_grids_f, intm_sed_w):
 
 
 @app.cell
-def _(duckdb, intm_sed_wg):
-    # Aggregate intermittent dose by hour, then rename cols to match the
-    # post-aggregation "per hour" unit (2026-04-24 unit convention). After
-    # SUM-per-hour, `propofol_mg_intm` represents total mg delivered that
-    # hour from intermittent admin, so the column name gains the `_hr_`
-    # segment. pandas.rename silently skips missing keys.
-    # FIXME: this is a clear violation of the pattern -- why are we materiliazing and renaming? whats the advantage in renaming by pandas? cant we rename within SQL?
-    intm_sed_dose_by_hr = duckdb.sql(
-        """
+def _(intm_sed_wg):
+    # Aggregate intermittent dose by hour. Column names already carry the
+    # post-aggregation `_hr_intm` unit suffix (set at pivot-construction
+    # time in intm_sed_w), so no rename is needed.
+    intm_sed_dose_by_hr = mo.sql(
+        f"""
         FROM intm_sed_wg
         SELECT hospitalization_id, _dh
             , SUM(COALESCE(COLUMNS('_intm'), 0))
         GROUP BY hospitalization_id, _dh
         ORDER BY hospitalization_id, _dh
         """
-    ).df().rename(columns={
-        'propofol_mg_intm':      'propofol_mg_hr_intm',
-        'fentanyl_mcg_intm':     'fentanyl_mcg_hr_intm',
-        'midazolam_mg_intm':     'midazolam_mg_hr_intm',
-        'hydromorphone_mg_intm': 'hydromorphone_mg_hr_intm',
-        'lorazepam_mg_intm':     'lorazepam_mg_hr_intm',
-    })
+    )
     return (intm_sed_dose_by_hr,)
 
 
@@ -710,7 +846,7 @@ def _():
 
 
 @app.cell
-def _(duckdb, sed_dose_by_hr):
+def _(sed_dose_by_hr):
     # Aggregate dose totals AND hour counts per hospitalization, day, shift.
     # n_hours is used downstream to convert totals to per-hour dose rates,
     # which avoids single-shift bias in the Dose by Shift descriptive table
@@ -719,8 +855,8 @@ def _(duckdb, sed_dose_by_hr):
     # Column-name convention (2026-04-24): totals carry their unit as
     # suffix (`_mg` for propofol+midaz totals, `_mcg` for fentanyl totals);
     # per-hour rates downstream carry `_mg_hr` / `_mcg_hr`.
-    sed_dose_agg = duckdb.sql(
-        """
+    sed_dose_agg = mo.sql(
+        f"""
         FROM sed_dose_by_hr
         SELECT hospitalization_id, _nth_day, _shift
             -- Phase 2: propofol now sums to total mcg/kg over the shift
@@ -738,7 +874,7 @@ def _(duckdb, sed_dose_by_hr):
 
 
 @app.cell
-def _(duckdb, sed_dose_agg):
+def _(sed_dose_agg):
     # Pivot _shift to wide day/night columns via conditional aggregation.
     # FILTER (WHERE _shift = 'day' / 'night') replaces the pandas .pivot()
     # +column-flatten dance so the entire daily roll-up stays in SQL.
@@ -748,8 +884,8 @@ def _(duckdb, sed_dose_agg):
     # day edges). Unit-suffixed column names (e.g. prop_day_mcg_kg = total
     # mcg/kg over 12h day shift) match the 2026-04-24 naming convention; see
     # 05_analytical_dataset.py.
-    sed_dose_daily = duckdb.sql(
-        """
+    sed_dose_daily = mo.sql(
+        f"""
         FROM sed_dose_agg
         SELECT hospitalization_id, _nth_day
             , prop_day_mcg_kg:   SUM(prop_mcg_kg) FILTER (WHERE _shift = 'day')
@@ -778,22 +914,32 @@ def _():
     mo.md(r"""
     ## Save Outputs
 
-    Terminal materialization — `.df()` exactly once per parquet write.
-    Each call triggers the optimizer to plan and execute the lazy DAG
-    accumulated upstream.
+    Terminal materialization. `sed_dose_daily` and `sed_dose_agg` write via
+    DuckDB native `.to_parquet()` (no `*_dttm` columns). `sed_dose_by_hr`
+    has `event_dttm` from the cohort grid join — DuckDB's parquet writer
+    normalizes TIMESTAMPTZ to a UTC tag, which would lose our site-local
+    tag on disk, so it routes through Polars (preserves the tz tag via
+    Arrow). See `pyCLIF/docs/duckdb_perf_guide.md §11.4`.
     """)
     return
 
 
 @app.cell
-def _(SITE_NAME, sed_dose_agg, sed_dose_by_hr, sed_dose_daily):
-    sed_dose_daily.df().to_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet", index=False)
-    sed_dose_agg.df().to_parquet(f"output/{SITE_NAME}/sed_dose_agg.parquet", index=False)
-    sed_dose_by_hr.df().to_parquet(f"output/{SITE_NAME}/sed_dose_by_hr.parquet", index=False)
+def _(SITE_NAME, SITE_TZ, sed_dose_agg, sed_dose_by_hr, sed_dose_daily):
+    import polars as pl  # cell-local — used only for the tz-bearing parquet write
 
-    print(f"Saved: output/{SITE_NAME}/sed_dose_daily.parquet")
-    print(f"Saved: output/{SITE_NAME}/sed_dose_agg.parquet")
-    print(f"Saved: output/{SITE_NAME}/sed_dose_by_hr.parquet")
+    sed_dose_daily.to_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet")
+    sed_dose_agg.to_parquet(f"output/{SITE_NAME}/sed_dose_agg.parquet")
+    (
+        sed_dose_by_hr
+        .pl()
+        .with_columns(pl.col("event_dttm").dt.convert_time_zone(SITE_TZ))
+        .write_parquet(f"output/{SITE_NAME}/sed_dose_by_hr.parquet")
+    )
+
+    logger.info(f"Saved: output/{SITE_NAME}/sed_dose_daily.parquet")
+    logger.info(f"Saved: output/{SITE_NAME}/sed_dose_agg.parquet")
+    logger.info(f"Saved: output/{SITE_NAME}/sed_dose_by_hr.parquet")
     return
 
 
