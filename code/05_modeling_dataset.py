@@ -59,18 +59,20 @@ def _():
 def _():
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
+    from _utils import retag_to_local_tz
     import pandas as pd
     import duckdb
 
     CONFIG_PATH = "config/config.json"
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    SITE_TZ = cfg['timezone']
     # Site-scoped output dir (see Makefile SITE= flag). `os` comes from the
     # app.setup block at the top; re-importing here would raise marimo's
     # MultipleDefinitionError.
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
-    return CONFIG_PATH, SITE_NAME, apply_outlier_handling, pd
+    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    return CONFIG_PATH, SITE_NAME, SITE_TZ, apply_outlier_handling, pd, retag_to_local_tz
 
 
 @app.cell(hide_code=True)
@@ -194,7 +196,7 @@ def _(
         , _success_extub_today: o._success_extub
         , sbt_done_next_day: LEAD(o.sbt_done) OVER w
         , success_extub_next_day: LEAD(o._success_extub) OVER w
-        -- Sensitivity-sibling SBT outcomes (see docs/intub_extub_specs.md
+        -- Sensitivity-sibling SBT outcomes (see docs/outcomes_specs.md
         -- "Sensitivity siblings"). Each varies the prior-mode operationalization
         -- or sustained-duration threshold; primary `sbt_done` above is the
         -- spec-literal version. The cohort filter at the bottom of this cell
@@ -206,6 +208,8 @@ def _(
         , sbt_done_imv6h_next_day: LEAD(o.sbt_done_imv6h) OVER w
         , _sbt_done_prefix_today: o.sbt_done_prefix
         , sbt_done_prefix_next_day: LEAD(o.sbt_done_prefix) OVER w
+        , _sbt_done_multiday_today: o.sbt_done_multiday
+        , sbt_done_multiday_next_day: LEAD(o.sbt_done_multiday) OVER w
         , _sbt_done_2min_today: o.sbt_done_2min
         , sbt_done_2min_next_day: LEAD(o.sbt_done_2min) OVER w
         , _sbt_done_subira_today: o.sbt_done_subira
@@ -337,8 +341,11 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, cohort_merged_final):
+def _(SITE_NAME, SITE_TZ, cohort_merged_final, retag_to_local_tz):
     _df = cohort_merged_final.df()
+    # _first_icu_dttm flows in from covariates_t1; retag so the on-disk tz
+    # tag is site-local regardless of who runs the script.
+    _df = retag_to_local_tz(_df, ["_first_icu_dttm"], SITE_TZ)
     _path = f"output/{SITE_NAME}/modeling_dataset.parquet"
     _df.to_parquet(_path, index=False)
     print(f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations)")
@@ -471,6 +478,8 @@ def _(
         , sbt_done_imv6h_next_day: LEAD(o.sbt_done_imv6h) OVER w
         , _sbt_done_prefix_today: o.sbt_done_prefix
         , sbt_done_prefix_next_day: LEAD(o.sbt_done_prefix) OVER w
+        , _sbt_done_multiday_today: o.sbt_done_multiday
+        , sbt_done_multiday_next_day: LEAD(o.sbt_done_multiday) OVER w
         , _sbt_done_2min_today: o.sbt_done_2min
         , sbt_done_2min_next_day: LEAD(o.sbt_done_2min) OVER w
         , _sbt_done_subira_today: o.sbt_done_subira
@@ -579,8 +588,9 @@ def _(cohort_merged_exposure_clean, nmb_excluded):
 
 
 @app.cell
-def _(SITE_NAME, cohort_merged_exposure_final):
+def _(SITE_NAME, SITE_TZ, cohort_merged_exposure_final, retag_to_local_tz):
     _df = cohort_merged_exposure_final.df()
+    _df = retag_to_local_tz(_df, ["_first_icu_dttm"], SITE_TZ)
     _path = f"output/{SITE_NAME}/exposure_dataset.parquet"
     _df.to_parquet(_path, index=False)
     _n_day0 = (_df['_nth_day'] == 0).sum()

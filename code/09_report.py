@@ -758,7 +758,7 @@ def _(
         # that OR > 1 persists across primary / anyprior / imv6h / 2min and
         # only flips under `prefix` (the pre-fix every-row reproduction),
         # establishing that the OR > 1 pattern is robust to the SBT-detection
-        # operationalization choice. See docs/intub_extub_specs.md "Sensitivity
+        # operationalization choice. See docs/outcomes_specs.md "Sensitivity
         # siblings" for definitions.
         _variant_titles = {
             'anyprior': "anyprior — drops controlled-mode whitelist; only requires non-SBT prior row",

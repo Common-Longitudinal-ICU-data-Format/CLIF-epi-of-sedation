@@ -45,7 +45,7 @@ def _():
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
-    from _utils import remove_meds_duplicates
+    from _utils import remove_meds_duplicates, retag_to_local_tz
 
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
@@ -60,6 +60,7 @@ def _():
         get_config_or_params,
         pd,
         remove_meds_duplicates,
+        retag_to_local_tz,
     )
 
 
@@ -68,9 +69,10 @@ def _(CONFIG_PATH, get_config_or_params):
     # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    SITE_TZ = cfg['timezone']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
-    return (SITE_NAME,)
+    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    return SITE_NAME, SITE_TZ
 
 
 @app.cell
@@ -920,6 +922,7 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
 @app.cell
 def _(
     SITE_NAME,
+    SITE_TZ,
     ase_df,
     bmi_df,
     duckdb,
@@ -927,6 +930,7 @@ def _(
     first_icu_admit,
     imv_dur_df,
     pf_24h_df,
+    retag_to_local_tz,
     sofa_24h_pd,
 ):
     # Cell H — Combine all T1 covariates into one row-per-hospitalization dataframe
@@ -959,6 +963,9 @@ def _(
         ORDER BY f.hospitalization_id
     """).df()
     _t1_path = f"output/{SITE_NAME}/covariates_t1.parquet"
+    # Retag _first_icu_dttm to SITE_TZ so the on-disk tz tag is the site's
+    # configured tz, not the OS session tz that DuckDB stamped at .df() time.
+    covariates_t1 = retag_to_local_tz(covariates_t1, ["_first_icu_dttm"], SITE_TZ)
     covariates_t1.to_parquet(_t1_path, index=False)
     print(
         f"Saved: {_t1_path} "
@@ -979,8 +986,11 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, covs, covs_daily):
+def _(SITE_NAME, SITE_TZ, covs, covs_daily, retag_to_local_tz):
     _covs_shift_df = covs.df()
+    # covariates_shift has event_dttm (shift-grain). covariates_daily is a
+    # pure aggregate (groups by hospitalization_id, _nth_day) so no retag.
+    _covs_shift_df = retag_to_local_tz(_covs_shift_df, ["event_dttm"], SITE_TZ)
     _covs_shift_path = f"output/{SITE_NAME}/covariates_shift.parquet"
     _covs_shift_df.to_parquet(_covs_shift_path)
     print(f"Saved: {_covs_shift_path} ({len(_covs_shift_df)} rows)")

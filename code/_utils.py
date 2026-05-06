@@ -5,44 +5,112 @@ import pandas as pd
 from pathlib import Path
 
 
-def add_day_shift_id(
-    df: pd.DataFrame, timestamp_name: str = "event_dttm"
+def retag_to_local_tz(
+    df: pd.DataFrame, columns: list[str], site_tz: str
 ) -> pd.DataFrame:
-    """Add day/shift columns (_dh, _hr, _shift, _nth_day, _day_shift) to a DataFrame.
+    """Re-tag UTC tz-aware columns as site-local tz-aware (preserves the tz
+    metadata on disk; downstream consumers read pre-converted local-tz
+    values without an extra ``tz_convert`` call).
 
-    Day shift: 7:00-19:00, Night shift: 19:00-7:00.
-    _nth_day increments at each 7am boundary.
+    pandas ``dt.tz_convert`` is a metadata-only operation — same UTC instants,
+    different display tag. pyarrow round-trips the tag through parquet, so a
+    column written here as ``datetime64[us, America/Chicago]`` reads back the
+    same way. Naive columns are left untouched.
+
+    Used at parquet-write boundaries in ``01_cohort.py`` (and any other
+    script that persists ``*_dttm`` columns) so ``output/{site}/*.parquet``
+    files self-document their tz convention.
     """
-    df["_dh"] = df[timestamp_name].dt.floor("h", ambiguous="NaT")
-    df["_hr"] = df[timestamp_name].dt.hour
-    _q = """
-    WITH day_starts AS (
-        FROM df
+    df = df.copy()
+    for col in columns:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if pd.api.types.is_datetime64_any_dtype(s) and s.dt.tz is not None:
+            df[col] = s.dt.tz_convert(site_tz)
+    return df
+
+
+def add_day_shift_id(
+    df: pd.DataFrame,
+    timestamp_name: str = "event_dttm",
+    *,
+    site_tz: str,
+) -> pd.DataFrame:
+    """Add day/shift columns (_dh, _hr, _shift, _is_day_start, _nth_day,
+    _day_shift) to a DataFrame.
+
+    Day shift: 7:00-19:00 site-local, Night shift: 19:00-7:00 site-local.
+    _nth_day increments at each local 7am boundary.
+
+    Caller contract: ``df[timestamp_name]`` is UTC tz-aware
+    (``datetime64[*, UTC]``). ``site_tz`` is REQUIRED (keyword-only) — pass
+    ``cfg['timezone']`` from config for clinical site-local semantics. To
+    reproduce pre-`ea911a9` (UTC-hour) outputs, pass ``site_tz="UTC"``
+    explicitly.
+
+    All local-tz interpretation is done with explicit ``AT TIME ZONE`` in
+    SQL, so the result is invariant under DuckDB's session timezone (any
+    upstream library doing ``SET TimeZone = '...'`` cannot affect us).
+
+    Output columns:
+
+    - ``_dh``: naive local TIMESTAMP at the local hour-floor (derived
+      bucket label — its tz is implied by the column name).
+    - ``_hr``: INT, local hour 0-23.
+    - ``_shift``: 'day' if ``_hr`` in [7, 19), else 'night'.
+    - ``_is_day_start``: 1 at the row where ``_hr`` first crosses to 7.
+    - ``_nth_day``: running count of local 7am crossings per hospitalization.
+    - ``_day_shift``: e.g., ``'day1_day'`` / ``'day2_night'``.
+    """
+    result = duckdb.sql(f"""
+        WITH local_ts AS (
+            FROM df
+            SELECT *
+                , _dh: date_trunc('hour', {timestamp_name} AT TIME ZONE '{site_tz}')
+                , _hr: extract('hour' FROM {timestamp_name} AT TIME ZONE '{site_tz}')::INT
+        )
+        , day_starts AS (
+            FROM local_ts
+            SELECT *
+                , _shift: CASE WHEN _hr >= 7 AND _hr < 19 THEN 'day' ELSE 'night' END
+                , _is_day_start: CASE
+                    WHEN _hr = 7 AND COALESCE(LAG(_hr) OVER w, -1) != 7 THEN 1
+                    ELSE 0 END
+            WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _dh)
+        )
+        FROM day_starts
         SELECT *
-            , _shift: CASE WHEN _hr >= 7 AND _hr < 19 THEN 'day' ELSE 'night' END
-            , _is_day_start: CASE
-                WHEN _hr = 7 AND COALESCE(LAG(_hr) OVER w, -1) != 7 THEN 1
-                ELSE 0 END
+            , _nth_day: SUM(_is_day_start) OVER w
+            , _day_shift: 'day' || _nth_day::INT::TEXT || '_' || _shift
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _dh)
-    )
-    FROM day_starts
-    SELECT *
-        , _nth_day: SUM(_is_day_start) OVER w
-        , _day_shift: 'day' || _nth_day::INT::TEXT || '_' || _shift
-    WINDOW w AS (PARTITION BY hospitalization_id ORDER BY _dh)
-    ORDER BY hospitalization_id, _dh
-    """
-    return duckdb.sql(_q).df()
+        ORDER BY hospitalization_id, _dh
+    """).df()
+    # Re-anchor the input timestamp's display tz to UTC, so the function's
+    # output dtype is deterministic regardless of DuckDB's session tz at the
+    # time of `.df()` (when session tz != UTC, the TIMESTAMPTZ → pandas
+    # conversion tags the column with whatever session tz was set; that
+    # leaks session state into the caller's frame).
+    s = result[timestamp_name]
+    if pd.api.types.is_datetime64_any_dtype(s) and s.dt.tz is not None:
+        result[timestamp_name] = s.dt.tz_convert("UTC")
+    return result
 
 
-def remove_meds_duplicates(meds_df: pd.DataFrame) -> pd.DataFrame:
+def remove_meds_duplicates(meds_df):
     """Deduplicate medication records by (hospitalization_id, admin_dttm, med_category).
 
     Priority: prefer actionable MAR actions > non-zero doses > larger doses.
     Falls back to mar_action_name if mar_action_category is unavailable.
+
+    Accepts either a pandas ``DataFrame`` or a ``DuckDBPyRelation`` and
+    returns the same type. The lazy-relation form is preferred in new code
+    so callers can keep the chain unmaterialized; the pandas form is kept
+    for backward compatibility with existing callers (e.g.,
+    ``04_covariates.py``'s ``cont_veso_deduped`` cell).
     """
+    is_relation = isinstance(meds_df, duckdb.DuckDBPyRelation)
     if 'mar_action_category' not in meds_df.columns:
-        print('mar_action_category not available, deduping by mar_action_name instead')
         _q = """
         SELECT *
         FROM meds_df
@@ -57,7 +125,7 @@ def remove_meds_duplicates(meds_df: pd.DataFrame) -> pd.DataFrame:
                     ELSE 2 END,
                 med_dose DESC
         ) = 1
-        ORDER BY hospitalization_id, med_category, admin_dttm;
+        ORDER BY hospitalization_id, med_category, admin_dttm
         """
     else:
         _q = """
@@ -75,9 +143,10 @@ def remove_meds_duplicates(meds_df: pd.DataFrame) -> pd.DataFrame:
                     ELSE 2 END,
                 med_dose DESC
         ) = 1
-        ORDER BY hospitalization_id, med_category, admin_dttm;
+        ORDER BY hospitalization_id, med_category, admin_dttm
         """
-    return duckdb.sql(_q).to_df()
+    rel = duckdb.sql(_q)
+    return rel if is_relation else rel.to_df()
 
 
 def consort_to_markdown(consort_json: dict) -> str:

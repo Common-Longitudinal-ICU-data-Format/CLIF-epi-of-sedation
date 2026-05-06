@@ -140,21 +140,31 @@ def _():
 
     **Model specs (all include exposures: prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr):**
 
+    Norm flip (2026-05-05): the 24h `_*_any` binary indicators are NO LONGER
+    in the default specs. They appear only in the single `daydose_anydose`
+    sibling, which exists for hurdle-decomposition sensitivity. All other
+    specs absorb the day-rate signal through a single linear coefficient
+    per drug (the pre-H17 form).
+
     1. **baseline**: age + sex + ICU type + CCI
 
-    2. **daydose_nohurdle**: baseline + daytime absolute dose rates only (no
-       hurdle indicators) — pre-H17 form, single linear coefficient per drug.
+    2. **daydose**: baseline + daytime absolute dose rates only (no
+       hurdle indicators) — single linear coefficient per drug.
 
-    3. **daydose**: baseline + 24h hurdle indicators (`_prop_any` etc.) +
-       daytime absolute dose rates — two-part hurdle decomposition.
+    3. **daydose_anydose**: daydose + 24h `_*_any` hurdle indicators —
+       the only spec that still carries the indicators; supports the
+       selection + intensity-among-exposed decomposition.
 
     4. **sofa**: daydose + `sofa_total`
 
     5. **clinical**: daydose + pH/P/F levels + NEE at 7am/7pm
 
+    6. **daydose_wt** / **clinical_wt**: daydose / clinical + `weight_kg`.
+       These are the two specs displayed in the cross-site forest plot
+       (`code/agg/forest_night_day_cross_site.py`).
+
     `sofa` and `clinical` are siblings (both extend `daydose`).
-    `daydose_nohurdle` is a sensitivity sibling of `daydose` — same
-    daytime-rate predictors, just without the hurdle indicators.
+    `daydose_anydose` is a hurdle-decomposition sibling of `daydose`.
 
     **Outputs:**
 
@@ -257,28 +267,32 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # 2026-04-29 model-update round — rate-only going forward.
     BASELINE = ("{{outcome}} ~ prop_dif_mcg_kg_min + fenteq_dif_mcg_hr + midazeq_dif_mg_hr + "
                 "age + _nth_day + C(sex_category) + C(icu_type) + cci_score")
-    # DAYDOSE adds two-part (hurdle) exposure: a 24h binary indicator (day
-    # OR night) for any drug use + the continuous daytime rate. The indicator
-    # absorbs the zero-mass selection signal (clinician chose to keep the
-    # patient on the drug at all in last 24h); the continuous daytime rate
-    # then reflects dose-response among daytime-exposed.
-    # See `docs/uptitration_paradox_investigation.md` and plan H17.
-    DAYDOSE = BASELINE + (" + _prop_any + _fenteq_any + _midazeq_any"
-                          " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr")
-    # DAYDOSE_NOHURDLE: reverses the hurdle decomposition. Same daytime-rate
-    # covariates as DAYDOSE but WITHOUT the 3 binary indicators
-    # (`_prop_any`, `_fenteq_any`, `_midazeq_any`). This is the pre-H17 form
-    # — a single linear coefficient per drug that absorbs BOTH the
-    # selection-vs-not-selected contrast AND the dose-given-exposed
-    # contrast. Reported as a side-by-side sensitivity so the manuscript
-    # can show what the day-level effect looks like when we don't
-    # separately model the "any exposure" hurdle.
-    DAYDOSE_NOHURDLE = BASELINE + (
+    # DAYDOSE: BASELINE + the 3 daytime continuous rates. Single linear
+    # coefficient per drug — absorbs BOTH the selection-vs-not-selected
+    # contrast AND the dose-given-exposed contrast in one term. Pre-H17
+    # form; promoted to default 2026-05-05 so the manuscript reports specs
+    # without the binary 24h `_*_any` indicators by default. For the
+    # hurdle decomposition (selection + intensity-among-exposed), use
+    # the `daydose_anydose` sibling below.
+    DAYDOSE = BASELINE + (
         " + _prop_day_mcg_kg_min + _midazeq_day_mg_hr + _fenteq_day_mcg_hr"
     )
+    # DAYDOSE_ANYDOSE: the sole spec that retains the 3 `_*_any` binary
+    # indicators. Adds them on top of DAYDOSE so the day-rate effect can
+    # be split into "any exposure (selection)" + "dose given exposed
+    # (intensity)" via the two-part hurdle decomposition.
+    # See `docs/uptitration_paradox_investigation.md` and plan H17.
+    DAYDOSE_ANYDOSE = DAYDOSE + " + _prop_any + _fenteq_any + _midazeq_any"
     SOFA = DAYDOSE + " + sofa_total"
     CLINICAL = DAYDOSE + (" + ph_level_7am + ph_level_7pm + pf_level_7am + "
                           "pf_level_7pm + nee_7am + nee_7pm")
+    # *_WT siblings: weight-adjusted forms of DAYDOSE and CLINICAL. These
+    # are the two specs the cross-site forest figure plots
+    # (code/agg/forest_night_day_cross_site.py) — adding `weight_kg` keeps
+    # the body-habitus signal in the model without re-introducing the
+    # 24h any-flag indicators.
+    DAYDOSE_WT = DAYDOSE + " + weight_kg"
+    CLINICAL_WT = CLINICAL + " + weight_kg"
 
     # RCS (restricted cubic splines) variant of the sofa spec.
     # Wraps the 6 exposure variables in patsy's cr() transform for natural
@@ -351,10 +365,12 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
 
     COVARIATE_SPECS = [
         {'label': 'baseline',         'formula': BASELINE},
-        {'label': 'daydose_nohurdle', 'formula': DAYDOSE_NOHURDLE},
         {'label': 'daydose',          'formula': DAYDOSE},
+        {'label': 'daydose_anydose',  'formula': DAYDOSE_ANYDOSE},
         {'label': 'sofa',             'formula': SOFA},
         {'label': 'clinical',         'formula': CLINICAL},
+        {'label': 'daydose_wt',       'formula': DAYDOSE_WT},
+        {'label': 'clinical_wt',      'formula': CLINICAL_WT},
         {'label': 'sofa_rcs',         'formula': SOFA_RCS},
         {'label': 'sofa_weight',      'formula': SOFA_WEIGHT},
         {'label': 'sofa_bmi',         'formula': SOFA_BMI},
@@ -378,6 +394,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         {'outcome': 'success_extub_v2_next_day',  'model_type': 'logit', 'fit_fn': _fit_logit},
         # — SBT outcomes (gee only) —
         {'outcome': 'sbt_done_prefix_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
+        {'outcome': 'sbt_done_multiday_next_day', 'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'sbt_done_subira_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'sbt_done_abc_next_day',      'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'sbt_elig_next_day',          'model_type': 'gee',   'fit_fn': _fit_gee},
@@ -394,6 +411,7 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # 2026-05-01: trimmed to kept SBT siblings only.
     SBT_VARIANT_OUTCOMES = {
         'sbt_done_prefix_next_day',
+        'sbt_done_multiday_next_day',
         'sbt_done_subira_next_day',
         'sbt_done_abc_next_day',
     }
@@ -482,6 +500,7 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
         'success_extub_next_day':     'success_extub',
         'success_extub_v2_next_day':  'success_extub_v2',
         'sbt_done_prefix_next_day':   'sbt_done_prefix',
+        'sbt_done_multiday_next_day': 'sbt_done_multiday',
         'sbt_done_subira_next_day':   'sbt_done_subira',
         'sbt_done_abc_next_day':      'sbt_done_abc',
         'sbt_elig_next_day':          'sbt_elig',
@@ -710,8 +729,8 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
     # 2026-05-01: linear `sofa` plots removed — RCS curves carry the
     # nonlinearity signal and the linear form's straightness is implicit.
     # PLOT_SPECS controls which spec(s) to plot.
-    # SBT sensitivity siblings (sbt_done_prefix / subira / abc) are skipped
-    # — variants are compared via the forest plot + wide CSVs, not curves.
+    # SBT sensitivity siblings (sbt_done_prefix / multiday / subira / abc) are
+    # skipped — variants are compared via the forest plot + wide CSVs, not curves.
     PLOT_SPECS = ['sofa_rcs']
     for (_outcome, _mt), _spec_dict in fitted.items():
         if _outcome in SBT_VARIANT_OUTCOMES:
@@ -732,16 +751,18 @@ def _():
     mo.md(r"""
     ## Forest Plots — 10→90 percentile OR per outcome
 
-    One PNG per (outcome × model_type). Each forest plot has 6 rows (3 night–day
-    diffs + 3 daytime rates) and 5 horizontal pointranges per row, color-coded
-    by spec (`baseline / daydose / sofa / clinical / sofa_rcs`). Every dot is on
-    the same OR scale: "OR for a shift from the 10th to 90th percentile of the
-    predictor's production-cohort distribution (zeros included; signed diffs
-    preserved)" — per the literature pattern (Kamdar et al. 2015).
+    One PNG per (outcome × model_type). Each forest plot has 9 rows (3 night–day
+    diffs + 3 daytime rates + 3 24h any-flag indicators) and one horizontal
+    pointrange per spec per row, color-coded by spec (see `SPEC_ORDER` /
+    `SPEC_COLORS` below). Every dot is on the same OR scale: "OR for a shift
+    from the 10th to 90th percentile of the predictor's production-cohort
+    distribution (zeros included; signed diffs preserved)" — per the
+    literature pattern (Kamdar et al. 2015).
 
-    **Linear specs** (`baseline / daydose / sofa / clinical`): rescaled
+    **Linear specs** (everything except `sofa_rcs`): rescaled
     `OR = exp(β × (x90 − x10))` using the contrast-vector form so the same code
-    path works for the RCS spec.
+    path works for the RCS spec. Specs that don't include a given predictor
+    in their formula simply produce no dot for that row.
 
     **RCS spec** (`sofa_rcs`): single OR per predictor for x10→x90 shift,
     computed via `predict_link(x90) − predict_link(x10)` with all other
@@ -774,35 +795,66 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
         ('_fenteq_any',          'Any fentanyl eq use (24h, yes/no)'),
         ('_midazeq_any',         'Any midazolam eq use (24h, yes/no)'),
     ]
-    SPEC_ORDER = ['baseline', 'daydose_nohurdle', 'daydose', 'sofa', 'clinical',
+    SPEC_ORDER = ['baseline', 'daydose', 'daydose_anydose', 'sofa', 'clinical',
+                  'daydose_wt', 'clinical_wt',
                   'sofa_rcs', 'sofa_weight', 'sofa_bmi']
-    # 8 dots per predictor row: 6 main specs + 2 habitus siblings (cyan, olive).
+    # 10 dots per predictor row.
     SPEC_COLORS = {
         'baseline':         '#5e3c99',
-        'daydose_nohurdle': '#9467bd',  # purple — pre-hurdle sensitivity
         'daydose':          '#1f77b4',
+        'daydose_anydose':  '#9467bd',  # purple — sole sibling that re-adds the 24h _*_any indicators
         'sofa':             '#2ca02c',
         'clinical':         '#ff7f0e',
+        'daydose_wt':       '#e377c2',  # pink — figure spec 1 (cross-site forest)
+        'clinical_wt':      '#8c564b',  # brown — figure spec 2 (cross-site forest)
         'sofa_rcs':         '#d62728',
         'sofa_weight':      '#17becf',  # cyan — body-habitus sibling 1
         'sofa_bmi':         '#bcbd22',  # olive — body-habitus sibling 2
     }
 
     # ── Build PERCENTILE_REF: per-predictor (x10_raw, x90_raw, x10_scaled,
-    # x90_scaled). Default: full cohort distribution (zeros included). For
-    # daytime continuous-rate predictors paired with a hurdle indicator, use
-    # the NON-ZERO subset — the forest cell for those predictors then reports
-    # "intensity 10→90 OR among the exposed," cleanly separated from the
-    # selection effect captured by the indicator's own forest row.
+    # x90_scaled). Three filtering regimes per predictor type:
+    #
+    #   1. Daytime continuous-rate predictors (`_prop_day_mcg_kg_min` etc., the
+    #      keys of HURDLE_INDICATORS): drop zeros — equivalent to "among the
+    #      exposed". Selection effect is captured separately by the `_*_any`
+    #      forest row.
+    #
+    #   2. Night–day diff predictors (`prop_dif_mcg_kg_min` etc.): drop rows
+    #      where the patient had NO exposure at all in the past 24h, i.e.
+    #      restrict to `_*_any == 1` rows. A diff of zero among
+    #      no-drug-at-all patients is uninformative — those rows otherwise
+    #      pile up at zero and collapse the percentiles (the original midaz
+    #      problem at low-use sites). After this filter, diff = 0 still
+    #      appears for patients on a constant rate (informative), but the
+    #      "no-drug-trivial-zero" mass is removed.
+    #
+    #   3. Other predictors (e.g., the `_*_any` indicators themselves): use
+    #      the full distribution.
+    DIFF_HURDLE_INDICATORS = {
+        'prop_dif_mcg_kg_min':  '_prop_any',
+        'fenteq_dif_mcg_hr':    '_fenteq_any',
+        'midazeq_dif_mg_hr':    '_midazeq_any',
+    }
     PERCENTILE_REF = {}
     for _pred, _ in FOREST_PREDICTORS:
-        _vals = cohort_merged_final[_pred].dropna().to_numpy()
-        if len(_vals) == 0:
+        _series = cohort_merged_final[_pred].dropna()
+        if len(_series) == 0:
             continue
         if _pred in HURDLE_INDICATORS:
+            _vals = _series.to_numpy()
             _vals = _vals[_vals != 0]
-            if len(_vals) == 0:
-                continue
+            _subset = 'non-zero (daytime exposed)'
+        elif _pred in DIFF_HURDLE_INDICATORS:
+            _ind_col = DIFF_HURDLE_INDICATORS[_pred]
+            _mask = (cohort_merged_final[_ind_col] == 1) & cohort_merged_final[_pred].notna()
+            _vals = cohort_merged_final.loc[_mask, _pred].to_numpy()
+            _subset = 'any-24h-exposure'
+        else:
+            _vals = _series.to_numpy()
+            _subset = 'all'
+        if len(_vals) == 0:
+            continue
         _x10, _x90 = np.percentile(_vals, 10), np.percentile(_vals, 90)
         _scale = VAR_DISPLAY.get(_pred, {}).get('scale', 1)
         PERCENTILE_REF[_pred] = {
@@ -811,11 +863,11 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
             'x10_scaled': _x10 / _scale,
             'x90_scaled': _x90 / _scale,
             'delta_scaled': (_x90 - _x10) / _scale,
-            'subset': 'non-zero' if _pred in HURDLE_INDICATORS else 'all',
+            'subset': _subset,
         }
     print("PERCENTILE_REF (raw clinical units, 10th and 90th percentiles):")
     for _pred, _info in PERCENTILE_REF.items():
-        _tag = f"  [{_info['subset']}]" if _info['subset'] == 'non-zero' else ''
+        _tag = f"  [{_info['subset']}]" if _info['subset'] != 'all' else ''
         print(f"  {_pred:<24s}: x10={_info['x10_raw']:>+8.3f}, x90={_info['x90_raw']:>+8.3f}{_tag}")
 
     # Reference row (median for numeric, mode for categorical) over the

@@ -191,7 +191,7 @@ def _(resp_p):
             -- row-level SQL (would need a 30-min lookback window comparing
             -- against the prior block's values). Dropped for this
             -- implementation; flag captures the mode-criterion only. See
-            -- docs/intub_extub_specs.md for the simplification note.
+            -- docs/outcomes_specs.md for the simplification note.
             , _sbt_state_abc: CASE
                 WHEN regexp_matches(device_name, 't[\\s_-]?piece', 'i') THEN 1
                 WHEN mode_category = 'pressure support/cpap'
@@ -224,7 +224,7 @@ def _(sbt_t1):
         f"""
         -- Gaps-and-islands: cumulative extubation and trach flags;
         -- plus row-level prior-state predicates needed downstream by sbt_outcomes
-        -- to enforce spec-literal SBT-onset definition (see docs/intub_extub_specs.md).
+        -- to enforce spec-literal SBT-onset definition (see docs/outcomes_specs.md).
         FROM sbt_t1
         SELECT *
             , _chg_sbt_state: CASE
@@ -495,6 +495,14 @@ def _(sbt_t3):
                     WHEN _on_imv = 1
                     THEN date_diff('minute', _imv_streak_start_dttm, recorded_dttm)
                     ELSE NULL END
+                -- "Did this SBT block start from a controlled mode?" — broadcast
+                -- to every row of the block. _prior_mode_controlled (from sbt_t2)
+                -- is only 1 on the onset row of an SBT block; MAX-OVER-_block_id
+                -- propagates that boolean across the whole block, so the
+                -- sbt_done_multiday CASE in sbt_outcomes can fire on every row
+                -- of a "real" SBT block without collapsing to onset-only.
+                , _block_prior_mode_controlled: MAX(_prior_mode_controlled)
+                    OVER (PARTITION BY hospitalization_id, _block_id)
                 -- ── Per-variant SBT-block boundaries (Subira / ABC) ──────────
                 -- Block start/last-record per `_block_id_<variant>`, broadcast
                 -- to every row of the block. Used downstream by sbt_outcomes
@@ -690,7 +698,10 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
             , sbt_t4._lag_sbt_state_subira, sbt_t4._lag_sbt_state_abc
             , sbt_t4._block_id_subira, sbt_t4._block_id_abc
             , sbt_t4._block_duration_mins_subira, sbt_t4._block_duration_mins_abc
-            -- Spec-literal SBT onset (see docs/intub_extub_specs.md). Fires only
+            -- Block-level "did this block start from controlled IMV?" predicate,
+            -- broadcast across all rows of the block in sbt_t4. Drives sbt_done_multiday.
+            , sbt_t4._block_prior_mode_controlled
+            -- Spec-literal SBT onset (see docs/outcomes_specs.md). Fires only
             -- on the legitimate transition row of a qualifying block:
             --   (a) sustained ≥30 min via _block_duration_mins
             --   (b) current row is in SBT target state (_sbt_state = 1)
@@ -708,7 +719,7 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
                     AND sbt_t4._lag_sbt_state = 0
                     AND sbt_t4._prior_mode_controlled = 1
                 THEN 1 ELSE 0 END
-            -- ── Sensitivity variants (see docs/intub_extub_specs.md §
+            -- ── Sensitivity variants (see docs/outcomes_specs.md §
             --    "SBT Detection (current implementation) > Sensitivity siblings")
             -- (a) anyprior: drop the controlled-mode-list requirement; just need
             --     the prior row was non-SBT. Most permissive prior-mode check.
@@ -732,6 +743,18 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
                 WHEN _block_duration_mins >= 30
                     AND sbt_t4._sbt_state = 1
                 THEN 1 ELSE 0 END
+            -- (c') multiday: keeps prefix's multi-day spread (every row of a
+            --     qualifying ≥30-min block, NOT onset-only) but restricted to
+            --     blocks that came from controlled IMV. Block-level prior-mode
+            --     property is broadcast in sbt_t4 via MAX-OVER-_block_id —
+            --     row-level _prior_mode_controlled would AND-collapse to
+            --     onset-only and defeat the multiday intent. By construction:
+            --       sbt_done <= sbt_done_multiday <= sbt_done_prefix  (daily rates)
+            , sbt_done_multiday: CASE
+                WHEN _block_duration_mins >= 30
+                    AND sbt_t4._sbt_state = 1
+                    AND sbt_t4._block_prior_mode_controlled = 1
+                THEN 1 ELSE 0 END
             -- (d) 2min: spec-literal prior conditions but ≥2 min duration.
             , sbt_done_2min: CASE
                 WHEN _block_duration_mins >= 2
@@ -753,7 +776,7 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
             --     T-piece OR CPAP=5 OR PS<7, sustained ≥30 min. Strictly more
             --     conservative than Subira on PS arm. Drops the original ABC
             --     "no change in PEEP/FiO2 during SBT" clause as a known
-            --     simplification (see docs/intub_extub_specs.md).
+            --     simplification (see docs/outcomes_specs.md).
             , sbt_done_abc: CASE
                 WHEN sbt_t4._block_duration_mins_abc >= 30
                     AND sbt_t4._sbt_state_abc = 1
@@ -818,11 +841,17 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
 
 
 @app.cell
-def _(SITE_NAME, sbt_outcomes):
+def _(SITE_NAME, SITE_TZ, sbt_outcomes):
     # Persist the raw row-level table for audit / QC dashboard consumption.
     # Naming convention: this is the second-to-last aggregation tier (before
     # hourly + daily roll-ups), saved alongside `sbt_outcomes_daily.parquet`.
+    # Retag event_dttm to SITE_TZ before writing — DuckDB's .df() stamps
+    # TIMESTAMPTZ columns with the session tz, which leaks the runner's OS
+    # tz into the on-disk schema. retag_to_local_tz normalizes to the
+    # configured site tz so output is byte-identical regardless of who runs.
+    from _utils import retag_to_local_tz
     _out = sbt_outcomes.df()
+    _out = retag_to_local_tz(_out, ["event_dttm"], SITE_TZ)
     _path = f"output/{SITE_NAME}/sbt_outcomes.parquet"
     _out.to_parquet(_path)
     print(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
@@ -858,6 +887,7 @@ def _(SITE_TZ, sbt_outcomes):
             , sbt_done_anyprior: MAX(sbt_done_anyprior)
             , sbt_done_imv6h: MAX(sbt_done_imv6h)
             , sbt_done_prefix: MAX(sbt_done_prefix)
+            , sbt_done_multiday: MAX(sbt_done_multiday)
             , sbt_done_2min: MAX(sbt_done_2min)
             , sbt_done_subira: MAX(sbt_done_subira)
             , sbt_done_abc: MAX(sbt_done_abc)
@@ -894,6 +924,7 @@ def _(cohort_hrly_grids_f, sbt_outcomes_hrly):
             , sbt_done_anyprior: COALESCE(s.sbt_done_anyprior, 0)
             , sbt_done_imv6h: COALESCE(s.sbt_done_imv6h, 0)
             , sbt_done_prefix: COALESCE(s.sbt_done_prefix, 0)
+            , sbt_done_multiday: COALESCE(s.sbt_done_multiday, 0)
             , sbt_done_2min: COALESCE(s.sbt_done_2min, 0)
             , sbt_done_subira: COALESCE(s.sbt_done_subira, 0)
             , sbt_done_abc: COALESCE(s.sbt_done_abc, 0)
@@ -927,6 +958,7 @@ def _(cohort_sbt_outcomes_hrly):
             , sbt_done_anyprior: MAX(sbt_done_anyprior)
             , sbt_done_imv6h: MAX(sbt_done_imv6h)
             , sbt_done_prefix: MAX(sbt_done_prefix)
+            , sbt_done_multiday: MAX(sbt_done_multiday)
             , sbt_done_2min: MAX(sbt_done_2min)
             , sbt_done_subira: MAX(sbt_done_subira)
             , sbt_done_abc: MAX(sbt_done_abc)
