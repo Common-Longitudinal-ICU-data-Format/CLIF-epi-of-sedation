@@ -178,7 +178,7 @@ def _(cohort_hosp_ids, duckdb, load_data):
             'hospitalization_id': cohort_hosp_ids,
         }
     )
-    cont_sed_rel = duckdb.sql("FROM cont_sed_rel WHERE med_dose IS NOT NULL")
+    cont_sed_rel = duckdb.sql("FROM cont_sed_rel WHERE med_dose IS NOT NULL AND mar_action_category != 'not_given'")
     if logger.isEnabledFor(logging.DEBUG):
         _n = cont_sed_rel.count("*").fetchone()[0]
         logger.debug(f"Continuous sedation: {_n:,} non-null-dose rows")

@@ -599,7 +599,7 @@ def _():
 
 
 @app.cell
-def _(CONFIG_PATH, cohort_hosp_ids, duckdb):
+def _(CONFIG_PATH, SITE_TZ, cohort_hosp_ids, duckdb):
     # Cell A — first ICU admit dttm per cohort hospitalization.
     # NOTE: For patients intubated in ED/OR then transferred to ICU,
     # this 24 h window starts AFTER intubation. Per user spec (first 24 h of ICU admit).
@@ -614,6 +614,17 @@ def _(CONFIG_PATH, cohort_hosp_ids, duckdb):
         },
     )
     adt_icu_df = _adt_icu.df
+    # clifpy's `from_file` loaders return *_dttm columns NAIVE but with
+    # wall-clock already in the config's site tz (per loader log line
+    # "Timezone: <site_tz>"). Attach the tz tag now via tz_localize —
+    # this is a metadata claim ("this naive wall-clock IS site-local"),
+    # NOT a tz_convert (which would relabel a UTC instant). The downstream
+    # DuckDB SQL then sees TIMESTAMPTZ and propagates the tz through
+    # MIN() into _first_icu_dttm / _first_icu_24h_end.
+    # localize_naive_to_site_tz handles DST fall-back ambiguity (UCMC has
+    # ICU admits at 01:00-02:00 on fall-back Sundays in 2019 / 2021).
+    from _utils import localize_naive_to_site_tz
+    adt_icu_df['in_dttm'] = localize_naive_to_site_tz(adt_icu_df['in_dttm'], SITE_TZ)
 
     first_icu_admit = duckdb.sql("""
         FROM adt_icu_df

@@ -294,45 +294,63 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     DAYDOSE_WT = DAYDOSE + " + weight_kg"
     CLINICAL_WT = CLINICAL + " + weight_kg"
 
-    # RCS (restricted cubic splines) variant of the sofa spec.
+    # RCS (restricted cubic splines) variants of the manuscript linear specs.
     # Wraps the 6 exposure variables in patsy's cr() transform for natural
     # cubic regression splines with 3 internal knots → 4 basis columns per variable.
     # Non-exposure adjustment variables stay linear/categorical.
     # Coefficients aren't human-interpretable as OR-per-unit, so the wide CSV
     # excludes them; the forest plot summarizes via 10→90 percentile OR.
     #
-    # NOTE (2026-05-01): Knots are computed from the NON-ZERO subset's
-    # quartiles instead of `df=4` (which uses whole-vector quartiles). Daytime
-    # exposures are ~62% exact zero in the cohort; whole-vector p25 and p50
-    # both collapse to 0, producing a degenerate cr() basis whose cluster-
-    # robust covariance has negative eigenvalues for basis directions —
-    # surfaced as empty OR rows in `forest_data.csv`. Non-zero quartiles
-    # place knots within the active dose range; basis at x=0 becomes a
-    # constant column absorbed by the intercept.
+    # KNOT STRATEGY (2026-05-06): hard-coded clinical values, identical
+    # across sites. Replaces the prior per-site non-zero-quartile knots.
+    # The original concern — percentile collapse from ~62% zero pile-up —
+    # is sidestepped because absolute knots are placed inside the active
+    # dose range; the basis at x=0 becomes a stable constant column absorbed
+    # by the intercept. Plus: identical knots → identical cr basis function
+    # across sites → cross-site marginal-effect curves overlay on the same
+    # x-grid, which is the whole point of the agg figure.
+    #
+    # No cr():indicator interaction here (was the workaround for the
+    # collapse problem) and no standalone `_*_any` main effects — the RCS
+    # specs are full parallels of the linear `daydose_wt`/`clinical_wt`,
+    # consistent with the no-any-flag norm.
     _RCS_VARS = [
         'prop_dif_mcg_kg_min', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
         '_prop_day_mcg_kg_min', '_fenteq_day_mcg_hr', '_midazeq_day_mg_hr',
     ]
+    # Clinical knot values in RAW units. Daytime rates: 3 anchors covering
+    # the dense low-to-moderate dose range; basis becomes linear past the
+    # top knot, which keeps high-dose tails interpretable instead of letting
+    # cubic basis wiggle in sparse data. Diffs: symmetric around 0, sized
+    # to enclose the bulk of each cohort's day-to-night swing distribution
+    # (e.g., UCMC fenteq diff x10/x90 ≈ ±29; ±25 covers the active range).
+    # Scaled at build time by VAR_DISPLAY['scale'] so they match the units
+    # patsy sees post-rescale.
+    # 2026-05-06 update: tightened from [10,30,50]/[25,75,150]/[1,3,6] (day)
+    # and ±50 / ±2 (fenteq/midaz diff) to concentrate cubic-fit power on
+    # the clinically active range.
+    RCS_KNOTS_RAW = {
+        '_prop_day_mcg_kg_min':   [10.0, 20.0, 30.0],
+        '_fenteq_day_mcg_hr':     [25.0, 50.0, 75.0],
+        '_midazeq_day_mg_hr':     [1.0,  2.0,  3.0],
+        'prop_dif_mcg_kg_min':    [-10.0, 0.0, 10.0],
+        'fenteq_dif_mcg_hr':      [-25.0, 0.0, 25.0],
+        'midazeq_dif_mg_hr':      [-1.0,  0.0, 1.0],
+    }
 
-    def _nz_quartile_knots(s):
-        nz = s[s != 0].dropna().to_numpy()
-        if len(nz) < 100:
-            return None
-        return [round(float(k), 6) for k in np.percentile(nz, [25, 50, 75])]
+    def _scaled_knots(v):
+        raw = RCS_KNOTS_RAW[v]
+        scale = VAR_DISPLAY.get(v, {}).get('scale', 1)
+        return [round(k / scale, 6) for k in raw]
 
-    # Compute knots from `_df_scaled` (the dataset actually fed to fits) so the
-    # values are in the same scaled units patsy sees at fit/predict time —
-    # raw units would trip cr()'s upper-bound check (knots > observed max).
-    _knots_by_var = {v: _nz_quartile_knots(_df_scaled[v]) for v in _RCS_VARS}
-    print("RCS knots from non-zero quartiles (in scaled units, per VAR_DISPLAY['scale']):")
-    for _v, _k in _knots_by_var.items():
-        print(f"  {_v:<24s}: {_k if _k is not None else 'fallback df=4 (<100 nonzero)'}")
+    _knots_by_var = {v: _scaled_knots(v) for v in _RCS_VARS}
+    print("RCS knots from clinical defaults (raw → scaled):")
+    for _v in _RCS_VARS:
+        print(f"  {_v:<24s}: raw={RCS_KNOTS_RAW[_v]}  scaled={_knots_by_var[_v]}")
 
-    # Map the 3 daytime continuous-rate predictors to their hurdle indicators.
-    # The cr() basis on these gets interaction-multiplied by the indicator so the
-    # basis evaluates to 0 on indicator=0 rows, removing the 62%-zero pile-up
-    # from the basis design and stabilizing cluster-robust V. For diff terms,
-    # there's no hurdle indicator (signed predictors), so cr() applies as-is.
+    # HURDLE_INDICATORS still kept in scope: it's used by the forest plot's
+    # `_or_10_to_90` (see PERCENTILE_REF builder below) for filtering
+    # daytime predictors to the non-zero subset when computing percentiles.
     HURDLE_INDICATORS = {
         '_prop_day_mcg_kg_min': '_prop_any',
         '_fenteq_day_mcg_hr':   '_fenteq_any',
@@ -340,16 +358,20 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     }
 
     def _cr_term(v):
-        k = _knots_by_var[v]
-        base = f"cr({v}, df=4)" if k is None else f"cr({v}, knots={k})"
-        ind = HURDLE_INDICATORS.get(v)
-        return f"{base}:{ind}" if ind else base
+        return f"cr({v}, knots={_knots_by_var[v]})"
 
-    SOFA_RCS = (
+    # RCS variants of the 2 manuscript linear specs. Mirror DAYDOSE_WT and
+    # CLINICAL_WT covariate sets exactly, replacing the linear exposure
+    # terms with cr() basis terms. No standalone _*_any, no :indicator
+    # interaction, no sofa_total — full parallel with the linear forms.
+    DAYDOSE_WT_RCS = (
         "{{outcome}} ~ "
         + " + ".join(_cr_term(v) for v in _RCS_VARS) + " + "
-        "_prop_any + _fenteq_any + _midazeq_any + "
-        "age + _nth_day + C(sex_category) + C(icu_type) + cci_score + sofa_total"
+        "age + _nth_day + C(sex_category) + C(icu_type) + cci_score + weight_kg"
+    )
+    CLINICAL_WT_RCS = DAYDOSE_WT_RCS + (
+        " + ph_level_7am + ph_level_7pm + pf_level_7am + "
+        "pf_level_7pm + nee_7am + nee_7pm"
     )
 
     # Body-habitus sensitivity siblings of SOFA. Hypothesis: propofol exposure
@@ -371,7 +393,8 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         {'label': 'clinical',         'formula': CLINICAL},
         {'label': 'daydose_wt',       'formula': DAYDOSE_WT},
         {'label': 'clinical_wt',      'formula': CLINICAL_WT},
-        {'label': 'sofa_rcs',         'formula': SOFA_RCS},
+        {'label': 'daydose_wt_rcs',   'formula': DAYDOSE_WT_RCS},
+        {'label': 'clinical_wt_rcs',  'formula': CLINICAL_WT_RCS},
         {'label': 'sofa_weight',      'formula': SOFA_WEIGHT},
         {'label': 'sofa_bmi',         'formula': SOFA_BMI},
     ]
@@ -408,10 +431,11 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
 
     # Outcomes that are GEE-only siblings (skipped from marginal-effect plots
     # to keep the figure roster from exploding; the forest plot covers them).
-    # 2026-05-01: trimmed to kept SBT siblings only.
+    # 2026-05-06: sbt_done_multiday removed from this set — it's the
+    # manuscript's primary SBT-delivered outcome and now needs marginal
+    # effects rendered alongside sbt_elig and success_extub.
     SBT_VARIANT_OUTCOMES = {
         'sbt_done_prefix_next_day',
-        'sbt_done_multiday_next_day',
         'sbt_done_subira_next_day',
         'sbt_done_abc_next_day',
     }
@@ -517,12 +541,13 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
             continue
         _outcome_short = OUTCOME_SHORT.get(_config['outcome'], _config['outcome'])
         _fname = f"output_to_share/{SITE_NAME}/models/model_comparison_{_outcome_short}_{_config['model_type']}.csv"
-        # Skip sofa_rcs: cr() basis coefficients aren't human-interpretable
+        # Skip any *_rcs spec: cr() basis coefficients aren't human-interpretable
         # as OR-per-unit. The RCS results are still exported in the long-format
-        # sensitivity_analysis.csv above, and summarized in the forest plot via
-        # the 10→90 percentile-OR rescaling.
+        # sensitivity_analysis.csv above, summarized in the forest plot via the
+        # 10→90 percentile-OR rescaling, and rendered as marginal-effect curves.
         _results_for_table = {
-            _k: _v for _k, _v in fitted[_key].items() if _k != 'sofa_rcs'
+            _k: _v for _k, _v in fitted[_key].items()
+            if not _k.endswith('_rcs')
         }
         _wide = build_wide_table(_results_for_table)
         _wide.to_csv(_fname)
@@ -599,11 +624,15 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
         """Run result.get_prediction for a grid holding everything else constant.
 
         For daytime continuous-rate predictors paired with a hurdle indicator
-        (sofa_rcs uses `cr(rate, knots=...):indicator`), force the indicator
-        to 1 across the entire grid so the basis-times-indicator term actually
-        evaluates the dose-response shape. Otherwise the indicator stays at
-        REF_ROW's median (typically 0), the basis term is zero everywhere on
-        the grid, and the curve renders flat with a full-y-axis CI ribbon.
+        (kept here for forward compatibility with hypothetical specs that
+        reintroduce a `cr(rate):indicator` interaction; the current
+        manuscript RCS specs `daydose_wt_rcs`/`clinical_wt_rcs` use plain
+        `cr(rate, knots=...)` so the indicator force is a no-op for them),
+        force the indicator to 1 across the entire grid so the basis-times-
+        indicator term actually evaluates the dose-response shape. Otherwise
+        the indicator stays at REF_ROW's median (typically 0), the basis term
+        is zero everywhere on the grid, and the curve renders flat with a
+        full-y-axis CI ribbon.
 
         Returns (prob, ci_lo, ci_hi) all in probability space. statsmodels has
         TWO different `summary_frame()` column schemes depending on the model
@@ -653,7 +682,13 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
         ax.yaxis.label.set_color('#4d4d4d')
 
     def plot_marginal_effects(result, outcome, model_type, spec_label):
-        """Build and save a 2×3 figure of marginal-effect curves."""
+        """Build and save a 2×3 figure of marginal-effect curves.
+
+        Also returns a long-format DataFrame of the prediction grid (50 points
+        per panel × 6 panels = 300 rows) so the caller can stack across all
+        (outcome × model_type × spec) runs and save a single
+        marginal_effects_grid.csv for cross-site aggregation.
+        """
         # Rebuild scaled dataset (must match training-space units for prediction)
         df_scaled = cohort_merged_final.copy()
         for col, info in VAR_DISPLAY.items():
@@ -666,6 +701,7 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
 
         panel_letters = ['A', 'B', 'C', 'D', 'E', 'F']
         pidx = 0
+        grid_rows = []
 
         for row_idx in range(2):
             for col_idx in range(3):
@@ -684,6 +720,27 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
                 prob, ci_lo, ci_hi = _marginal_prediction(
                     result, ref_row, focal, scaled_grid
                 )
+
+                # Collect grid rows for cross-site aggregation. xlabel is
+                # included so the agg layer can render axis labels without
+                # re-deriving from the focal var name.
+                for _xa, _xs, _p, _lo, _hi in zip(
+                    actual_grid, scaled_grid, prob, ci_lo, ci_hi,
+                ):
+                    grid_rows.append({
+                        'outcome': outcome,
+                        'model_type': model_type,
+                        'spec': spec_label,
+                        'focal': focal,
+                        'xlabel': xlabel,
+                        'panel_row': row_idx,
+                        'panel_col': col_idx,
+                        'x_actual': float(_xa),
+                        'x_scaled': float(_xs),
+                        'prob': float(_p),
+                        'ci_lo': float(_lo),
+                        'ci_hi': float(_hi),
+                    })
 
                 ax.fill_between(
                     actual_grid, ci_lo, ci_hi,
@@ -723,23 +780,31 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
         fig.savefig(out_path, dpi=250, bbox_inches='tight', facecolor='white')
         _plt.close(fig)
         print(f"Saved: {out_path}")
-        return out_path
+        return pd.DataFrame(grid_rows)
 
     # Generate one 2×3 figure per (outcome, model_type, spec).
-    # 2026-05-01: linear `sofa` plots removed — RCS curves carry the
-    # nonlinearity signal and the linear form's straightness is implicit.
-    # PLOT_SPECS controls which spec(s) to plot.
-    # SBT sensitivity siblings (sbt_done_prefix / multiday / subira / abc) are
-    # skipped — variants are compared via the forest plot + wide CSVs, not curves.
-    PLOT_SPECS = ['sofa_rcs']
+    # 2026-05-06: PLOT_SPECS replaces sofa_rcs (orphan) with the two RCS
+    # variants of the manuscript linear specs. SBT sensitivity siblings
+    # (sbt_done_prefix / subira / abc) remain skipped from marginal-effect
+    # plots; sbt_done_multiday is now rendered (it's the manuscript's
+    # primary SBT-delivered outcome).
+    PLOT_SPECS = ['daydose_wt_rcs', 'clinical_wt_rcs']
+    _grid_frames = []
     for (_outcome, _mt), _spec_dict in fitted.items():
         if _outcome in SBT_VARIANT_OUTCOMES:
             continue
         for _spec_label in PLOT_SPECS:
             if _spec_label in _spec_dict:
-                plot_marginal_effects(
-                    _spec_dict[_spec_label], _outcome, _mt, _spec_label
+                _grid_frames.append(
+                    plot_marginal_effects(
+                        _spec_dict[_spec_label], _outcome, _mt, _spec_label
+                    )
                 )
+    if _grid_frames:
+        _grid_df = pd.concat(_grid_frames, ignore_index=True)
+        _grid_path = f"output_to_share/{SITE_NAME}/models/marginal_effects_grid.csv"
+        _grid_df.to_csv(_grid_path, index=False)
+        print(f"Saved {_grid_path} ({len(_grid_df)} rows)")
     return
 
 
@@ -759,14 +824,15 @@ def _():
     distribution (zeros included; signed diffs preserved)" — per the
     literature pattern (Kamdar et al. 2015).
 
-    **Linear specs** (everything except `sofa_rcs`): rescaled
+    **Linear specs** (everything not ending in `_rcs`): rescaled
     `OR = exp(β × (x90 − x10))` using the contrast-vector form so the same code
-    path works for the RCS spec. Specs that don't include a given predictor
+    path works for the RCS specs. Specs that don't include a given predictor
     in their formula simply produce no dot for that row.
 
-    **RCS spec** (`sofa_rcs`): single OR per predictor for x10→x90 shift,
-    computed via `predict_link(x90) − predict_link(x10)` with all other
-    covariates held at median/mode. Variance uses the delta method via
+    **RCS specs** (`daydose_wt_rcs`, `clinical_wt_rcs`): single OR per
+    predictor for x10→x90 shift, computed via
+    `predict_link(x90) − predict_link(x10)` with all other covariates held at
+    median/mode. Variance uses the delta method via
     `(X_x90 − X_x10) @ V @ (X_x90 − X_x10)'`.
 
     **Output**: `output_to_share/{site}/models/forest_{outcome_short}_{model_type}.png`
@@ -797,17 +863,19 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
     ]
     SPEC_ORDER = ['baseline', 'daydose', 'daydose_anydose', 'sofa', 'clinical',
                   'daydose_wt', 'clinical_wt',
-                  'sofa_rcs', 'sofa_weight', 'sofa_bmi']
-    # 10 dots per predictor row.
+                  'daydose_wt_rcs', 'clinical_wt_rcs',
+                  'sofa_weight', 'sofa_bmi']
+    # 11 dots per predictor row.
     SPEC_COLORS = {
         'baseline':         '#5e3c99',
         'daydose':          '#1f77b4',
         'daydose_anydose':  '#9467bd',  # purple — sole sibling that re-adds the 24h _*_any indicators
         'sofa':             '#2ca02c',
         'clinical':         '#ff7f0e',
-        'daydose_wt':       '#e377c2',  # pink — figure spec 1 (cross-site forest)
-        'clinical_wt':      '#8c564b',  # brown — figure spec 2 (cross-site forest)
-        'sofa_rcs':         '#d62728',
+        'daydose_wt':       '#e377c2',  # pink — manuscript linear spec 1 (cross-site forest)
+        'clinical_wt':      '#8c564b',  # brown — manuscript linear spec 2 (cross-site forest)
+        'daydose_wt_rcs':   '#7570b3',  # violet — manuscript RCS spec 1 (cross-site marginal effects)
+        'clinical_wt_rcs':  '#d95f02',  # burnt orange — manuscript RCS spec 2 (cross-site marginal effects)
         'sofa_weight':      '#17becf',  # cyan — body-habitus sibling 1
         'sofa_bmi':         '#bcbd22',  # olive — body-habitus sibling 2
     }
@@ -902,12 +970,15 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
         nd_x90 = pd.DataFrame([REF_ROW])
         nd_x10[predictor] = info['x10_scaled']
         nd_x90[predictor] = info['x90_scaled']
-        # If the predictor is paired with a hurdle indicator (sofa_rcs spec
-        # uses `cr(rate, knots=...):indicator`), force indicator=1 at both
-        # endpoints so the basis-times-indicator contrast captures the
-        # intensity-among-exposed effect. Otherwise the indicator stays at
-        # REF_ROW's median (typically 0), the contrast on the basis-times-
-        # indicator term is trivially 0, and OR comes out 1.0 with broken CI.
+        # If the predictor is paired with a hurdle indicator (kept here for
+        # forward compatibility with hypothetical specs that reintroduce a
+        # `cr(rate):indicator` interaction; the current manuscript RCS specs
+        # use plain `cr(rate, knots=...)` so this branch is a no-op for them),
+        # force indicator=1 at both endpoints so the basis-times-indicator
+        # contrast captures the intensity-among-exposed effect. Otherwise the
+        # indicator stays at REF_ROW's median (typically 0), the contrast on
+        # the basis-times-indicator term is trivially 0, and OR comes out 1.0
+        # with broken CI.
         _ind = HURDLE_INDICATORS.get(predictor)
         if _ind is not None:
             nd_x10[_ind] = 1

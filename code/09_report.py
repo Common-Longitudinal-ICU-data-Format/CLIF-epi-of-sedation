@@ -825,18 +825,23 @@ def _(
                     ],
                 )
 
-        # Pages 19-21: RCS marginal effect plots (sofa_rcs spec).
-        # Same 6 exposures wrapped in patsy's cr(x, df=4) so the fitted curves
-        # can bend — reveals dose-response shape that the linear plots cannot
-        # capture. See plan_rcs_exposures.md memory for the decision rationale.
-        for _label, _outcome_short, _mt in [
-            ('SBT Done Next Day (GEE)', 'sbt', 'gee'),
-            ('Successful Extubation Next Day (GEE)', 'extub', 'gee'),
-            ('Successful Extubation Next Day (Logit)', 'extub', 'logit'),
+        # RCS marginal effect plots — 6 pages (3 manuscript outcomes × 2 specs).
+        # 2026-05-06: replaced the legacy `sofa_rcs` block with the two
+        # manuscript RCS specs (`daydose_wt_rcs`, `clinical_wt_rcs`). Same
+        # 6 exposures wrapped in patsy's cr(x, knots=…) — clinical absolute
+        # knots, no `_*_any` interactions (parallel to linear `daydose_wt`
+        # and `clinical_wt`).
+        for _label, _outcome_short, _mt, _spec in [
+            ('SBT Eligible (GEE) — daydose+wt RCS',           'sbt_elig',          'gee', 'daydose_wt_rcs'),
+            ('SBT Eligible (GEE) — clinical+wt RCS',          'sbt_elig',          'gee', 'clinical_wt_rcs'),
+            ('SBT Delivered (multiday, GEE) — daydose+wt RCS',  'sbt_done_multiday', 'gee', 'daydose_wt_rcs'),
+            ('SBT Delivered (multiday, GEE) — clinical+wt RCS', 'sbt_done_multiday', 'gee', 'clinical_wt_rcs'),
+            ('Successful Extubation (GEE) — daydose+wt RCS',  'success_extub',     'gee', 'daydose_wt_rcs'),
+            ('Successful Extubation (GEE) — clinical+wt RCS', 'success_extub',     'gee', 'clinical_wt_rcs'),
         ]:
             _me_path = (
                 f"output_to_share/{SITE_NAME}/models/"
-                f"marginal_effects_{_outcome_short}_{_mt}_sofa_rcs.png"
+                f"marginal_effects_{_outcome_short}_{_mt}_{_spec}.png"
             )
             if os.path.exists(_me_path):
                 add_image_page(_pdf, _me_path, f"Marginal Effects (RCS) — {_label}")

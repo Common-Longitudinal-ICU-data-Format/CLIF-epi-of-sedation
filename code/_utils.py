@@ -5,6 +5,38 @@ import pandas as pd
 from pathlib import Path
 
 
+def localize_naive_to_site_tz(s: pd.Series, site_tz: str) -> pd.Series:
+    """Attach a site-tz tag to a naive datetime Series.
+
+    Sibling to ``retag_to_local_tz`` for the OTHER tz-fix direction:
+    ``retag`` is for tz-aware columns (relabels a UTC instant); this is
+    for naive columns whose wall-clock is *already* in site-local time
+    (clifpy's ``*.from_file`` convention) and just needs the tz tag.
+
+    Handles DST edge cases that ``Series.dt.tz_localize`` would otherwise
+    raise on:
+
+    - **Fall-back ambiguity** (e.g., 2024-11-03 01:30 Central exists twice):
+      tries ``ambiguous='infer'`` first (pandas uses neighboring timestamp
+      ordering to disambiguate); falls back to ``ambiguous=False`` (= the
+      LATER, post-fall-back / standard-time occurrence) if infer can't
+      resolve isolated ambiguous values. The fallback is deterministic
+      and matches the convention used elsewhere (e.g., DuckDB's
+      ``AT TIME ZONE`` resolves fall-back ambiguity to standard time).
+
+    - **Spring-forward gap** (e.g., 2024-03-10 02:30 Central doesn't exist):
+      shifts forward to the next valid minute via ``nonexistent='shift_forward'``.
+
+    No-op if the column is already tz-aware.
+    """
+    if not pd.api.types.is_datetime64_any_dtype(s) or s.dt.tz is not None:
+        return s
+    try:
+        return s.dt.tz_localize(site_tz, ambiguous='infer', nonexistent='shift_forward')
+    except Exception:
+        return s.dt.tz_localize(site_tz, ambiguous=False, nonexistent='shift_forward')
+
+
 def retag_to_local_tz(
     df: pd.DataFrame, columns: list[str], site_tz: str
 ) -> pd.DataFrame:

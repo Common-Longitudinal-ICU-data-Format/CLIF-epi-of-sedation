@@ -37,9 +37,31 @@ from _shared import (  # noqa: E402
 )
 
 
+def _drop_last_day_per_patient(df):
+    """Drop each hospitalization's row with the highest `_nth_day`.
+
+    Keeps only "full 24-hr ICU days" — days where the patient was on IMV
+    through the next 7am crossing. Without this, mid-stay bins
+    (1, 2, …, 8+) include extubation-day rows from short-stay patients
+    (e.g., 382 short-stay-3-day patients at mimic add their day 3
+    extubation rows to bin "3", biasing the violin's spread). Empirically
+    `_is_last_day == (_nth_day == max per hosp)` (0 mismatches across 79k
+    rows), so this is equivalent to `~_is_last_day`. Mirrors
+    `code/agg/night_day_diff_mean_cross_site.py:55-72`.
+    """
+    is_last = (
+        df.groupby("hospitalization_id")["_nth_day"].transform("max")
+        == df["_nth_day"]
+    )
+    return df.loc[~is_last].copy()
+
+
 def main() -> None:
     apply_style()
-    df = cap_day(prepare_diffs(load_exposure()), max_day=7)
+    df = cap_day(
+        prepare_diffs(_drop_last_day_per_patient(load_exposure())),
+        max_day=7,
+    )
     bins = list(df["_nth_day_bin"].cat.categories)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.5), sharex=True)
@@ -101,7 +123,8 @@ def main() -> None:
         "Each violin = distribution of diff for one ICU-day bin (width ∝ density at that y-level). "
         "Sister figure to `night_day_diff_combined_by_icu_day.png` — narrowing violins left-to-right "
         "indicate shift-to-shift dosing converging as patients stabilize. "
-        "Cohort: patient-day rate-diffs by ICU day. Single-shift days dropped silently via `dropna()` "
+        "Cohort: full-24-hr ICU days only — each patient's extubation day is dropped before binning so "
+        "late-stay bins are not survivor-biased. Single-shift days dropped silently via `dropna()` "
         "(rate-diff = NaN). Glossary: docs/descriptive_figures.md §3.",
         ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
