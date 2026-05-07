@@ -247,11 +247,18 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         return m.fit(maxiter=100)
 
     def _fit_logit(formula, data):
+        """Cluster-robust logit (groups=hospitalization_id).
+
+        Methodologically appropriate when within-cluster correlation
+        exists (avg cluster size ~5 days here). On cr() basis × binary
+        terminal-event outcome the sandwich estimator can produce
+        degenerate link-scale variance — see `_fit_logit_asym` for the
+        pragmatic alternative used in v1/v3 of the cross-site marginal-
+        effects figure. v2 of the cross-site figure uses this version
+        deliberately to illustrate the failure mode.
+        """
         # Drop rows with NaN in any column referenced by the formula so the
         # cluster-robust SE's `groups` length matches the model's residuals.
-        # statsmodels' Logit with cov_type='cluster' doesn't auto-align
-        # groups when missing rows are dropped internally — the result is a
-        # length mismatch in cov_cluster's bincount.
         _names = [c for c in data.columns if c in formula]
         if 'hospitalization_id' not in _names:
             _names.append('hospitalization_id')
@@ -260,6 +267,21 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         return m.fit(cov_type='cluster',
                      cov_kwds={'groups': _d['hospitalization_id']},
                      maxiter=100)
+
+    def _fit_logit_asym(formula, data):
+        """Asymptotic-SE logit (no cluster-robust).
+
+        Anti-conservative when within-cluster correlation exists, but
+        produces usable prediction CIs where `_fit_logit` can degenerate.
+        Used by v1 (`_full` spec) and v3 (`_diff` spec) of the cross-site
+        marginal-effects figure.
+        """
+        _names = [c for c in data.columns if c in formula]
+        if 'hospitalization_id' not in _names:
+            _names.append('hospitalization_id')
+        _d = data.dropna(subset=_names)
+        m = smf.logit(formula=formula, data=_d)
+        return m.fit(maxiter=100)
 
     # ── Dimension 1: nested covariate sets (all include exposures) ────
     # Rate-based exposures (mcg/kg/min for propofol, mcg/hr for fentanyl,
@@ -295,47 +317,53 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     CLINICAL_WT = CLINICAL + " + weight_kg"
 
     # RCS (restricted cubic splines) variants of the manuscript linear specs.
-    # Wraps the 6 exposure variables in patsy's cr() transform for natural
-    # cubic regression splines with 3 internal knots → 4 basis columns per variable.
+    # Apply cr() ONLY to the night–day diff predictors; daytime continuous
+    # rates stay linear (2026-05-07).
+    #
+    # Rationale: the 3 diff terms encode within-patient day-vs-night change
+    # — a quantity where non-linearity (asymmetric / threshold response)
+    # is plausible, so cr() is justified. The 3 daytime continuous-rate
+    # terms encode absolute dose level — for which the empirical curves
+    # (audit figure) are visually flat / monotone, so the cr basis was
+    # over-parameterizing without buying flexibility we needed. Linear
+    # daytime cuts the spline-basis column count from 30 (6 vars × 5 cols)
+    # to 15 (3 diff vars × 5 cols), which materially helps the cluster-
+    # robust logit fit's CI conditioning.
+    #
     # Non-exposure adjustment variables stay linear/categorical.
-    # Coefficients aren't human-interpretable as OR-per-unit, so the wide CSV
-    # excludes them; the forest plot summarizes via 10→90 percentile OR.
+    # Coefficients aren't human-interpretable as OR-per-unit for the cr
+    # terms, so the wide CSV excludes the *_rcs specs; the forest plot
+    # summarizes via 10→90 percentile OR.
     #
     # KNOT STRATEGY (2026-05-06): hard-coded clinical values, identical
     # across sites. Replaces the prior per-site non-zero-quartile knots.
-    # The original concern — percentile collapse from ~62% zero pile-up —
-    # is sidestepped because absolute knots are placed inside the active
-    # dose range; the basis at x=0 becomes a stable constant column absorbed
-    # by the intercept. Plus: identical knots → identical cr basis function
-    # across sites → cross-site marginal-effect curves overlay on the same
-    # x-grid, which is the whole point of the agg figure.
+    # Identical knots → identical cr basis function across sites →
+    # cross-site marginal-effect curves overlay on the same x-grid.
     #
     # No cr():indicator interaction here (was the workaround for the
-    # collapse problem) and no standalone `_*_any` main effects — the RCS
-    # specs are full parallels of the linear `daydose_wt`/`clinical_wt`,
+    # zero-pile-up problem) and no standalone `_*_any` main effects — the
+    # RCS specs are full parallels of the linear `daydose_wt`/`clinical_wt`,
     # consistent with the no-any-flag norm.
-    _RCS_VARS = [
+    # 2026-05-07: TWO RCS spec families maintained side by side so the
+    # cross-site agg figure can render 3 versions (v1 main / v2 SA clusterse
+    # / v3 SA asymse — see code/agg/marginal_effects_rcs_cross_site.py).
+    # `*_rcs_full`: cr() on all 6 exposure vars (more flexible).
+    # `*_rcs_diff`: cr() on the 3 diff vars only; daytime stays linear
+    #               (parsimony — daytime curves are empirically near-linear).
+    _RCS_DIFF_VARS = [
         'prop_dif_mcg_kg_min', 'fenteq_dif_mcg_hr', 'midazeq_dif_mg_hr',
+    ]
+    _LINEAR_DAYTIME_VARS = [
         '_prop_day_mcg_kg_min', '_fenteq_day_mcg_hr', '_midazeq_day_mg_hr',
     ]
-    # Clinical knot values in RAW units. Daytime rates: 3 anchors covering
-    # the dense low-to-moderate dose range; basis becomes linear past the
-    # top knot, which keeps high-dose tails interpretable instead of letting
-    # cubic basis wiggle in sparse data. Diffs: symmetric around 0, sized
-    # to enclose the bulk of each cohort's day-to-night swing distribution
-    # (e.g., UCMC fenteq diff x10/x90 ≈ ±29; ±25 covers the active range).
-    # Scaled at build time by VAR_DISPLAY['scale'] so they match the units
-    # patsy sees post-rescale.
-    # 2026-05-06 update: tightened from [10,30,50]/[25,75,150]/[1,3,6] (day)
-    # and ±50 / ±2 (fenteq/midaz diff) to concentrate cubic-fit power on
-    # the clinically active range.
+    _RCS_FULL_VARS = _RCS_DIFF_VARS + _LINEAR_DAYTIME_VARS
     RCS_KNOTS_RAW = {
-        '_prop_day_mcg_kg_min':   [10.0, 20.0, 30.0],
-        '_fenteq_day_mcg_hr':     [25.0, 50.0, 75.0],
-        '_midazeq_day_mg_hr':     [1.0,  2.0,  3.0],
         'prop_dif_mcg_kg_min':    [-10.0, 0.0, 10.0],
         'fenteq_dif_mcg_hr':      [-25.0, 0.0, 25.0],
         'midazeq_dif_mg_hr':      [-1.0,  0.0, 1.0],
+        '_prop_day_mcg_kg_min':   [10.0, 20.0, 30.0],
+        '_fenteq_day_mcg_hr':     [25.0, 50.0, 75.0],
+        '_midazeq_day_mg_hr':     [1.0,  2.0,  3.0],
     }
 
     def _scaled_knots(v):
@@ -343,9 +371,9 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         scale = VAR_DISPLAY.get(v, {}).get('scale', 1)
         return [round(k / scale, 6) for k in raw]
 
-    _knots_by_var = {v: _scaled_knots(v) for v in _RCS_VARS}
+    _knots_by_var = {v: _scaled_knots(v) for v in _RCS_FULL_VARS}
     print("RCS knots from clinical defaults (raw → scaled):")
-    for _v in _RCS_VARS:
+    for _v in _RCS_FULL_VARS:
         print(f"  {_v:<24s}: raw={RCS_KNOTS_RAW[_v]}  scaled={_knots_by_var[_v]}")
 
     # HURDLE_INDICATORS still kept in scope: it's used by the forest plot's
@@ -360,16 +388,33 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     def _cr_term(v):
         return f"cr({v}, knots={_knots_by_var[v]})"
 
+    # Two exposure-block builders for the two RCS spec families.
+    # _EXPOSURE_TERMS_DIFF: cr() on diff vars only; daytime stays linear.
+    # _EXPOSURE_TERMS_FULL: cr() on all 6 exposure vars.
+    _EXPOSURE_TERMS_DIFF = (
+        " + ".join(_cr_term(v) for v in _RCS_DIFF_VARS)
+        + " + " + " + ".join(_LINEAR_DAYTIME_VARS)
+    )
+    _EXPOSURE_TERMS_FULL = " + ".join(_cr_term(v) for v in _RCS_FULL_VARS)
+
     # RCS variants of the 2 manuscript linear specs. Mirror DAYDOSE_WT and
-    # CLINICAL_WT covariate sets exactly, replacing the linear exposure
-    # terms with cr() basis terms. No standalone _*_any, no :indicator
-    # interaction, no sofa_total — full parallel with the linear forms.
-    DAYDOSE_WT_RCS = (
-        "{{outcome}} ~ "
-        + " + ".join(_cr_term(v) for v in _RCS_VARS) + " + "
+    # CLINICAL_WT covariate sets exactly. No standalone _*_any, no
+    # :indicator interaction, no sofa_total — full parallel with the
+    # linear forms. Two flavors per base: _diff (parsimony) and _full
+    # (most flexible).
+    DAYDOSE_WT_RCS_DIFF = (
+        "{{outcome}} ~ " + _EXPOSURE_TERMS_DIFF + " + "
         "age + _nth_day + C(sex_category) + C(icu_type) + cci_score + weight_kg"
     )
-    CLINICAL_WT_RCS = DAYDOSE_WT_RCS + (
+    DAYDOSE_WT_RCS_FULL = (
+        "{{outcome}} ~ " + _EXPOSURE_TERMS_FULL + " + "
+        "age + _nth_day + C(sex_category) + C(icu_type) + cci_score + weight_kg"
+    )
+    CLINICAL_WT_RCS_DIFF = DAYDOSE_WT_RCS_DIFF + (
+        " + ph_level_7am + ph_level_7pm + pf_level_7am + "
+        "pf_level_7pm + nee_7am + nee_7pm"
+    )
+    CLINICAL_WT_RCS_FULL = DAYDOSE_WT_RCS_FULL + (
         " + ph_level_7am + ph_level_7pm + pf_level_7am + "
         "pf_level_7pm + nee_7am + nee_7pm"
     )
@@ -386,17 +431,19 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     SOFA_BMI    = SOFA + " + bmi"
 
     COVARIATE_SPECS = [
-        {'label': 'baseline',         'formula': BASELINE},
-        {'label': 'daydose',          'formula': DAYDOSE},
-        {'label': 'daydose_anydose',  'formula': DAYDOSE_ANYDOSE},
-        {'label': 'sofa',             'formula': SOFA},
-        {'label': 'clinical',         'formula': CLINICAL},
-        {'label': 'daydose_wt',       'formula': DAYDOSE_WT},
-        {'label': 'clinical_wt',      'formula': CLINICAL_WT},
-        {'label': 'daydose_wt_rcs',   'formula': DAYDOSE_WT_RCS},
-        {'label': 'clinical_wt_rcs',  'formula': CLINICAL_WT_RCS},
-        {'label': 'sofa_weight',      'formula': SOFA_WEIGHT},
-        {'label': 'sofa_bmi',         'formula': SOFA_BMI},
+        {'label': 'baseline',              'formula': BASELINE},
+        {'label': 'daydose',               'formula': DAYDOSE},
+        {'label': 'daydose_anydose',       'formula': DAYDOSE_ANYDOSE},
+        {'label': 'sofa',                  'formula': SOFA},
+        {'label': 'clinical',              'formula': CLINICAL},
+        {'label': 'daydose_wt',            'formula': DAYDOSE_WT},
+        {'label': 'clinical_wt',           'formula': CLINICAL_WT},
+        {'label': 'daydose_wt_rcs_diff',   'formula': DAYDOSE_WT_RCS_DIFF},
+        {'label': 'daydose_wt_rcs_full',   'formula': DAYDOSE_WT_RCS_FULL},
+        {'label': 'clinical_wt_rcs_diff',  'formula': CLINICAL_WT_RCS_DIFF},
+        {'label': 'clinical_wt_rcs_full',  'formula': CLINICAL_WT_RCS_FULL},
+        {'label': 'sofa_weight',           'formula': SOFA_WEIGHT},
+        {'label': 'sofa_bmi',              'formula': SOFA_BMI},
     ]
 
     # ── Dimension 2: outcome x model type ─────────────────────────────
@@ -410,11 +457,17 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # Convention: SBT outcomes are GEE-only (cluster-robust logit removed
     # by user direction); extubation outcomes keep both gee + logit.
     MODEL_CONFIGS = [
-        # — extubation (gee + logit) —
-        {'outcome': 'success_extub_next_day',     'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'success_extub_next_day',     'model_type': 'logit', 'fit_fn': _fit_logit},
-        {'outcome': 'success_extub_v2_next_day',  'model_type': 'gee',   'fit_fn': _fit_gee},
-        {'outcome': 'success_extub_v2_next_day',  'model_type': 'logit', 'fit_fn': _fit_logit},
+        # — extubation (gee + logit + logit_asym) —
+        # `logit` = cluster-robust SE (methodologically right but degenerates
+        # on cr() basis); `logit_asym` = ordinary asymptotic SE (anti-
+        # conservative but produces usable CIs). Cross-site agg figure
+        # renders v1/v3 from `logit_asym` and v2 from `logit`.
+        {'outcome': 'success_extub_next_day',     'model_type': 'gee',        'fit_fn': _fit_gee},
+        {'outcome': 'success_extub_next_day',     'model_type': 'logit',      'fit_fn': _fit_logit},
+        {'outcome': 'success_extub_next_day',     'model_type': 'logit_asym', 'fit_fn': _fit_logit_asym},
+        {'outcome': 'success_extub_v2_next_day',  'model_type': 'gee',        'fit_fn': _fit_gee},
+        {'outcome': 'success_extub_v2_next_day',  'model_type': 'logit',      'fit_fn': _fit_logit},
+        {'outcome': 'success_extub_v2_next_day',  'model_type': 'logit_asym', 'fit_fn': _fit_logit_asym},
         # — SBT outcomes (gee only) —
         {'outcome': 'sbt_done_prefix_next_day',   'model_type': 'gee',   'fit_fn': _fit_gee},
         {'outcome': 'sbt_done_multiday_next_day', 'model_type': 'gee',   'fit_fn': _fit_gee},
@@ -783,12 +836,14 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
         return pd.DataFrame(grid_rows)
 
     # Generate one 2×3 figure per (outcome, model_type, spec).
-    # 2026-05-06: PLOT_SPECS replaces sofa_rcs (orphan) with the two RCS
-    # variants of the manuscript linear specs. SBT sensitivity siblings
-    # (sbt_done_prefix / subira / abc) remain skipped from marginal-effect
-    # plots; sbt_done_multiday is now rendered (it's the manuscript's
-    # primary SBT-delivered outcome).
-    PLOT_SPECS = ['daydose_wt_rcs', 'clinical_wt_rcs']
+    # 2026-05-07: PLOT_SPECS now includes both RCS spec families
+    # (`*_rcs_diff` parsimony / `*_rcs_full` flexible) for the 2 manuscript
+    # base specs. The cross-site agg figure picks among these per version.
+    # SBT sensitivity siblings (sbt_done_prefix / subira / abc) remain
+    # skipped from marginal-effect plots; sbt_done_multiday is rendered
+    # (manuscript's primary SBT-delivered outcome).
+    PLOT_SPECS = ['daydose_wt_rcs_diff', 'daydose_wt_rcs_full',
+                  'clinical_wt_rcs_diff', 'clinical_wt_rcs_full']
     _grid_frames = []
     for (_outcome, _mt), _spec_dict in fitted.items():
         if _outcome in SBT_VARIANT_OUTCOMES:
@@ -863,21 +918,24 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
     ]
     SPEC_ORDER = ['baseline', 'daydose', 'daydose_anydose', 'sofa', 'clinical',
                   'daydose_wt', 'clinical_wt',
-                  'daydose_wt_rcs', 'clinical_wt_rcs',
+                  'daydose_wt_rcs_diff', 'daydose_wt_rcs_full',
+                  'clinical_wt_rcs_diff', 'clinical_wt_rcs_full',
                   'sofa_weight', 'sofa_bmi']
-    # 11 dots per predictor row.
+    # 13 dots per predictor row.
     SPEC_COLORS = {
-        'baseline':         '#5e3c99',
-        'daydose':          '#1f77b4',
-        'daydose_anydose':  '#9467bd',  # purple — sole sibling that re-adds the 24h _*_any indicators
-        'sofa':             '#2ca02c',
-        'clinical':         '#ff7f0e',
-        'daydose_wt':       '#e377c2',  # pink — manuscript linear spec 1 (cross-site forest)
-        'clinical_wt':      '#8c564b',  # brown — manuscript linear spec 2 (cross-site forest)
-        'daydose_wt_rcs':   '#7570b3',  # violet — manuscript RCS spec 1 (cross-site marginal effects)
-        'clinical_wt_rcs':  '#d95f02',  # burnt orange — manuscript RCS spec 2 (cross-site marginal effects)
-        'sofa_weight':      '#17becf',  # cyan — body-habitus sibling 1
-        'sofa_bmi':         '#bcbd22',  # olive — body-habitus sibling 2
+        'baseline':              '#5e3c99',
+        'daydose':               '#1f77b4',
+        'daydose_anydose':       '#9467bd',  # purple — sole sibling that re-adds the 24h _*_any indicators
+        'sofa':                  '#2ca02c',
+        'clinical':              '#ff7f0e',
+        'daydose_wt':            '#e377c2',  # pink — manuscript linear spec 1
+        'clinical_wt':           '#8c564b',  # brown — manuscript linear spec 2
+        'daydose_wt_rcs_diff':   '#7570b3',  # violet — RCS diff (parsimony)
+        'daydose_wt_rcs_full':   '#3a3573',  # dark violet — RCS full
+        'clinical_wt_rcs_diff':  '#d95f02',  # burnt orange — RCS diff (parsimony)
+        'clinical_wt_rcs_full':  '#7a3700',  # dark burnt orange — RCS full
+        'sofa_weight':           '#17becf',  # cyan — body-habitus sibling 1
+        'sofa_bmi':              '#bcbd22',  # olive — body-habitus sibling 2
     }
 
     # ── Build PERCENTILE_REF: per-predictor (x10_raw, x90_raw, x10_scaled,
