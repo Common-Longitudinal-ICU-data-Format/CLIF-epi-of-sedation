@@ -119,11 +119,14 @@ def _():
 @app.cell
 def _(duckdb, load_data):
     # Lazy ADT load with column + ICU-category pushdown into the parquet scan.
+    # hospital_id is included so the same relation can feed both ICU filtering
+    # and clifpy's stitch_encounters (which requires it in adt) without a
+    # second parquet scan.
     adt_rel = load_data(
         'adt',
         config_path='config/config.json',
         return_rel=True,
-        columns=['hospitalization_id', 'in_dttm', 'out_dttm', 'location_category', 'location_type'],
+        columns=['hospitalization_id', 'hospital_id', 'in_dttm', 'out_dttm', 'location_category', 'location_type'],
         filters={'location_category': ['icu']},
     )
     hosp_ids_w_icu_stays = [
@@ -144,6 +147,266 @@ def _(adt_rel):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
+    ## Encounter-Stitch Dedup Filter
+
+    Drop within-12h discharge→readmit paperwork artifacts so downstream "first
+    IMV streak" reflects a genuinely independent ICU episode. Keep only the
+    first hospitalization (by `admission_dttm`) per stitched encounter block.
+
+    `encounter_block` is consumed-and-discarded inside this cell —
+    `hospitalization_id` stays the cohort key, so downstream cells see exactly
+    the same schema as before. Runtime toggle:
+    `COHORT_STITCH_DEDUP_ON=0` short-circuits to identity passthrough; CONSORT
+    step 2 is then omitted via the `n_dropped_stitch is None` sentinel
+    (mirrors the conditional range-rule step at step 7+).
+    """)
+    return
+
+
+@app.cell
+def _(adt_rel, hosp_ids_w_icu_stays, load_data):
+    # Encounter-stitch DEDUP filter — see markdown above. Toggle:
+    # COHORT_STITCH_DEDUP_ON=0 short-circuits to identity passthrough
+    # (n_dropped_stitch=None → CONSORT step 2 is omitted). Default ON.
+    _stitch_on = os.environ.get('COHORT_STITCH_DEDUP_ON', '1') == '1'
+
+    if not _stitch_on:
+        cohort_hosp_ids_post_stitch = list(hosp_ids_w_icu_stays)
+        n_dropped_stitch = None  # sentinel — CONSORT skips step 2
+        stitch_dropped_hosp_ids: list = []
+        stitch_block_sizes = None  # sentinel — QA cell skips
+        n_unmapped_singletons = 0
+        logger.info("Encounter stitch-dedup: OFF (COHORT_STITCH_DEDUP_ON=0)")
+    else:
+        from clifpy.utils.stitching_encounters import stitch_encounters
+
+        _hosp_rel = load_data(
+            'hospitalization',
+            config_path='config/config.json',
+            return_rel=True,
+            columns=[
+                'patient_id', 'hospitalization_id', 'admission_dttm',
+                'discharge_dttm', 'age_at_admission',
+                'admission_type_category', 'discharge_category',
+            ],
+            filters={'hospitalization_id': hosp_ids_w_icu_stays},
+        )
+        _hosp_df = _hosp_rel.df()
+        _adt_df = adt_rel.df()
+
+        # stitch_encounters is pandas-only — clifpy I/O bridge. Returns
+        # (hosp_stitched, adt_stitched, encounter_mapping); only the mapping
+        # is needed (cols: hospitalization_id, encounter_block).
+        _, _, _encounter_mapping = stitch_encounters(
+            _hosp_df, _adt_df, time_interval=12,
+        )
+
+        # CRITICAL: clifpy's stitch_encounters can silently drop hospitalizations
+        # from the returned encounter_mapping (e.g., when admission_dttm /
+        # discharge_dttm have null/quirky values that confuse the propagation
+        # step). These hosps are NOT stitched to anything — they should be
+        # KEPT as singletons by the dedup filter, not dropped along with the
+        # genuinely-stitched-second-or-later hosps. Surface the missing count
+        # separately in QA so federated sites can investigate clifpy data
+        # quality without it confounding the cohort-attrition story.
+        _mapped_ids = set(_encounter_mapping['hospitalization_id'])
+        _unmapped_ids = [h for h in hosp_ids_w_icu_stays if h not in _mapped_ids]
+        n_unmapped_singletons = len(_unmapped_ids)
+
+        # For each MAPPED hosp, pick the first by admission_dttm in its
+        # encounter block. Then re-add unmapped hosps as singletons.
+        _merged = _encounter_mapping.merge(
+            _hosp_df[['hospitalization_id', 'admission_dttm']],
+            on='hospitalization_id',
+        )
+        _first_per_block = (
+            _merged
+            .sort_values(['encounter_block', 'admission_dttm'])
+            .drop_duplicates('encounter_block', keep='first')
+        )
+        _kept_from_mapping = _first_per_block['hospitalization_id'].tolist()
+        cohort_hosp_ids_post_stitch = _kept_from_mapping + _unmapped_ids
+        n_dropped_stitch = (
+            len(hosp_ids_w_icu_stays) - len(cohort_hosp_ids_post_stitch)
+        )
+
+        # Surface the dropped hosp_ids list + block-size series for the
+        # QA-summary cell that follows. Both are cross-cell DAG outputs (no
+        # underscore prefix). IDs stay in-memory only — never persisted.
+        _kept_set = set(cohort_hosp_ids_post_stitch)
+        stitch_dropped_hosp_ids = [
+            h for h in hosp_ids_w_icu_stays if h not in _kept_set
+        ]
+        stitch_block_sizes = _encounter_mapping.groupby('encounter_block').size()
+
+        logger.info(
+            f"Encounter stitch-dedup (12h window): {n_dropped_stitch:,} "
+            f"hospitalizations stitched out (kept first per encounter block; "
+            f"{len(cohort_hosp_ids_post_stitch):,} remain). "
+            f"Unmapped (kept as singletons): {n_unmapped_singletons:,}"
+        )
+
+    return (
+        cohort_hosp_ids_post_stitch,
+        n_dropped_stitch,
+        n_unmapped_singletons,
+        stitch_dropped_hosp_ids,
+        stitch_block_sizes,
+    )
+
+
+@app.cell
+def _(
+    SITE_NAME,
+    load_data,
+    n_dropped_stitch,
+    n_unmapped_singletons,
+    stitch_block_sizes,
+    stitch_dropped_hosp_ids,
+):
+    # Stitch QA summary — persists per-site stitch behavior + cohort-impact
+    # decomposition for cross-site QA pooling. Written to
+    # output_to_share/{site}/qc/stitch_summary.json. Skipped when toggle is
+    # OFF (no stitch behavior to characterize). No IDs surfaced — only
+    # group-level counts per CLIF data privacy rules.
+    if n_dropped_stitch is None:
+        logger.info("Stitch QA summary: skipped (COHORT_STITCH_DEDUP_ON=0)")
+    else:
+        import json as _json
+
+        os.makedirs(f"output_to_share/{SITE_NAME}/qc", exist_ok=True)
+
+        # Block-size distribution from encounter_mapping. Group-level only.
+        _n_blocks_total = int(len(stitch_block_sizes))
+        _n_blocks_singleton = int((stitch_block_sizes == 1).sum())
+        _n_blocks_size_2 = int((stitch_block_sizes == 2).sum())
+        _n_blocks_size_ge3 = int((stitch_block_sizes >= 3).sum())
+        _bs_describe = {
+            k: float(v) for k, v in stitch_block_sizes.describe().to_dict().items()
+        }
+
+        # Decompose dropped hosps by IMV status. Coarse heuristic for the
+        # ≥24h split: max(recorded_dttm) - min(recorded_dttm) on IMV-tagged
+        # rows ≥ 24h. This is an UPPER BOUND on actual IMV duration (no gap
+        # / restart handling). Empirically at sites with reliable charting
+        # (UCMC/MIMIC) n_dropped_with_imv = 0 so the split is moot; the
+        # finer ≥24h split is included to surface anomalies at federated
+        # sites where the bucket may be non-trivial.
+        #
+        # Pandas (not DuckDB) for the aggregation: the dropped-hosp set is
+        # tiny (60-150 hosps), and DuckDB's replacement scan doesn't resolve
+        # underscore-prefixed cell-local relations, so we materialize the
+        # filtered relation to pandas and aggregate there.
+        if len(stitch_dropped_hosp_ids) > 0:
+            _resp_dropped_df = load_data(
+                'respiratory_support',
+                config_path='config/config.json',
+                return_rel=True,
+                columns=['hospitalization_id', 'recorded_dttm', 'device_category'],
+                filters={'hospitalization_id': stitch_dropped_hosp_ids},
+            ).df()
+            _resp_imv = _resp_dropped_df[
+                _resp_dropped_df['device_category'] == 'imv'
+            ]
+            _imv_per_hosp = _resp_imv.groupby('hospitalization_id').agg(
+                _imv_min=('recorded_dttm', 'min'),
+                _imv_max=('recorded_dttm', 'max'),
+            )
+            _imv_per_hosp['_imv_dur_hr'] = (
+                (_imv_per_hosp['_imv_max'] - _imv_per_hosp['_imv_min'])
+                .dt.total_seconds() / 3600
+            )
+            _n_with_imv = int(len(_imv_per_hosp))
+            _n_imv_ge24h = int((_imv_per_hosp['_imv_dur_hr'] >= 24).sum())
+            _n_imv_lt24h = _n_with_imv - _n_imv_ge24h
+            _n_no_imv_total = len(stitch_dropped_hosp_ids) - _n_with_imv
+        else:
+            _n_imv_ge24h = 0
+            _n_imv_lt24h = 0
+            _n_no_imv_total = 0
+
+        # Auto-generated interpretation. Triggers a clearer warning string
+        # if any qualifying-IMV hosps were stitched out (the only scenario
+        # where the filter has cohort cost).
+        if _n_imv_ge24h == 0:
+            _interp = (
+                f"All {n_dropped_stitch} stitched-out hospitalizations had "
+                f"either no IMV records ({_n_no_imv_total}) or IMV <24h "
+                f"({_n_imv_lt24h}). Net effect on final analytic cohort: 0."
+            )
+        else:
+            _interp = (
+                f"{_n_imv_ge24h} of {n_dropped_stitch} stitched-out "
+                f"hospitalizations had IMV >=24h. These would have qualified "
+                f"for the analytic cohort but were dropped as paperwork-"
+                f"artifact re-admissions. INVESTIGATE before pooling."
+            )
+
+        _pre_stitch = (
+            _n_blocks_total + n_dropped_stitch + n_unmapped_singletons
+        )
+        _post_stitch = _n_blocks_total + n_unmapped_singletons
+        _summary = {
+            "site": SITE_NAME,
+            "time_interval_hours": 12,
+            "toggle_state": "ON",
+            "cohort_size": {
+                "pre_stitch": _pre_stitch,
+                "post_stitch": _post_stitch,
+                "n_dropped": n_dropped_stitch,
+            },
+            "block_size_distribution": {
+                "n_blocks_total": _n_blocks_total,
+                "n_blocks_singleton": _n_blocks_singleton,
+                "n_blocks_size_2": _n_blocks_size_2,
+                "n_blocks_size_ge3": _n_blocks_size_ge3,
+                "describe": _bs_describe,
+                "comment": (
+                    "describes encounter_mapping returned by clifpy's "
+                    "stitch_encounters; excludes unmapped hosps (see "
+                    "clifpy_data_quality.n_unmapped_singletons)"
+                ),
+            },
+            "clifpy_data_quality": {
+                "n_unmapped_singletons": n_unmapped_singletons,
+                "comment": (
+                    "Hospitalizations missing from clifpy's returned "
+                    "encounter_mapping (likely null/quirky admission_dttm "
+                    "or discharge_dttm). Kept as singletons by the dedup "
+                    "filter, not stitched. Investigate at federated sites "
+                    "where this count is non-trivial relative to total ICU "
+                    "stays — may indicate upstream date-parsing issues."
+                ),
+            },
+            "dropped_hosp_decomposition": {
+                "n_dropped_no_imv": _n_no_imv_total,
+                "n_dropped_imv_lt24h": _n_imv_lt24h,
+                "n_dropped_imv_ge24h": _n_imv_ge24h,
+                "duration_method": (
+                    "max(recorded_dttm) - min(recorded_dttm) on IMV rows; "
+                    "coarse upper bound (no gap/restart handling)"
+                ),
+            },
+            "interpretation": _interp,
+        }
+
+        _path = f"output_to_share/{SITE_NAME}/qc/stitch_summary.json"
+        with open(_path, "w") as _f:
+            _json.dump(_summary, _f, indent=2)
+        logger.info(f"Saved: {_path}")
+        logger.info(
+            f"  Stitch QA: dropped={n_dropped_stitch:,} "
+            f"(no_imv={_n_no_imv_total:,}, imv_lt24h={_n_imv_lt24h:,}, "
+            f"imv_ge24h={_n_imv_ge24h:,}); "
+            f"blocks={_n_blocks_total:,} (singleton={_n_blocks_singleton:,}, "
+            f"size_2={_n_blocks_size_2:,}, size_ge3={_n_blocks_size_ge3:,})"
+        )
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
     ## Respiratory Support
     """)
     return
@@ -155,7 +418,7 @@ def _(
     SITE_NAME,
     SITE_TZ,
     apply_outlier_handling_duckdb,
-    hosp_ids_w_icu_stays,
+    cohort_hosp_ids_post_stitch,
     load_data,
 ):
     from clifpy import RespiratorySupport
@@ -198,7 +461,7 @@ def _(
             config_path=CONFIG_PATH,
             return_rel=True,
             columns=_resp_columns,
-            filters={"hospitalization_id": hosp_ids_w_icu_stays},
+            filters={"hospitalization_id": cohort_hosp_ids_post_stitch},
             site_tz="",  # skip auto-conversion; values stay UTC tz-aware
         )
         _resp_rel = apply_outlier_handling_duckdb(
@@ -351,24 +614,24 @@ def _(all_streaks_w_lead):
 
 @app.cell
 def _(
-    SITE_NAME,
     all_streaks_w_lead,
+    cohort_hosp_ids_post_stitch,
     cohort_imv_streaks,
     duckdb,
     hosp_ids_w_icu_stays,
+    n_dropped_stitch,
 ):
-    # Pre-weight cohort = qualifying IMV streaks (one row per qualifying hosp).
+    # Cell A — pre-weight cohort + CONSORT scalar counts.
     # Pulled via DuckDB SQL to keep the streak relation lazy; only the small
-    # ID list materializes here.
+    # ID list materializes here. Per-criterion scalars come from independent
+    # scalar SQL queries (per duckdb_perf_guide §11.6 — scalar diagnostics
+    # without breaking the lazy DAG).
     cohort_hosp_ids_pre_weight = [
         r[0] for r in duckdb.sql(
             "FROM cohort_imv_streaks SELECT DISTINCT hospitalization_id"
         ).fetchall()
     ]
 
-    # Intermediate CONSORT counts via scalar SQL queries on the lazy
-    # all_streaks_w_lead relation (per duckdb_perf_guide §11.6 — scalar
-    # diagnostics without breaking the lazy DAG).
     _n_with_any_imv = duckdb.sql("""
         FROM all_streaks_w_lead
         SELECT COUNT(DISTINCT hospitalization_id)
@@ -386,54 +649,170 @@ def _(
             AND _trach_dttm IS NOT NULL
     """).fetchone()[0]
 
-    # Weight-QC exclusion (Phase 2 of weight-audit work). Reads the drop list
-    # produced by `make weight-audit SITE=<site>`. If the audit hasn't run
-    # yet, the file won't exist and we skip the exclusion — first-run pipelines
-    # complete without weight QC, then the user runs the audit, then re-runs
-    # this script to apply the drop. See code/qc/weight_audit_README.md.
-    _drop_path = Path(f"output/{SITE_NAME}/qc/weight_qc_drop_list.parquet")
-    if _drop_path.exists():
-        _drop_df = pl.read_parquet(_drop_path)
-        _weight_drop_set = set(
-            _drop_df.select(pl.col('hospitalization_id').cast(pl.Utf8)).to_series().to_list()
-        )
-        _vc = _drop_df['_drop_reason'].value_counts(sort=True)
-        weight_drop_breakdown = dict(
-            zip(_vc['_drop_reason'].to_list(), _vc['count'].to_list())
-        )
-        cohort_hosp_ids = [
-            h for h in cohort_hosp_ids_pre_weight
-            if str(h) not in _weight_drop_set
-        ]
-        _n_weight_excluded = len(cohort_hosp_ids_pre_weight) - len(cohort_hosp_ids)
-        logger.info(f"Weight-QC exclusion: {_n_weight_excluded:,} hospitalizations dropped")
-        for _reason, _n_for_reason in weight_drop_breakdown.items():
-            logger.info(f"  {_reason}: {_n_for_reason:,}")
-    else:
-        weight_drop_breakdown = {}
-        cohort_hosp_ids = list(cohort_hosp_ids_pre_weight)
-        _n_weight_excluded = 0
-        logger.warning(f"No weight-QC drop list at {_drop_path} — skipping weight QC")
-        logger.warning(f"  (run `make weight-audit SITE={SITE_NAME}` then re-run 01_cohort.py to apply)")
-
-    consort_counts = {
+    # Re-anchor n_no_imv on n_post_stitch so the CONSORT cascade stays
+    # additive (each step's n_excluded is a marginal exclusion against the
+    # PRIOR step's n_remaining). When stitch is OFF, n_post_stitch == n_icu,
+    # so the math reduces to the prior expression.
+    _n_post_stitch = len(cohort_hosp_ids_post_stitch)
+    cohort_pre_weight_counts = {
         'n_icu': len(hosp_ids_w_icu_stays),
+        'n_post_stitch': _n_post_stitch,
+        'n_dropped_stitch': n_dropped_stitch,  # None when stitch toggle OFF
         'n_any_imv': _n_with_any_imv,
-        'n_no_imv': len(hosp_ids_w_icu_stays) - _n_with_any_imv,
+        'n_no_imv': _n_post_stitch - _n_with_any_imv,
         'n_first_imv_ge24': len(cohort_hosp_ids_pre_weight),
         'n_first_imv_lt24': _n_first_imv_lt24,
         'n_trach_truncated': _n_trach_truncated,
-        'n_weight_excluded': _n_weight_excluded,
-        'n_post_weight': len(cohort_hosp_ids),
-        'weight_drop_breakdown': weight_drop_breakdown,
     }
-    logger.info(f"Cohort hospitalizations (first IMV ≥24h, post-weight-QC): {len(cohort_hosp_ids):,}")
+    return cohort_hosp_ids_pre_weight, cohort_pre_weight_counts
+
+
+@app.cell
+def _(cohort_hosp_ids_pre_weight, duckdb, load_data):
+    # Cell B — weight-presence exclusion (upfront, runtime).
+    # Drop hospitalizations with ZERO non-null weight_kg rows in vitals so the
+    # first-pass cohort already excludes hosps that can never produce weight-
+    # dependent dose conversions. The audit's value-quality checks (jump,
+    # range) live separately in qc/weight_audit.py and feed back via
+    # weight_qc_drop_list.parquet on pass 2 (next cell).
+    weight_presence_rel = load_data(
+        'vitals',
+        config_path='config/config.json',
+        return_rel=True,
+        columns=['hospitalization_id', 'vital_category', 'vital_value'],
+        filters={
+            'vital_category': ['weight_kg'],
+            'hospitalization_id': cohort_hosp_ids_pre_weight,
+        },
+    )
+    cohort_hosp_ids_w_weight = [
+        r[0] for r in duckdb.sql("""
+            FROM weight_presence_rel
+            SELECT DISTINCT hospitalization_id
+            WHERE vital_value IS NOT NULL
+        """).fetchall()
+    ]
+    n_dropped_no_weight = (
+        len(cohort_hosp_ids_pre_weight) - len(cohort_hosp_ids_w_weight)
+    )
+    logger.info(
+        f"Weight-presence exclusion: {n_dropped_no_weight:,} hospitalizations "
+        f"dropped (zero weight_kg rows in vitals)"
+    )
+    return cohort_hosp_ids_w_weight, n_dropped_no_weight
+
+
+@app.cell
+def _(
+    SITE_NAME,
+    cohort_hosp_ids_w_weight,
+    cohort_pre_weight_counts,
+    n_dropped_no_weight,
+):
+    # Cell C — weight-QC drop list re-entry split per criterion.
+    # Phase 2 of weight-audit: reads `weight_qc_drop_list.parquet` produced
+    # by `make weight-audit SITE=<site>`, splits the drops by `_drop_reason`
+    # prefix (zero_weight* / jump_* / range_*), and applies them
+    # incrementally. Each criterion's marginal exclusion count flows into
+    # CONSORT as its own step (steps 5-7), giving per-rule visibility.
+    # If the file isn't present yet (first-pass run), counts are zero and
+    # the existing cohort_hosp_ids_w_weight passes through unchanged.
+    _drop_path = Path(f"output/{SITE_NAME}/qc/weight_qc_drop_list.parquet")
+    if _drop_path.exists():
+        _drop_df = pl.read_parquet(_drop_path)
+        # Group drop ids by reason prefix (handles parameterized reason
+        # strings like 'jump_gt_20kg_within_24h' / 'range_gt_30kg').
+        _drop_by_kind = {'zero': set(), 'jump': set(), 'range': set()}
+        for _row in _drop_df.iter_rows(named=True):
+            _hid = str(_row['hospitalization_id'])
+            _reason = _row['_drop_reason']
+            if _reason.startswith('zero_weight'):
+                _drop_by_kind['zero'].add(_hid)
+            elif _reason.startswith('jump_'):
+                _drop_by_kind['jump'].add(_hid)
+            elif _reason.startswith('range_'):
+                _drop_by_kind['range'].add(_hid)
+            else:
+                logger.warning(f"Unrecognized weight-QC drop reason: {_reason}")
+
+        # Apply incrementally; each step's count is the marginal exclusion.
+        _post_c1_resid = [
+            h for h in cohort_hosp_ids_w_weight
+            if str(h) not in _drop_by_kind['zero']
+        ]
+        _post_jump = [
+            h for h in _post_c1_resid
+            if str(h) not in _drop_by_kind['jump']
+        ]
+        _post_range = [
+            h for h in _post_jump
+            if str(h) not in _drop_by_kind['range']
+        ]
+        cohort_hosp_ids = _post_range
+
+        n_excl_c1_residual = len(cohort_hosp_ids_w_weight) - len(_post_c1_resid)
+        n_excl_jump = len(_post_c1_resid) - len(_post_jump)
+        n_excl_range = len(_post_jump) - len(_post_range)
+
+        # Surface the parameterized threshold strings so the CONSORT
+        # exclusion_reason text shows the active threshold.
+        _all_reasons = _drop_df['_drop_reason'].unique().to_list()
+        jump_threshold_str = next(
+            (r for r in _all_reasons if r.startswith('jump_')), None
+        )
+        range_threshold_str = next(
+            (r for r in _all_reasons if r.startswith('range_')), None
+        )
+
+        logger.info(
+            f"Weight-QC value checks: C1-residual={n_excl_c1_residual:,}, "
+            f"jump={n_excl_jump:,}, range={n_excl_range:,}"
+        )
+    else:
+        cohort_hosp_ids = list(cohort_hosp_ids_w_weight)
+        n_excl_c1_residual = 0
+        n_excl_jump = 0
+        n_excl_range = 0
+        jump_threshold_str = None
+        range_threshold_str = None
+        logger.warning(
+            f"No weight-QC drop list at {_drop_path} — "
+            "skipping C1-residual/jump/range"
+        )
+        logger.warning(
+            f"  (run `make weight-audit SITE={SITE_NAME}` "
+            "then re-run 01_cohort.py to apply)"
+        )
+
+    consort_counts = {
+        **cohort_pre_weight_counts,
+        'n_dropped_no_weight': n_dropped_no_weight,
+        'n_post_weight_presence': len(cohort_hosp_ids_w_weight),
+        'n_excl_c1_residual': n_excl_c1_residual,
+        'n_post_c1_residual': len(cohort_hosp_ids_w_weight) - n_excl_c1_residual,
+        'n_excl_jump': n_excl_jump,
+        'n_post_jump': (
+            len(cohort_hosp_ids_w_weight) - n_excl_c1_residual - n_excl_jump
+        ),
+        'n_excl_range': n_excl_range,
+        'n_post_range': len(cohort_hosp_ids),
+        'jump_threshold_str': jump_threshold_str,
+        'range_threshold_str': range_threshold_str,
+    }
+
+    logger.info(
+        f"Cohort hospitalizations (after all weight QC + IMV + ICU): "
+        f"{len(cohort_hosp_ids):,}"
+    )
     logger.info(f"  Excluded — no IMV: {consort_counts['n_no_imv']:,}")
     logger.info(
         f"  Excluded — first IMV <24h: {consort_counts['n_first_imv_lt24']:,} "
         f"(of which {consort_counts['n_trach_truncated']:,} tracheostomy-truncated)"
     )
-    logger.info(f"  Excluded — weight-QC: {_n_weight_excluded:,}")
+    logger.info(f"  Excluded — no weight_kg row: {n_dropped_no_weight:,}")
+    logger.info(f"  Excluded — all weights out of clamp: {n_excl_c1_residual:,}")
+    logger.info(f"  Excluded — weight jump rule: {n_excl_jump:,}")
+    logger.info(f"  Excluded — weight range rule: {n_excl_range:,}")
     return cohort_hosp_ids, consort_counts
 
 
@@ -643,49 +1022,102 @@ def _(
     ).fetchone()[0]
     _cc = consort_counts
 
-    _weight_breakdown_str = (
-        ", ".join(f"{k}: {v}" for k, v in _cc['weight_drop_breakdown'].items())
-        if _cc['weight_drop_breakdown'] else "n/a — drop list not present at run time"
-    )
+    # Per-criterion CONSORT steps. Two conditional steps coexist via the
+    # n_*=None sentinel pattern:
+    #   - Step 2 (encounter-stitch dedup) — emitted only if the stitch toggle
+    #     is ON (n_dropped_stitch is not None).
+    #   - Range rule (step ~7) — emitted only if the audit ran with
+    #     WEIGHT_QC_RANGE_RULE_ON=1 (range_threshold_str is not None).
+    # Step numbers are assigned by the renumber loop at the end so neither
+    # conditional shifts a hardcoded literal.
+    _steps = [
+        {
+            "step": 1,  # placeholder — final step numbers assigned below
+            "description": "Hospitalizations with ICU stays",
+            "n_remaining": _cc['n_icu'],
+        },
+    ]
+
+    # Optional step 2: encounter-stitch dedup. Skipped when the toggle is off.
+    if _cc['n_dropped_stitch'] is not None:
+        _steps.append({
+            "step": 2,
+            "description": "After encounter-stitch dedup (12h window)",
+            "n_remaining": _cc['n_post_stitch'],
+            "n_excluded": _cc['n_dropped_stitch'],
+            "exclusion_reason": "Within-12h discharge→readmit paperwork artifact (kept first hosp per stitched encounter block)",
+        })
+
+    _steps.extend([
+        {
+            "step": 0,
+            "description": "With any invasive mechanical ventilation",
+            "n_remaining": _cc['n_any_imv'],
+            "n_excluded": _cc['n_no_imv'],
+            "exclusion_reason": "No IMV recorded",
+        },
+        {
+            "step": 0,
+            "description": "First IMV streak >= 24 hours",
+            "n_remaining": _cc['n_first_imv_ge24'],
+            "n_excluded": _cc['n_first_imv_lt24'],
+            "exclusion_reason": f"First IMV streak <24h ({_cc['n_trach_truncated']} tracheostomy-truncated)",
+        },
+        {
+            "step": 0,
+            "description": "Has >= 1 weight_kg record (presence check)",
+            "n_remaining": _cc['n_post_weight_presence'],
+            "n_excluded": _cc['n_dropped_no_weight'],
+            "exclusion_reason": "Zero weight_kg rows in vitals (runtime upfront check)",
+        },
+        {
+            "step": 0,
+            "description": "Has >= 1 weight in [30, 300] kg (post-clamp residual)",
+            "n_remaining": _cc['n_post_c1_residual'],
+            "n_excluded": _cc['n_excl_c1_residual'],
+            "exclusion_reason": "All weight_kg values outside clamp [30, 300] kg (audit C1 residual)",
+        },
+        {
+            "step": 0,
+            "description": "No consecutive weight jump within 24h",
+            "n_remaining": _cc['n_post_jump'],
+            "n_excluded": _cc['n_excl_jump'],
+            "exclusion_reason": (
+                f"Implausible weight jump (audit C2; reason='{_cc['jump_threshold_str']}')"
+                if _cc['jump_threshold_str'] else
+                "Implausible weight jump (audit C2; threshold unknown — drop list absent)"
+            ),
+        },
+    ])
+
+    # Optional weight-range rule. Skipped when audit ran without the rule.
+    if _cc['range_threshold_str'] is not None:
+        _steps.append({
+            "step": 0,
+            "description": "No within-stay weight range exceeded",
+            "n_remaining": _cc['n_post_range'],
+            "n_excluded": _cc['n_excl_range'],
+            "exclusion_reason": f"Within-stay weight range exceeded (audit C3; reason='{_cc['range_threshold_str']}')",
+        })
+
+    # NMB step (always last). n_remaining is anchored to the actual final
+    # cohort size minus NMB-excluded hosps.
+    _steps.append({
+        "step": 0,
+        "description": "Exclude hospitalizations with any NMB >1h",
+        "n_remaining": len(cohort_hosp_ids) - _n_nmb_hosp_ids,
+        "n_excluded": _n_nmb_hosp_ids,
+        "exclusion_reason": f"Any patient-day with NMB >1h ({_n_nmb_patient_days:,} patient-days across {_n_nmb_hosp_ids:,} hosp)",
+    })
+
+    # Assign final step numbers in order — single source of truth, robust to
+    # which conditional steps fired.
+    for _i, _s in enumerate(_steps, start=1):
+        _s["step"] = _i
 
     consort_flow = {
         "site": SITE_NAME,
-        "steps": [
-            {
-                "step": 1,
-                "description": "Hospitalizations with ICU stays",
-                "n_remaining": _cc['n_icu'],
-            },
-            {
-                "step": 2,
-                "description": "With any invasive mechanical ventilation",
-                "n_remaining": _cc['n_any_imv'],
-                "n_excluded": _cc['n_no_imv'],
-                "exclusion_reason": "No IMV recorded",
-            },
-            {
-                "step": 3,
-                "description": "First IMV streak >= 24 hours",
-                "n_remaining": _cc['n_first_imv_ge24'],
-                "n_excluded": _cc['n_first_imv_lt24'],
-                "exclusion_reason": f"First IMV streak <24h ({_cc['n_trach_truncated']} tracheostomy-truncated)",
-            },
-            {
-                "step": 4,
-                "description": "Pass weight-QC (zero-weight, jump rule)",
-                "n_remaining": _cc['n_post_weight'],
-                "n_excluded": _cc['n_weight_excluded'],
-                "exclusion_reason": f"Weight-QC drop list ({_weight_breakdown_str})",
-                "weight_qc_breakdown": _cc['weight_drop_breakdown'],
-            },
-            {
-                "step": 5,
-                "description": "Exclude hospitalizations with any NMB >1h",
-                "n_remaining": _cc['n_post_weight'] - _n_nmb_hosp_ids,
-                "n_excluded": _n_nmb_hosp_ids,
-                "exclusion_reason": f"Any patient-day with NMB >1h ({_n_nmb_patient_days:,} patient-days across {_n_nmb_hosp_ids:,} hosp)",
-            },
-        ],
+        "steps": _steps,
     }
 
     _consort_json_path = f"output_to_share/{SITE_NAME}/models/consort_inclusion.json"
