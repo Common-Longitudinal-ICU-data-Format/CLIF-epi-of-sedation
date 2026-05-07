@@ -4,27 +4,38 @@
 #     "marimo",
 #     "clifpy>=0.3.1",
 #     "duckdb>=1.4.1",
-#     "pandas>=2.3.1",
+#     "polars>=1.34.0",
 # ]
 # ///
 
 import marimo
 
-__generated_with = "0.21.0"
+__generated_with = "0.22.5"
 app = marimo.App(sql_output="native")
 
 with app.setup:
     import marimo as mo
     import os
     import sys
+    import logging
+    import polars as pl
     from pathlib import Path
     # sys.path.insert(0, str(Path(__file__).parent))
     RERUN_WATERFALL = False
-    # Hoisted into setup so any cell can call it without re-importing
+    # Hoisted into setup so any cell can call them without re-importing
     # (marimo flags duplicate top-level imports across cells as
-    # cross-cell shadowing). retag_to_local_tz is a pure metadata-only
-    # tz_convert helper used at every parquet-write boundary.
-    from _utils import retag_to_local_tz
+    # cross-cell shadowing). retag_to_local_tz is metadata-only tz_convert
+    # at parquet boundaries; add_day_shift_id is the SQL-based local-hour
+    # derivation (tested in tests/test_timezone.py); plot_consort and
+    # consort_to_markdown render the CONSORT artifacts.
+    from _utils import (
+        retag_to_local_tz,
+        add_day_shift_id,
+        plot_consort,
+        consort_to_markdown,
+    )
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.cohort")
 
 
 @app.cell(hide_code=True)
@@ -35,28 +46,46 @@ def _():
     Identifies ICU patients with first IMV streak >= 24 hours.
     Builds hourly time grids with day/shift annotations.
     Computes NMB exclusion flags.
+
+    Pipeline follows `pyCLIF/docs/duckdb_perf_guide.md` §11: stay lazy as
+    `DuckDBPyRelation`s, materialize only at framework boundaries (waterfall,
+    parquet writes for tz-tagged outputs). Vendored DuckDB outlier handler
+    (`code/_outlier_handler.py`) replaces clifpy's pandas-based
+    `apply_outlier_handling` so the resp chain stays unmaterialized through
+    the outlier step.
+
+    Cohort definition (per-hospitalization, first IMV streak ≥24h with at-
+    least-one-ICU-stay eligibility) is preserved unchanged from prior
+    versions. Encounter-stitching collapse and patient-level filter were
+    explored and deferred — see `docs/analysis_plan.md` "Cohort definition
+    — alternatives considered" for the rationale + empirical numbers.
     """)
     return
 
 
 @app.cell
 def _():
-    from clifpy import ClifOrchestrator
-    import pandas as pd
+    from clifpy import load_data, setup_logging
     import duckdb
     from clifpy.utils.config import get_config_or_params
-    from clifpy.utils import apply_outlier_handling
+    from _outlier_handler import apply_outlier_handling_duckdb
 
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
 
     CONFIG_PATH = "config/config.json"
-    co = ClifOrchestrator(config_path=CONFIG_PATH)
-    return CONFIG_PATH, apply_outlier_handling, get_config_or_params, pd
+    return (
+        CONFIG_PATH,
+        apply_outlier_handling_duckdb,
+        duckdb,
+        get_config_or_params,
+        load_data,
+        setup_logging,
+    )
 
 
 @app.cell
-def _(CONFIG_PATH, get_config_or_params):
+def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # Site-scoped output directories — every per-site run lives under
     # output/{site}/ and output_to_share/{site}/ so multiple sites coexist
     # on disk (see Makefile's SITE= flag and the "Multi-site support"
@@ -70,59 +99,45 @@ def _(CONFIG_PATH, get_config_or_params):
     # {site}/models/. Both flat — no nested figures/.
     os.makedirs(f"output_to_share/{SITE_NAME}/descriptive", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
-    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    # Per-site log separation: logs land at output/{site}/logs/clifpy_all.log
+    # + clifpy_errors.log. setup_logging is idempotent; we call it explicitly
+    # here (replaces the ClifOrchestrator instantiation side effect that the
+    # prior version relied on) so the output_directory is site-scoped.
+    setup_logging(output_directory=f"output/{SITE_NAME}")
+    logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
     return SITE_NAME, SITE_TZ
 
 
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Load ADT & Hospitalization
+    ## Load ADT
     """)
     return
 
 
 @app.cell
-def _():
-    from clifpy import Adt, Hospitalization
-
-    adt = Adt.from_file(
+def _(duckdb, load_data):
+    # Lazy ADT load with column + ICU-category pushdown into the parquet scan.
+    adt_rel = load_data(
+        'adt',
         config_path='config/config.json',
+        return_rel=True,
         columns=['hospitalization_id', 'in_dttm', 'out_dttm', 'location_category', 'location_type'],
-        filters={
-            'location_category': ['icu']
-        }
+        filters={'location_category': ['icu']},
     )
-
-    adt_df = adt.df
-    hosp_ids_w_icu_stays = adt_df['hospitalization_id'].unique().tolist()
-    print(f"Hospitalizations with ICU stays: {len(hosp_ids_w_icu_stays)}")
-    return Adt, Hospitalization, adt_df, hosp_ids_w_icu_stays
+    hosp_ids_w_icu_stays = [
+        r[0] for r in duckdb.sql(
+            "FROM adt_rel SELECT DISTINCT hospitalization_id"
+        ).fetchall()
+    ]
+    logger.info(f"Hospitalizations with ICU stays: {len(hosp_ids_w_icu_stays):,}")
+    return adt_rel, hosp_ids_w_icu_stays
 
 
 @app.cell
-def _(Adt, Hospitalization, hosp_ids_w_icu_stays):
-    from clifpy.utils.stitching_encounters import stitch_encounters
-
-    hosp_w_icu_stays = Hospitalization.from_file(
-        config_path='config/config.json',
-        filters={
-            'hospitalization_id': hosp_ids_w_icu_stays
-        }
-    )
-    adt_w_icu_stays = Adt.from_file(
-        config_path='config/config.json',
-        filters={
-            'hospitalization_id': hosp_ids_w_icu_stays
-        }
-    )
-
-    # NOTE: Encounter stitching computed but not yet wired into downstream pipeline
-    hosp_stitched, adt_stitched, encounter_mapping = stitch_encounters(
-        hospitalization=hosp_w_icu_stays.df,
-        adt=adt_w_icu_stays.df,
-        time_interval=12  # 12-hour window
-    )
+def _(adt_rel):
+    adt_rel
     return
 
 
@@ -139,12 +154,11 @@ def _(
     CONFIG_PATH,
     SITE_NAME,
     SITE_TZ,
-    apply_outlier_handling,
+    apply_outlier_handling_duckdb,
     hosp_ids_w_icu_stays,
-    pd,
+    load_data,
 ):
     from clifpy import RespiratorySupport
-    from clifpy.utils.io import load_data
 
     resp_processed_path = f"output/{SITE_NAME}/resp_processed_bf.parquet"
 
@@ -177,21 +191,27 @@ def _(
         import json as _json
         with open(CONFIG_PATH) as _cfg_f:
             _cfg = _json.load(_cfg_f)
-        _resp_df_raw = load_data(
+        # Lazy load + vendored DuckDB outlier handler (per duckdb_perf_guide
+        # §11.1 — replaces clifpy's pandas-based apply_outlier_handling).
+        _resp_rel = load_data(
             "respiratory_support",
             config_path=CONFIG_PATH,
+            return_rel=True,
             columns=_resp_columns,
             filters={"hospitalization_id": hosp_ids_w_icu_stays},
-            site_tz="",  # Skip auto-conversion; values stay as UTC tz-aware
+            site_tz="",  # skip auto-conversion; values stay UTC tz-aware
         )
+        _resp_rel = apply_outlier_handling_duckdb(
+            _resp_rel, 'respiratory_support', 'config/outlier_config.yaml',
+        )
+        # Materialize at the waterfall boundary — RespiratorySupport.waterfall
+        # is Table-bound (operates on .df, pandas). Vendoring waterfall is
+        # out of scope.
         cohort_resp = RespiratorySupport(
             data_directory=_cfg["data_directory"],
             filetype=_cfg.get("filetype", "parquet"),
             timezone="UTC",
-            data=_resp_df_raw,
-        )
-        apply_outlier_handling(
-            cohort_resp, outlier_config_path="config/outlier_config.yaml"
+            data=_resp_rel.df(),
         )
         cohort_resp_p = cohort_resp.waterfall(bfill=True)
         # Re-tag UTC tz-aware recorded_dttm → site-local tz-aware before
@@ -205,17 +225,14 @@ def _(
         cohort_resp_p.df.to_parquet(resp_processed_path)
         resp_p = cohort_resp_p.df
     else:
-        print(f"Loading cached {resp_processed_path}")
-        resp_p = pd.read_parquet(resp_processed_path)
+        # Cached load via Polars to preserve the on-disk site-tz tag (pyarrow
+        # round-trips the tag through parquet metadata; DuckDB's `.df()` would
+        # rewrite the tag to session tz). `.to_pandas()` keeps the tz info.
+        logger.info(f"Loading cached {resp_processed_path}")
+        resp_p = pl.read_parquet(resp_processed_path).to_pandas()
 
-    print(f"resp_p: {len(resp_p)} rows")
+    logger.info(f"resp_p: {len(resp_p):,} rows")
     return (resp_p,)
-
-
-@app.cell
-def _(resp_p):
-    resp_p['tracheostomy'] = resp_p['tracheostomy'].fillna(0).astype(int)
-    return
 
 
 @app.cell(hide_code=True)
@@ -223,7 +240,10 @@ def _():
     mo.md(r"""
     ## IMV Streak Detection
 
-    Inlined from `cohort_id.sql`. Each CTE is a separate cell for interactive inspection.
+    Inlined from `cohort_id.sql`. Each CTE is a separate cell for interactive
+    inspection (per the "one CTE per cell" pattern in the global CLAUDE.md).
+    The `tracheostomy` NaN→0 coercion is folded into cohort_t1's SELECT via
+    `COALESCE(...)::INT` rather than mutating `resp_p` in pandas first.
     """)
     return
 
@@ -237,7 +257,7 @@ def _(resp_p):
         SELECT hospitalization_id
             , event_dttm: recorded_dttm
             , device_category
-            , tracheostomy
+            , tracheostomy: COALESCE(tracheostomy, 0)::INT
             , _on_imv: CASE WHEN device_category = 'imv' THEN 1 ELSE 0 END
             , _chg_imv: CASE
                 -- getting off imv (extub)
@@ -330,44 +350,71 @@ def _(all_streaks_w_lead):
 
 
 @app.cell
-def _(SITE_NAME, all_streaks_w_lead, cohort_imv_streaks, hosp_ids_w_icu_stays, pd):
-    import duckdb as _ddb
-    from pathlib import Path as _Path
+def _(
+    SITE_NAME,
+    all_streaks_w_lead,
+    cohort_imv_streaks,
+    duckdb,
+    hosp_ids_w_icu_stays,
+):
+    # Pre-weight cohort = qualifying IMV streaks (one row per qualifying hosp).
+    # Pulled via DuckDB SQL to keep the streak relation lazy; only the small
+    # ID list materializes here.
+    cohort_hosp_ids_pre_weight = [
+        r[0] for r in duckdb.sql(
+            "FROM cohort_imv_streaks SELECT DISTINCT hospitalization_id"
+        ).fetchall()
+    ]
 
-    cohort_hosp_ids_pre_weight = cohort_imv_streaks.df()['hospitalization_id'].unique().tolist()
-
-    # Intermediate CONSORT counts from all_streaks_w_lead
-    _streaks_df = all_streaks_w_lead.df()
-
-    _n_with_any_imv = _streaks_df.loc[_streaks_df['_on_imv'] == 1, 'hospitalization_id'].nunique()
-    _first_imv = _streaks_df[(_streaks_df['_streak_id'] == 1) & (_streaks_df['_on_imv'] == 1)]
-    _n_first_imv_lt24 = len(_first_imv[_first_imv['_at_least_24h'] == 0])
-    _n_trach_truncated = len(_first_imv[_first_imv['_trach_dttm'].notna() & (_first_imv['_at_least_24h'] == 0)])
+    # Intermediate CONSORT counts via scalar SQL queries on the lazy
+    # all_streaks_w_lead relation (per duckdb_perf_guide §11.6 — scalar
+    # diagnostics without breaking the lazy DAG).
+    _n_with_any_imv = duckdb.sql("""
+        FROM all_streaks_w_lead
+        SELECT COUNT(DISTINCT hospitalization_id)
+        WHERE _on_imv = 1
+    """).fetchone()[0]
+    _n_first_imv_lt24 = duckdb.sql("""
+        FROM all_streaks_w_lead
+        SELECT COUNT(*)
+        WHERE _streak_id = 1 AND _on_imv = 1 AND _at_least_24h = 0
+    """).fetchone()[0]
+    _n_trach_truncated = duckdb.sql("""
+        FROM all_streaks_w_lead
+        SELECT COUNT(*)
+        WHERE _streak_id = 1 AND _on_imv = 1 AND _at_least_24h = 0
+            AND _trach_dttm IS NOT NULL
+    """).fetchone()[0]
 
     # Weight-QC exclusion (Phase 2 of weight-audit work). Reads the drop list
     # produced by `make weight-audit SITE=<site>`. If the audit hasn't run
     # yet, the file won't exist and we skip the exclusion — first-run pipelines
     # complete without weight QC, then the user runs the audit, then re-runs
     # this script to apply the drop. See code/qc/weight_audit_README.md.
-    _drop_path = _Path(f"output/{SITE_NAME}/qc/weight_qc_drop_list.parquet")
+    _drop_path = Path(f"output/{SITE_NAME}/qc/weight_qc_drop_list.parquet")
     if _drop_path.exists():
-        _drop_df = pd.read_parquet(_drop_path)
-        _weight_drop_ids = set(_drop_df['hospitalization_id'].astype(str))
-        weight_drop_breakdown = _drop_df['_drop_reason'].value_counts().to_dict()
+        _drop_df = pl.read_parquet(_drop_path)
+        _weight_drop_set = set(
+            _drop_df.select(pl.col('hospitalization_id').cast(pl.Utf8)).to_series().to_list()
+        )
+        _vc = _drop_df['_drop_reason'].value_counts(sort=True)
+        weight_drop_breakdown = dict(
+            zip(_vc['_drop_reason'].to_list(), _vc['count'].to_list())
+        )
         cohort_hosp_ids = [
             h for h in cohort_hosp_ids_pre_weight
-            if str(h) not in _weight_drop_ids
+            if str(h) not in _weight_drop_set
         ]
         _n_weight_excluded = len(cohort_hosp_ids_pre_weight) - len(cohort_hosp_ids)
-        print(f"Weight-QC exclusion: {_n_weight_excluded} hospitalizations dropped")
-        for _reason, _n in weight_drop_breakdown.items():
-            print(f"  {_reason}: {_n}")
+        logger.info(f"Weight-QC exclusion: {_n_weight_excluded:,} hospitalizations dropped")
+        for _reason, _n_for_reason in weight_drop_breakdown.items():
+            logger.info(f"  {_reason}: {_n_for_reason:,}")
     else:
         weight_drop_breakdown = {}
         cohort_hosp_ids = list(cohort_hosp_ids_pre_weight)
         _n_weight_excluded = 0
-        print(f"No weight-QC drop list at {_drop_path} — skipping weight QC")
-        print(f"  (run `make weight-audit SITE={SITE_NAME}` then re-run 01_cohort.py to apply)")
+        logger.warning(f"No weight-QC drop list at {_drop_path} — skipping weight QC")
+        logger.warning(f"  (run `make weight-audit SITE={SITE_NAME}` then re-run 01_cohort.py to apply)")
 
     consort_counts = {
         'n_icu': len(hosp_ids_w_icu_stays),
@@ -380,19 +427,22 @@ def _(SITE_NAME, all_streaks_w_lead, cohort_imv_streaks, hosp_ids_w_icu_stays, p
         'n_post_weight': len(cohort_hosp_ids),
         'weight_drop_breakdown': weight_drop_breakdown,
     }
-    print(f"Cohort hospitalizations (first IMV ≥24h, post-weight-QC): {len(cohort_hosp_ids)}")
-    print(f"  Excluded — no IMV: {consort_counts['n_no_imv']}")
-    print(f"  Excluded — first IMV <24h: {consort_counts['n_first_imv_lt24']} (of which {consort_counts['n_trach_truncated']} tracheostomy-truncated)")
-    print(f"  Excluded — weight-QC: {_n_weight_excluded}")
+    logger.info(f"Cohort hospitalizations (first IMV ≥24h, post-weight-QC): {len(cohort_hosp_ids):,}")
+    logger.info(f"  Excluded — no IMV: {consort_counts['n_no_imv']:,}")
+    logger.info(
+        f"  Excluded — first IMV <24h: {consort_counts['n_first_imv_lt24']:,} "
+        f"(of which {consort_counts['n_trach_truncated']:,} tracheostomy-truncated)"
+    )
+    logger.info(f"  Excluded — weight-QC: {_n_weight_excluded:,}")
     return cohort_hosp_ids, consort_counts
 
 
 @app.cell
-def _(adt_df, cohort_hosp_ids):
+def _(adt_rel, cohort_hosp_ids):
     icu_type_df = mo.sql(
         f"""
         -- First ICU type per cohort hospitalization (earliest ADT record)
-        FROM adt_df
+        FROM adt_rel
         SELECT hospitalization_id
             , icu_type: FIRST(location_type ORDER BY in_dttm)
         WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
@@ -403,8 +453,15 @@ def _(adt_df, cohort_hosp_ids):
 
 
 @app.cell
-def _(icu_type_df):
-    print(f"ICU types extracted: {len(icu_type_df)} hospitalizations")
+def _(duckdb, icu_type_df):
+    _n_icu_types = duckdb.sql("FROM icu_type_df SELECT COUNT(*)").fetchone()[0]
+    logger.info(f"ICU types extracted: {_n_icu_types:,} hospitalizations")
+    return
+
+
+@app.cell
+def _(cohort_imv_streaks):
+    cohort_imv_streaks
     return
 
 
@@ -412,21 +469,35 @@ def _(icu_type_df):
 def _():
     mo.md(r"""
     ## Hourly Time Grids
+
+    Per the "one CTE per cell" pattern: bound computation is split off so
+    the intermediate is inspectable in the marimo UI. The two cells fuse
+    into one execution at the terminal `.df()` / parquet write — zero perf
+    overhead in production.
     """)
     return
 
 
 @app.cell
 def _(cohort_imv_streaks):
+    cohort_streak_bounds = mo.sql(
+        f"""
+        -- Per-streak hour bounds (rounded to the hour boundary, end exclusive +1h).
+        FROM cohort_imv_streaks
+        SELECT hospitalization_id
+            , _start_hr: date_trunc('hour', _start_dttm)
+            , _end_hr: date_trunc('hour', _end_dttm) + INTERVAL '1 hour'
+        """
+    )
+    return (cohort_streak_bounds,)
+
+
+@app.cell
+def _(cohort_streak_bounds):
     cohort_hrly_grids = mo.sql(
         f"""
         -- Generate hourly time grid from start to end of each qualifying IMV streak
-        FROM (
-            FROM cohort_imv_streaks
-            SELECT hospitalization_id
-                , _start_hr: date_trunc('hour', _start_dttm)
-                , _end_hr: date_trunc('hour', _end_dttm) + INTERVAL '1 hour'
-        )
+        FROM cohort_streak_bounds
         SELECT hospitalization_id
             , unnest(generate_series(_start_hr, _end_hr, INTERVAL '1 hour')) AS event_dttm
         ORDER BY hospitalization_id, event_dttm
@@ -437,24 +508,21 @@ def _(cohort_imv_streaks):
 
 @app.cell
 def _(SITE_TZ, cohort_hrly_grids):
-    from _utils import add_day_shift_id
-
+    # add_day_shift_id derives _dh / _hr / _shift / _is_day_start / _nth_day /
+    # _day_shift via explicit `AT TIME ZONE site_tz` in SQL — session-tz
+    # invariant (see tests/test_timezone.py for invariants and DST coverage).
+    # The function returns pandas; downstream consumers via DuckDB
+    # replacement scan handle pandas natively.
     _grids_df = cohort_hrly_grids.df()
-    # Pass site_tz so `_hr` / `_shift` / `_nth_day` reflect the local
-    # clinical clock (7am-7pm local) rather than UTC (the legacy default
-    # 'UTC' produced ~1am-1pm Central, miscoloring every shift-stratified
-    # downstream output). Function uses explicit AT TIME ZONE in SQL — no
-    # session-tz dependency. See tests/test_timezone.py for invariants.
     cohort_hrly_grids_f = add_day_shift_id(_grids_df, site_tz=SITE_TZ)
     assert len(cohort_hrly_grids_f) == len(_grids_df), 'length altered by add_day_shift_id'
-    print(f"Hourly grid rows: {len(cohort_hrly_grids_f)}")
+    logger.info(f"Hourly grid rows: {len(cohort_hrly_grids_f):,}")
     return (cohort_hrly_grids_f,)
 
 
 @app.cell
 def _(cohort_hrly_grids_f):
-    cohort_shift_change_grids = cohort_hrly_grids_f[cohort_hrly_grids_f['_hr'].isin([7, 19])]
-    print(f"Shift-change grid rows (7am/7pm only): {len(cohort_shift_change_grids)}")
+    cohort_hrly_grids_f
     return
 
 
@@ -470,28 +538,28 @@ def _():
 
 
 @app.cell
-def _():
-    from clifpy import MedicationAdminContinuous
-
-    nmb = MedicationAdminContinuous.from_file(
+def _(load_data):
+    nmb_rel = load_data(
+        'medication_admin_continuous',
         config_path='config/config.json',
+        return_rel=True,
         columns=['hospitalization_id', 'admin_dttm', 'med_name', 'med_category', 'med_dose', 'med_dose_unit'],
-        filters={
-            'med_category': ['cisatracurium', 'vecuronium', 'rocuronium']
-        }
+        filters={'med_category': ['cisatracurium', 'vecuronium', 'rocuronium']},
     )
-
-    nmb_df = nmb.df
-    print(f"NMB records: {len(nmb_df)}")
-    return (nmb_df,)
+    if logger.isEnabledFor(logging.DEBUG):
+        _n = nmb_rel.count("*").fetchone()[0]
+        logger.debug(f"NMB records: {_n:,}")
+    else:
+        logger.info("NMB records: lazy relation built")
+    return (nmb_rel,)
 
 
 @app.cell
-def _(nmb_df):
+def _(nmb_rel):
     nmb_w_duration = mo.sql(
         f"""
         -- Compute duration (minutes) between consecutive NMB administrations
-        FROM nmb_df
+        FROM nmb_rel
         SELECT hospitalization_id
             , admin_dttm
             , med_dose
@@ -541,6 +609,13 @@ def _(nmb_hrly):
 def _():
     mo.md(r"""
     ## CONSORT Flow & Save Outputs
+
+    Terminal materialization. Tz-tagged outputs (`cohort_imv_streaks` with
+    `_start_dttm`/`_end_dttm`, `cohort_hrly_grids` with `event_dttm`) write
+    via Polars `dt.convert_time_zone` + `write_parquet` to preserve the
+    site-local tz tag on disk. Non-tz outputs (`nmb_excluded`, `icu_type`)
+    use DuckDB's native `.to_parquet()` directly. Mirrors the 02_exposure
+    save pattern.
     """)
     return
 
@@ -553,20 +628,21 @@ def _(
     cohort_hrly_grids_f,
     cohort_imv_streaks,
     consort_counts,
+    duckdb,
     icu_type_df,
     nmb_excluded_patient_days,
 ):
     import json
 
-    # CONSORT flow
-    _nmb_excluded_df = nmb_excluded_patient_days.df()
-    _n_nmb_patient_days = len(_nmb_excluded_df)
-    _n_nmb_hosp_ids = _nmb_excluded_df['hospitalization_id'].nunique() if len(_nmb_excluded_df) > 0 else 0
+    # NMB exclusion summary — scalar SQL on the lazy relation.
+    _n_nmb_patient_days = duckdb.sql(
+        "FROM nmb_excluded_patient_days SELECT COUNT(*)"
+    ).fetchone()[0]
+    _n_nmb_hosp_ids = duckdb.sql(
+        "FROM nmb_excluded_patient_days SELECT COUNT(DISTINCT hospitalization_id)"
+    ).fetchone()[0]
     _cc = consort_counts
 
-    # Weight-QC exclusion already applied (or skipped if drop list missing) in
-    # the cohort_hosp_ids cell above. The CONSORT step here just reports the
-    # totals from consort_counts.
     _weight_breakdown_str = (
         ", ".join(f"{k}: {v}" for k, v in _cc['weight_drop_breakdown'].items())
         if _cc['weight_drop_breakdown'] else "n/a — drop list not present at run time"
@@ -615,56 +691,61 @@ def _(
     _consort_json_path = f"output_to_share/{SITE_NAME}/models/consort_inclusion.json"
     with open(_consort_json_path, "w") as f:
         json.dump(consort_flow, f, indent=2)
-    print(f"CONSORT flow saved to {_consort_json_path}")
+    logger.info(f"CONSORT flow saved to {_consort_json_path}")
 
-    # Save intermediate outputs (site-scoped: output/{site}/...).
-    # cohort_imv_streaks and cohort_hrly_grids_f are filtered to the
-    # post-weight-QC cohort so every downstream consumer (02 / 04 / 05 / qc)
-    # only sees kept patients. The pre-weight-QC streaks/grid are still in
-    # memory (used by NMB exclusion above) but not persisted.
-    _kept_set = set(cohort_hosp_ids)
-    _streaks_df_full = cohort_imv_streaks.df()
-    _streaks_df_kept = _streaks_df_full[
-        _streaks_df_full['hospitalization_id'].isin(_kept_set)
-    ]
-    _grids_df_kept = cohort_hrly_grids_f[
-        cohort_hrly_grids_f['hospitalization_id'].isin(_kept_set)
-    ]
+    # Filter cohort artifacts to the kept (post-weight-QC) cohort. SEMI JOIN
+    # in DuckDB is the lazy way; results materialize at .pl() / .to_parquet().
+    _streaks_kept_rel = duckdb.sql(f"""
+        FROM cohort_imv_streaks
+        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+    """)
+    _grids_kept_rel = duckdb.sql(f"""
+        FROM cohort_hrly_grids_f
+        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+    """)
 
-    # Re-tag UTC tz-aware *_dttm columns → site-local tz-aware before
-    # persisting. Project convention for output/{site}/*.parquet is
-    # site-local tz-tagged so downstream consumers (02-09, qc, agg) read
-    # pre-converted local-tz values without an extra tz_convert call.
-    # `_dh` (in `cohort_hrly_grids_f`) stays naive — derived bucket label.
-    # See _utils.retag_to_local_tz docstring + tests/test_timezone.py.
-    _streaks_df_kept = retag_to_local_tz(
-        _streaks_df_kept,
-        ['_start_dttm', '_end_dttm', '_last_observed_dttm', '_trach_dttm', '_next_start_dttm'],
-        SITE_TZ,
+    # Tz-tagged outputs via Polars (preserves site-local tz tag on disk;
+    # DuckDB native .to_parquet would normalize to UTC tag — see
+    # duckdb_perf_guide.md §11.4).
+    (
+        _streaks_kept_rel
+        .pl()
+        .with_columns(
+            pl.col('_start_dttm').dt.convert_time_zone(SITE_TZ),
+            pl.col('_end_dttm').dt.convert_time_zone(SITE_TZ),
+        )
+        .write_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
     )
-    _grids_df_kept = retag_to_local_tz(_grids_df_kept, ['event_dttm'], SITE_TZ)
+    (
+        _grids_kept_rel
+        .pl()
+        .with_columns(pl.col('event_dttm').dt.convert_time_zone(SITE_TZ))
+        .write_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
+    )
 
-    _streaks_df_kept.to_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
-    _grids_df_kept.to_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
-    _nmb_excluded_df.to_parquet(f"output/{SITE_NAME}/nmb_excluded.parquet")
-    icu_type_df.df().to_parquet(f"output/{SITE_NAME}/icu_type.parquet")
+    # Non-tz outputs: DuckDB native .to_parquet() directly on the relation.
+    nmb_excluded_patient_days.to_parquet(f"output/{SITE_NAME}/nmb_excluded.parquet")
+    icu_type_df.to_parquet(f"output/{SITE_NAME}/icu_type.parquet")
 
-    print(f"Saved: output/{SITE_NAME}/cohort_imv_streaks.parquet ({len(cohort_hosp_ids)} hospitalizations)")
-    print(f"Saved: output/{SITE_NAME}/cohort_hrly_grids.parquet ({len(_grids_df_kept)} rows)")
-    print(f"Saved: output/{SITE_NAME}/nmb_excluded.parquet ({_n_nmb_patient_days} patient-days)")
-    print(f"Saved: output/{SITE_NAME}/icu_type.parquet ({len(icu_type_df)} hospitalizations)")
+    _n_grids_rows = _grids_kept_rel.count("*").fetchone()[0]
+    _n_icu = icu_type_df.count("*").fetchone()[0]
+    logger.info(
+        f"Saved: output/{SITE_NAME}/cohort_imv_streaks.parquet "
+        f"({len(cohort_hosp_ids):,} hospitalizations)"
+    )
+    logger.info(f"Saved: output/{SITE_NAME}/cohort_hrly_grids.parquet ({_n_grids_rows:,} rows)")
+    logger.info(f"Saved: output/{SITE_NAME}/nmb_excluded.parquet ({_n_nmb_patient_days:,} patient-days)")
+    logger.info(f"Saved: output/{SITE_NAME}/icu_type.parquet ({_n_icu:,} hospitalizations)")
 
     # CONSORT flowchart PNG
-    from _utils import plot_consort
     _consort_png_path = f"output_to_share/{SITE_NAME}/models/consort_inclusion.png"
     plot_consort(consort_flow, _consort_png_path)
-    print(f"Saved: {_consort_png_path}")
+    logger.info(f"Saved: {_consort_png_path}")
     return (consort_flow,)
 
 
 @app.cell
 def _(consort_flow):
-    from _utils import consort_to_markdown
     mo.md(f"""
     ## CONSORT Flow
 
