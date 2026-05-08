@@ -20,6 +20,9 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.covariates")
+
     # Cache-bypass flags for expensive Table 1 covariate recomputes
     RERUN_SOFA_24H = False
     RERUN_ASE = False
@@ -71,28 +74,28 @@ def _(CONFIG_PATH, get_config_or_params):
     SITE_NAME = cfg['site_name'].lower()
     SITE_TZ = cfg['timezone']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
     return SITE_NAME, SITE_TZ
 
 
 @app.cell
 def _(SITE_NAME, pd):
     cohort_hrly_grids = pd.read_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet")
-    print(f"Hourly grid rows: {len(cohort_hrly_grids)}")
+    logger.info(f"Hourly grid rows: {len(cohort_hrly_grids)}")
     return (cohort_hrly_grids,)
 
 
 @app.cell
 def _(cohort_hrly_grids):
     cohort_shift_change_grids = cohort_hrly_grids[cohort_hrly_grids['_hr'].isin([7, 19])]
-    print(f"Shift-change grid rows (7am/7pm only): {len(cohort_shift_change_grids)}")
+    logger.info(f"Shift-change grid rows (7am/7pm only): {len(cohort_shift_change_grids)}")
     return (cohort_shift_change_grids,)
 
 
 @app.cell
 def _(cohort_hrly_grids):
     cohort_hosp_ids = cohort_hrly_grids['hospitalization_id'].unique().tolist()
-    print(f"Cohort hospitalizations: {len(cohort_hosp_ids)}")
+    logger.info(f"Cohort hospitalizations: {len(cohort_hosp_ids)}")
     return (cohort_hosp_ids,)
 
 
@@ -100,7 +103,7 @@ def _(cohort_hrly_grids):
 def _(SITE_NAME, pd):
     resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
     resp_p = pd.read_parquet(resp_processed_path)
-    print(f"resp_p: {len(resp_p)} rows (from {resp_processed_path})")
+    logger.info(f"resp_p: {len(resp_p)} rows (from {resp_processed_path})")
     return (resp_p,)
 
 
@@ -303,7 +306,7 @@ def _(
             },
         )
     except Exception:
-        print("Loading without mar_action_category instead")
+        logger.info("Loading without mar_action_category instead")
         cont_veso = MedicationAdminContinuous.from_file(
             config_path="config/config.json",
             columns=[
@@ -333,7 +336,7 @@ def _(
 
     cont_veso_deduped = remove_meds_duplicates(cont_veso.df)
     _n_removed = len(cont_veso.df) - len(cont_veso_deduped)
-    print(
+    logger.info(
         f"Removed {_n_removed} ({_n_removed / len(cont_veso.df):.2%}) duplicates by MAR action"
     )
 
@@ -441,7 +444,7 @@ def _(SITE_NAME):
             ])
         )
     )
-    print(f"SOFA cohort: {sofa_cohort.height} patient-days")
+    logger.info(f"SOFA cohort: {sofa_cohort.height} patient-days")
     return (sofa_cohort,)
 
 
@@ -457,7 +460,7 @@ def _(CONFIG_PATH, get_config_or_params, sofa_cohort):
         id_name='patient_day_id',
         timezone=_cfg.get('timezone'),
     )
-    print(f"SOFA raw: {sofa_raw.height} rows, {sofa_raw.width} columns")
+    logger.info(f"SOFA raw: {sofa_raw.height} rows, {sofa_raw.width} columns")
     return (sofa_raw,)
 
 
@@ -493,7 +496,7 @@ def _(SITE_NAME, sofa_raw):
     )
     _sofa_path = f"output/{SITE_NAME}/sofa_by_id_imvday.parquet"
     sofa_daily.to_pandas().to_parquet(_sofa_path)
-    print(f"Saved: {_sofa_path} ({sofa_daily.height} patient-days)")
+    logger.info(f"Saved: {_sofa_path} ({sofa_daily.height} patient-days)")
     return
 
 
@@ -574,11 +577,11 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids):
     )
     cci_df = calculate_cci(_dx, hierarchy=True)
     elix_df = calculate_elix(_dx, hierarchy=True)
-    print(f"CCI: {len(cci_df)} rows, Elixhauser: {len(elix_df)} rows")
+    logger.info(f"CCI: {len(cci_df)} rows, Elixhauser: {len(elix_df)} rows")
 
     cci_df.to_parquet(f"output/{SITE_NAME}/covariates_cci.parquet", index=False)
     elix_df.to_parquet(f"output/{SITE_NAME}/covariates_elix.parquet", index=False)
-    print(f"Saved: output/{SITE_NAME}/covariates_cci.parquet, output/{SITE_NAME}/covariates_elix.parquet")
+    logger.info(f"Saved: output/{SITE_NAME}/covariates_cci.parquet, output/{SITE_NAME}/covariates_elix.parquet")
     return
 
 
@@ -634,7 +637,7 @@ def _(CONFIG_PATH, SITE_TZ, cohort_hosp_ids, duckdb):
         GROUP BY hospitalization_id
         ORDER BY hospitalization_id
     """).df()
-    print(f"first_icu_admit: {len(first_icu_admit)} hospitalizations")
+    logger.info(f"first_icu_admit: {len(first_icu_admit)} hospitalizations")
     return (first_icu_admit,)
 
 
@@ -676,10 +679,10 @@ def _(CONFIG_PATH, first_icu_admit, get_config_or_params):
             'sofa_renal': 'sofa_renal_1st24h',
         })
         _sofa_24h.write_parquet(_sofa_24h_path)
-        print(f"Computed + saved {_sofa_24h_path} ({_sofa_24h.height} rows)")
+        logger.info(f"Computed + saved {_sofa_24h_path} ({_sofa_24h.height} rows)")
     else:
         _sofa_24h = _pl.read_parquet(_sofa_24h_path)
-        print(f"Loaded cached {_sofa_24h_path} ({_sofa_24h.height} rows)")
+        logger.info(f"Loaded cached {_sofa_24h_path} ({_sofa_24h.height} rows)")
 
     sofa_24h_pd = _sofa_24h.to_pandas()
     return (sofa_24h_pd,)
@@ -735,7 +738,7 @@ def _(CONFIG_PATH, apply_outlier_handling, cohort_hosp_ids, duckdb):
             , bmi: w.weight_kg / ((h.height_cm / 100.0) * (h.height_cm / 100.0))
         ORDER BY hospitalization_id
     """).df()
-    print(f"bmi_df: {len(bmi_df)} rows, {bmi_df['bmi'].notna().sum()} non-null BMIs")
+    logger.info(f"bmi_df: {len(bmi_df)} rows, {bmi_df['bmi'].notna().sum()} non-null BMIs")
     return bmi_df, vitals_t1_df
 
 
@@ -799,7 +802,7 @@ def _(cont_veso_converted, duckdb):
         ORDER BY hospitalization_id
     """).df()
     _n_pressor = int(ever_pressor_df['ever_pressor'].sum())
-    print(
+    logger.info(
         f"ever_pressor_df: {len(ever_pressor_df)} rows, {_n_pressor} with ever_pressor=1"
     )
     return (ever_pressor_df,)
@@ -871,7 +874,7 @@ def _(duckdb, first_icu_admit, po2_w, resp_p, vitals_t1_df):
         ORDER BY hospitalization_id
     """).df()
     _med_pf = pf_24h_df['pf_1st24h_min'].median() if len(pf_24h_df) else float('nan')
-    print(f"pf_24h_df: {len(pf_24h_df)} rows, median pf_1st24h_min: {_med_pf:.1f}")
+    logger.info(f"pf_24h_df: {len(pf_24h_df)} rows, median pf_1st24h_min: {_med_pf:.1f}")
     return (pf_24h_df,)
 
 
@@ -889,7 +892,7 @@ def _(SITE_NAME, pd):
         columns={'_duration_hrs': 'imv_duration_hrs'}
     )
     _med_imv = imv_dur_df['imv_duration_hrs'].median()
-    print(f"imv_dur_df: {len(imv_dur_df)} rows, median imv_duration_hrs: {_med_imv:.1f}")
+    logger.info(f"imv_dur_df: {len(imv_dur_df)} rows, median imv_duration_hrs: {_med_imv:.1f}")
     return (imv_dur_df,)
 
 
@@ -912,10 +915,10 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
             verbose=True,
         )
         ase_full.to_parquet(_ase_path, index=False)
-        print(f"Computed + saved {_ase_path} ({len(ase_full)} rows)")
+        logger.info(f"Computed + saved {_ase_path} ({len(ase_full)} rows)")
     else:
         ase_full = pd.read_parquet(_ase_path)
-        print(f"Loaded cached {_ase_path} ({len(ase_full)} rows)")
+        logger.info(f"Loaded cached {_ase_path} ({len(ase_full)} rows)")
 
     # Aggregate to per-hospitalization binary: any ASE episode = sepsis_ase = 1
     ase_df = duckdb.sql("""
@@ -926,7 +929,7 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
         ORDER BY hospitalization_id
     """).df()
     _n_sepsis = int(ase_df['sepsis_ase'].sum())
-    print(f"ase_df: {len(ase_df)} rows, {_n_sepsis} with sepsis_ase=1")
+    logger.info(f"ase_df: {len(ase_df)} rows, {_n_sepsis} with sepsis_ase=1")
     return (ase_df,)
 
 
@@ -978,7 +981,7 @@ def _(
     # configured tz, not the OS session tz that DuckDB stamped at .df() time.
     covariates_t1 = retag_to_local_tz(covariates_t1, ["_first_icu_dttm"], SITE_TZ)
     covariates_t1.to_parquet(_t1_path, index=False)
-    print(
+    logger.info(
         f"Saved: {_t1_path} "
         f"({len(covariates_t1)} hospitalizations, {covariates_t1.shape[1]} columns)"
     )
@@ -1004,12 +1007,12 @@ def _(SITE_NAME, SITE_TZ, covs, covs_daily, retag_to_local_tz):
     _covs_shift_df = retag_to_local_tz(_covs_shift_df, ["event_dttm"], SITE_TZ)
     _covs_shift_path = f"output/{SITE_NAME}/covariates_by_id_shift.parquet"
     _covs_shift_df.to_parquet(_covs_shift_path)
-    print(f"Saved: {_covs_shift_path} ({len(_covs_shift_df)} rows)")
+    logger.info(f"Saved: {_covs_shift_path} ({len(_covs_shift_df)} rows)")
 
     _covs_daily_df = covs_daily.df()
     _covs_daily_path = f"output/{SITE_NAME}/covariates_by_id_imvday.parquet"
     _covs_daily_df.to_parquet(_covs_daily_path)
-    print(f"Saved: {_covs_daily_path} ({len(_covs_daily_df)} rows)")
+    logger.info(f"Saved: {_covs_daily_path} ({len(_covs_daily_df)} rows)")
     return
 
 
@@ -1019,7 +1022,7 @@ def _(SITE_NAME, weight_daily):
     _weight_path = f"output/{SITE_NAME}/weight_by_id_imvday.parquet"
     _weight_daily_df.to_parquet(_weight_path)
     _n_nonnull = _weight_daily_df["weight_kg_asof_day_start"].notna().sum()
-    print(
+    logger.info(
         f"Saved: {_weight_path} "
         f"({len(_weight_daily_df)} rows, {_n_nonnull} non-null weights)"
     )
@@ -1209,8 +1212,8 @@ def _(SITE_NAME, SITE_TZ, cohort_meta_by_id, retag_to_local_tz):
         .sort_index()
         .to_dict()
     )
-    print(f"Saved: {_path} ({len(_df):,} hospitalizations)")
-    print(f"  exit_mechanism distribution: {_exit_counts}")
+    logger.info(f"Saved: {_path} ({len(_df):,} hospitalizations)")
+    logger.info(f"  exit_mechanism distribution: {_exit_counts}")
     return
 
 

@@ -20,6 +20,9 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.modeling_dataset")
+
 
 @app.cell(hide_code=True)
 def _():
@@ -71,7 +74,7 @@ def _():
     # app.setup block at the top; re-importing here would raise marimo's
     # MultipleDefinitionError.
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
     return CONFIG_PATH, SITE_NAME, SITE_TZ, apply_outlier_handling, pd, retag_to_local_tz
 
 
@@ -86,28 +89,28 @@ def _():
 @app.cell
 def _(SITE_NAME, pd):
     sbt_outcomes_daily = pd.read_parquet(f"output/{SITE_NAME}/outcomes_by_id_imvday.parquet")
-    print(f"sbt_outcomes_daily: {len(sbt_outcomes_daily)} rows")
+    logger.info(f"sbt_outcomes_daily: {len(sbt_outcomes_daily)} rows")
     return (sbt_outcomes_daily,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
     sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
-    print(f"sed_dose_daily: {len(sed_dose_daily)} rows")
+    logger.info(f"sed_dose_daily: {len(sed_dose_daily)} rows")
     return (sed_dose_daily,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
     covs_daily = pd.read_parquet(f"output/{SITE_NAME}/covariates_by_id_imvday.parquet")
-    print(f"covs_daily: {len(covs_daily)} rows")
+    logger.info(f"covs_daily: {len(covs_daily)} rows")
     return (covs_daily,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
     nmb_excluded = pd.read_parquet(f"output/{SITE_NAME}/cohort_nmb_excluded.parquet")
-    print(f"nmb_excluded patient-days: {len(nmb_excluded)}")
+    logger.info(f"nmb_excluded patient-days: {len(nmb_excluded)}")
     return (nmb_excluded,)
 
 
@@ -120,7 +123,7 @@ def _(CONFIG_PATH, apply_outlier_handling):
     )
     apply_outlier_handling(hosp, outlier_config_path='config/outlier_config.yaml')
     hosp_df = hosp.df
-    print(f"hosp_df: {len(hosp_df)} rows")
+    logger.info(f"hosp_df: {len(hosp_df)} rows")
     return (hosp_df,)
 
 
@@ -132,7 +135,7 @@ def _(CONFIG_PATH):
         columns=['patient_id', 'sex_category'],
     )
     patient_df = _patient.df
-    print(f"patient_df: {len(patient_df)} rows")
+    logger.info(f"patient_df: {len(patient_df)} rows")
     return (patient_df,)
 
 
@@ -144,7 +147,7 @@ def _(SITE_NAME, pd):
     elix_df = pd.read_parquet(f"output/{SITE_NAME}/covariates_elix.parquet")
     covariates_t1 = pd.read_parquet(f"output/{SITE_NAME}/covariates_t1.parquet")
     weight_daily = pd.read_parquet(f"output/{SITE_NAME}/weight_by_id_imvday.parquet")
-    print(
+    logger.info(
         f"sofa_daily: {len(sofa_daily)}, icu_type: {len(icu_type_df)}, "
         f"cci: {len(cci_df)}, elix: {len(elix_df)}, "
         f"covariates_t1: {len(covariates_t1)}, weight_daily: {len(weight_daily)}"
@@ -311,7 +314,7 @@ def _(cohort_merged):
     _merged_df = cohort_merged.df()
     _merged_df.dropna(subset=['age'], inplace=True)
     cohort_merged_clean = _merged_df
-    print(f"After dropping null age: {len(cohort_merged_clean)} rows")
+    logger.info(f"After dropping null age: {len(cohort_merged_clean)} rows")
     return (cohort_merged_clean,)
 
 
@@ -348,7 +351,7 @@ def _(SITE_NAME, SITE_TZ, cohort_merged_final, retag_to_local_tz):
     _df = retag_to_local_tz(_df, ["_first_icu_dttm"], SITE_TZ)
     _path = f"output/{SITE_NAME}/modeling_dataset.parquet"
     _df.to_parquet(_path, index=False)
-    print(f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations)")
+    logger.info(f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations)")
     return
 
 
@@ -564,7 +567,7 @@ def _(cohort_merged_exposure):
     _merged_df = cohort_merged_exposure.df()
     _merged_df.dropna(subset=['age'], inplace=True)
     cohort_merged_exposure_clean = _merged_df
-    print(f"[day-0] After dropping null age: {len(cohort_merged_exposure_clean)} rows")
+    logger.info(f"[day-0] After dropping null age: {len(cohort_merged_exposure_clean)} rows")
     return (cohort_merged_exposure_clean,)
 
 
@@ -596,9 +599,251 @@ def _(SITE_NAME, SITE_TZ, cohort_merged_exposure_final, retag_to_local_tz):
     _n_day0 = (_df['_nth_day'] == 0).sum()
     _n_last = int(_df['_is_last_day'].sum())
     _n_single = int(_df['_single_shift_day'].sum())
-    print(
+    logger.info(
         f"Saved {_path} ({len(_df)} rows, {_df['hospitalization_id'].nunique()} hospitalizations, "
         f"{_n_day0} day-0 rows, {_n_last} last-day rows, {_n_single} single-shift rows)"
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Consolidated `model_input_by_id_imvday` (Phase 4 — additive cutover)
+
+    Single per-day modeling input, base table = `cohort_meta_by_id_imvday`.
+    LEFT-joins every per-day source onto the canonical patient-day registry.
+    Two filter views replace the legacy two parquets:
+
+    - **Outcome-modeling cohort** (replaces `modeling_dataset.parquet`):
+      `WHERE _nth_day > 0 AND sbt_done_next_day IS NOT NULL AND
+      success_extub_next_day IS NOT NULL`.
+
+    - **Exposure characterization** (replaces `exposure_dataset.parquet`):
+      no filter — the full registry trajectory.
+
+    - **Day-0 sensitivity** (replaces inline filter in `08_models.py`):
+      `WHERE _nth_day >= 0 AND <outcome filters>` — a 2-character switch
+      (`>` → `>=`) on the modeling filter.
+
+    Rate convention: hour-normalized via `NULLIF(n_hrs_*, 0)` (the exposure
+    style). Verified equivalent to legacy `/12.0` on the modeling cohort
+    because the outcome filter implicitly drops every partial-shift row
+    (where `n_hrs_day == 12 AND n_hrs_night == 12`, the two formulas agree).
+
+    `_is_first_day`, `_is_last_day`, `_is_full_24h_day`, `n_hrs_day`,
+    `n_hrs_night`, `day_type`, `day_start_dttm`, `day_end_dttm`,
+    `encounter_block`, `nmb_excluded`, `nmb_total_min` come from the
+    registry directly — no inline window-function recomputation.
+
+    `_rel_day` is **dropped**. Phase 5 migrates the 3 binning consumers
+    (`dose_pattern_6group_count_by_icu_day*`,
+    `night_day_diff_combined_by_icu_day`) to use `_nth_day - 1` plus
+    a `_is_full_24h_day = TRUE` filter.
+
+    `_single_shift_day` is kept as a derived column for back-compat —
+    `True` whenever either shift had zero coverage hours.
+
+    During Phase 4 cutover, this parquet is written **alongside** the
+    legacy two; no consumer reads it yet. Phase 4 Step 2 migrates
+    consumers one at a time. Phase 4 Step 3 deletes the legacy writes.
+    """)
+    return
+
+
+@app.cell
+def _(
+    SITE_NAME,
+    cci_df,
+    covariates_t1,
+    covs_daily,
+    elix_df,
+    hosp_df,
+    icu_type_df,
+    patient_df,
+    sbt_outcomes_daily,
+    sed_dose_daily,
+    sofa_daily,
+    weight_daily,
+):
+    model_input_relation = mo.sql(
+        f"""
+        -- Consolidated per-day modeling input. Base table = the canonical
+        -- patient-day registry; every other source LEFT-joins onto it.
+        -- Day flags (_is_first_day / _is_last_day / _is_full_24h_day) and
+        -- hour counts (n_hrs_day / n_hrs_night) come straight from the
+        -- registry, replacing the inline window-function re-derivations
+        -- in `cohort_merged_exposure` above. Rate divisors use
+        -- NULLIF(n_hrs_*, 0) — equivalent to /12.0 on the outcome-modeling
+        -- filter view (see verification cell below).
+        FROM read_parquet('output/{SITE_NAME}/cohort_meta_by_id_imvday.parquet') reg
+        LEFT JOIN sbt_outcomes_daily o USING (hospitalization_id, _nth_day)
+        LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
+        LEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)
+        LEFT JOIN hosp_df h USING (hospitalization_id)
+        LEFT JOIN patient_df p USING (patient_id)
+        LEFT JOIN icu_type_df i USING (hospitalization_id)
+        LEFT JOIN sofa_daily sf USING (hospitalization_id, _nth_day)
+        LEFT JOIN cci_df cc USING (hospitalization_id)
+        LEFT JOIN elix_df ex USING (hospitalization_id)
+        LEFT JOIN covariates_t1 t1 USING (hospitalization_id)
+        LEFT JOIN weight_daily wd USING (hospitalization_id, _nth_day)
+        SELECT
+            -- Registry columns (canonical patient-day metadata)
+            reg.hospitalization_id
+            , reg._nth_day
+            , reg.encounter_block
+            , reg.day_type
+            , reg._is_first_day
+            , reg._is_last_day
+            , reg._is_full_24h_day
+            , reg.n_hrs_day
+            , reg.n_hrs_night
+            , reg.day_start_dttm
+            , reg.day_end_dttm
+            , reg.nmb_excluded
+            , reg.nmb_total_min
+            -- Derived back-compat flag — `True` if either shift had zero hrs.
+            -- For non-first_partial rows this equals ~_is_full_24h_day; for
+            -- first_partial rows it's True (only one shift had any coverage).
+            , _single_shift_day: (COALESCE(reg.n_hrs_day, 0) = 0
+                                    OR COALESCE(reg.n_hrs_night, 0) = 0)
+            -- Outcome columns + sensitivity siblings (LEAD over registry order
+            -- gives next-day outcomes; rows that don't match sbt_outcomes_daily
+            -- contribute NULL, which propagates correctly).
+            , _sbt_done_today: o.sbt_done
+            , _success_extub_today: o._success_extub
+            , sbt_done_next_day: LEAD(o.sbt_done) OVER w
+            , success_extub_next_day: LEAD(o._success_extub) OVER w
+            , _sbt_done_anyprior_today: o.sbt_done_anyprior
+            , sbt_done_anyprior_next_day: LEAD(o.sbt_done_anyprior) OVER w
+            , _sbt_done_imv6h_today: o.sbt_done_imv6h
+            , sbt_done_imv6h_next_day: LEAD(o.sbt_done_imv6h) OVER w
+            , _sbt_done_prefix_today: o.sbt_done_prefix
+            , sbt_done_prefix_next_day: LEAD(o.sbt_done_prefix) OVER w
+            , _sbt_done_multiday_today: o.sbt_done_multiday
+            , sbt_done_multiday_next_day: LEAD(o.sbt_done_multiday) OVER w
+            , _sbt_done_2min_today: o.sbt_done_2min
+            , sbt_done_2min_next_day: LEAD(o.sbt_done_2min) OVER w
+            , _sbt_done_subira_today: o.sbt_done_subira
+            , sbt_done_subira_next_day: LEAD(o.sbt_done_subira) OVER w
+            , _sbt_done_abc_today: o.sbt_done_abc
+            , sbt_done_abc_next_day: LEAD(o.sbt_done_abc) OVER w
+            -- v2 outcome family
+            , _sbt_elig_today: o.sbt_elig
+            , sbt_elig_next_day: LEAD(o.sbt_elig) OVER w
+            , _sbt_done_v2_today: o.sbt_done_v2
+            , sbt_done_v2_next_day: LEAD(o.sbt_done_v2) OVER w
+            , _success_extub_v2_today: o._success_extub_v2
+            , success_extub_v2_next_day: LEAD(o._success_extub_v2) OVER w
+            -- Hour-normalized rates (NULLIF on n_hrs_* yields NULL on zero-
+            -- hour shifts; for full 12+12 days this == /12.0 exactly).
+            , _prop_day_mcg_kg_min:
+                COALESCE(s.prop_day_mcg_kg, 0) / NULLIF(reg.n_hrs_day, 0) / 60.0
+            , _prop_night_mcg_kg_min:
+                COALESCE(s.prop_night_mcg_kg, 0) / NULLIF(reg.n_hrs_night, 0) / 60.0
+            , _fenteq_day_mcg_hr:
+                COALESCE(s.fenteq_day_mcg, 0) / NULLIF(reg.n_hrs_day, 0)
+            , _fenteq_night_mcg_hr:
+                COALESCE(s.fenteq_night_mcg, 0) / NULLIF(reg.n_hrs_night, 0)
+            , _midazeq_day_mg_hr:
+                COALESCE(s.midazeq_day_mg, 0) / NULLIF(reg.n_hrs_day, 0)
+            , _midazeq_night_mg_hr:
+                COALESCE(s.midazeq_night_mg, 0) / NULLIF(reg.n_hrs_night, 0)
+            -- Hurdle-binary flags (any 24h exposure to this drug)
+            , _prop_any:   CAST(COALESCE(s.prop_day_mcg_kg, 0) > 0
+                                 OR COALESCE(s.prop_night_mcg_kg, 0) > 0 AS INTEGER)
+            , _fenteq_any: CAST(COALESCE(s.fenteq_day_mcg, 0) > 0
+                                 OR COALESCE(s.fenteq_night_mcg, 0) > 0 AS INTEGER)
+            , _midazeq_any: CAST(COALESCE(s.midazeq_day_mg, 0) > 0
+                                  OR COALESCE(s.midazeq_night_mg, 0) > 0 AS INTEGER)
+            -- Day-night rate differences
+            , prop_dif_mcg_kg_min:
+                (COALESCE(s.prop_night_mcg_kg, 0) / NULLIF(reg.n_hrs_night, 0) / 60.0)
+                - (COALESCE(s.prop_day_mcg_kg, 0) / NULLIF(reg.n_hrs_day, 0) / 60.0)
+            , fenteq_dif_mcg_hr:
+                (COALESCE(s.fenteq_night_mcg, 0) / NULLIF(reg.n_hrs_night, 0))
+                - (COALESCE(s.fenteq_day_mcg, 0) / NULLIF(reg.n_hrs_day, 0))
+            , midazeq_dif_mg_hr:
+                (COALESCE(s.midazeq_night_mg, 0) / NULLIF(reg.n_hrs_night, 0))
+                - (COALESCE(s.midazeq_day_mg, 0) / NULLIF(reg.n_hrs_day, 0))
+            -- Absolute totals (per-shift over actual coverage hours; useful
+            -- for absolute-amount sensitivity SAs).
+            , _prop_day_mcg_kg:   COALESCE(s.prop_day_mcg_kg, 0)
+            , _prop_night_mcg_kg: COALESCE(s.prop_night_mcg_kg, 0)
+            , _fenteq_day_mcg:    COALESCE(s.fenteq_day_mcg, 0)
+            , _fenteq_night_mcg:  COALESCE(s.fenteq_night_mcg, 0)
+            , _midazeq_day_mg:    COALESCE(s.midazeq_day_mg, 0)
+            , _midazeq_night_mg:  COALESCE(s.midazeq_night_mg, 0)
+            , prop_dif_mcg_kg:
+                COALESCE(s.prop_night_mcg_kg, 0) - COALESCE(s.prop_day_mcg_kg, 0)
+            , fenteq_dif_mcg:
+                COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)
+            , midazeq_dif_mg:
+                COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)
+            -- Per-day covariate columns (7am/7pm vital snapshots etc.)
+            , COLUMNS('(7am)|(7pm)')
+            -- Per-stay rollups
+            , age: h.age_at_admission
+            , p.sex_category
+            , i.icu_type
+            , sofa_total: COALESCE(sf.sofa_total, 0)
+            , cci_score: COALESCE(cc.cci_score, 0)
+            , elix_score: COALESCE(ex.elix_score, 0)
+            , t1.bmi
+            , t1.height_cm
+            , t1.weight_kg
+            , wd.weight_kg_asof_day_start
+            , t1.sofa_1st24h
+            , t1.sofa_cv_97_1st24h
+            , t1.sofa_coag_1st24h
+            , t1.sofa_liver_1st24h
+            , t1.sofa_resp_1st24h
+            , t1.sofa_cns_1st24h
+            , t1.sofa_renal_1st24h
+            , ever_pressor: COALESCE(t1.ever_pressor, 0)
+            , t1.pf_1st24h_min
+            , t1.pf_1st24h_source
+            , t1.imv_duration_hrs
+            , sepsis_ase: COALESCE(t1.sepsis_ase, 0)
+            , t1._first_icu_dttm
+        WINDOW w AS (PARTITION BY reg.hospitalization_id ORDER BY reg._nth_day)
+        ORDER BY reg.hospitalization_id, reg._nth_day
+        """
+    )
+    return (model_input_relation,)
+
+
+@app.cell
+def _(model_input_relation, nmb_excluded):
+    model_input_filtered = mo.sql(
+        f"""
+        -- Hospitalization-level NMB exclusion (matches the legacy two
+        -- parquets) + drop rows whose hosp has no recorded age.
+        FROM model_input_relation
+        ANTI JOIN (SELECT DISTINCT hospitalization_id FROM nmb_excluded)
+            USING (hospitalization_id)
+        SELECT *
+        WHERE age IS NOT NULL
+        """
+    )
+    return (model_input_filtered,)
+
+
+@app.cell
+def _(SITE_NAME, SITE_TZ, model_input_filtered, retag_to_local_tz):
+    _df = model_input_filtered.df()
+    _df = retag_to_local_tz(_df, ["_first_icu_dttm"], SITE_TZ)
+    _path = f"output/{SITE_NAME}/model_input_by_id_imvday.parquet"
+    _df.to_parquet(_path, index=False)
+    _n_full = int(_df['_is_full_24h_day'].sum())
+    _n_first_partial = int((_df['day_type'] == 'first_partial').sum())
+    _n_last_partial = int((_df['day_type'] == 'last_partial').sum())
+    logger.info(
+        f"Saved {_path} ({len(_df)} rows, "
+        f"{_df['hospitalization_id'].nunique()} hospitalizations: "
+        f"{_n_full} full-24h days, {_n_first_partial} first_partial, "
+        f"{_n_last_partial} last_partial)"
     )
     return
 

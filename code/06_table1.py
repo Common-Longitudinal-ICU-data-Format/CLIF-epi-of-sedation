@@ -20,6 +20,9 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.table1")
+
 
 @app.cell(hide_code=True)
 def _():
@@ -51,14 +54,14 @@ def _():
     # descriptive (night-vs-day) artifacts and model artifacts sit in
     # parallel thematic subdirs.
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
+    logger.info(f"Site: {SITE_NAME}")
     return CONFIG_PATH, SITE_NAME, apply_outlier_handling, duckdb, json, pd, tableone
 
 
 @app.cell
 def _(SITE_NAME, pd):
     analytical_df = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
-    print(f"Modeling dataset: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
+    logger.info(f"Modeling dataset: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
     return (analytical_df,)
 
 
@@ -94,7 +97,7 @@ def _(SITE_NAME):
 @app.cell
 def _(SITE_NAME, pd):
     covs_shift = pd.read_parquet(f"output/{SITE_NAME}/covariates_by_id_shift.parquet")
-    print(f"covs_shift: {len(covs_shift)} rows")
+    logger.info(f"covs_shift: {len(covs_shift)} rows")
     return (covs_shift,)
 
 
@@ -106,7 +109,7 @@ def _(SITE_NAME, pd):
     cohort_meta_by_id = pd.read_parquet(
         f"output/{SITE_NAME}/cohort_meta_by_id.parquet"
     )
-    print(
+    logger.info(
         f"cohort_meta_by_id: {len(cohort_meta_by_id)} hospitalizations; "
         f"exit_mechanism distribution: "
         f"{cohort_meta_by_id['exit_mechanism'].value_counts().to_dict()}"
@@ -193,7 +196,7 @@ def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, pd):
         'n_hospitalizations': [n_hospitalizations],
         'n_unique_patients': [n_unique_patients],
     }).to_csv(f'output_to_share/{SITE_NAME}/models/cohort_stats.csv', index=False)
-    print(f"Cohort: {n_hospitalizations} hospitalizations from {n_unique_patients} unique patients")
+    logger.info(f"Cohort: {n_hospitalizations} hospitalizations from {n_unique_patients} unique patients")
     return
 
 
@@ -222,7 +225,7 @@ def _(SITE_NAME, cohort_merged_for_t1, cohort_meta_by_id, hosp_df, tableone):
 
     n_hosp = _df['hospitalization_id'].nunique()
     n_pat = _df['patient_id'].nunique()
-    print(f"Table 1 cohort: N={n_hosp} hospitalizations from {n_pat} unique patients")
+    logger.info(f"Table 1 cohort: N={n_hosp} hospitalizations from {n_pat} unique patients")
 
     # NEW Table 1: standard ICU epidemiology baseline characteristics
     _cont_vars = [
@@ -287,7 +290,7 @@ def _(SITE_NAME, cohort_merged_for_t1, cohort_meta_by_id, hosp_df, tableone):
     )
     _t1_path = f'output_to_share/{SITE_NAME}/models/table1.csv'
     table1_overall.to_csv(_t1_path)
-    print(f"Saved {_t1_path}")
+    logger.info(f"Saved {_t1_path}")
     return
 
 
@@ -314,7 +317,7 @@ def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, tableone):
     # restore; only the CSV write is disabled so the outdated
     # output_to_share/table1_by_shift.csv is no longer regenerated.
     # table1_by_shift.to_csv('output_to_share/table1_by_shift.csv')
-    # print("Saved output_to_share/table1_by_shift.csv")
+    # logger.info("Saved output_to_share/table1_by_shift.csv")
     return
 
 

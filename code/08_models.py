@@ -19,6 +19,9 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.models")
+
 
 @app.cell(hide_code=True)
 def _():
@@ -43,14 +46,14 @@ def _():
     # Site-scoped output dirs (see Makefile SITE= flag).
     # Path B++ refactor: every modeling artifact lands under {site}/models/.
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
+    logger.info(f"Site: {SITE_NAME}")
     return SITE_NAME, pd
 
 
 @app.cell
 def _(SITE_NAME, pd):
     cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
-    print(f"Analytical dataset: {len(cohort_merged_final)} rows")
+    logger.info(f"Analytical dataset: {len(cohort_merged_final)} rows")
     return (cohort_merged_final,)
 
 
@@ -120,13 +123,13 @@ def _(SITE_NAME, cohort_merged_final, pd):
     _logit_df = cohort_merged_final.dropna(subset=_logit_cols)
     logit_model = _smf.logit(formula=success_extub_formula, data=_logit_df)
     logit_result = logit_model.fit(cov_type='cluster', cov_kwds={'groups': _logit_df['hospitalization_id']})
-    print(logit_result.summary())
+    logger.info(logit_result.summary())
     _summary_df = logit_result.summary().tables[1]
     _summary_pd = pd.DataFrame(_summary_df.data[1:], columns=_summary_df.data[0])
     _summary_pd.to_csv(f'output_to_share/{SITE_NAME}/models/logit_summary.csv', index=False)
     _cov_matrix = logit_result.cov_params()
     _cov_matrix.to_csv(f'output_to_share/{SITE_NAME}/models/logit_covmat.csv')
-    print(f"Saved output_to_share/{SITE_NAME}/models/logit_summary.csv, logit_covmat.csv")
+    logger.info(f"Saved output_to_share/{SITE_NAME}/models/logit_summary.csv, logit_covmat.csv")
     return
 
 
@@ -372,9 +375,9 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
         return [round(k / scale, 6) for k in raw]
 
     _knots_by_var = {v: _scaled_knots(v) for v in _RCS_FULL_VARS}
-    print("RCS knots from clinical defaults (raw → scaled):")
+    logger.info("RCS knots from clinical defaults (raw → scaled):")
     for _v in _RCS_FULL_VARS:
-        print(f"  {_v:<24s}: raw={RCS_KNOTS_RAW[_v]}  scaled={_knots_by_var[_v]}")
+        logger.info(f"  {_v:<24s}: raw={RCS_KNOTS_RAW[_v]}  scaled={_knots_by_var[_v]}")
 
     # HURDLE_INDICATORS still kept in scope: it's used by the forest plot's
     # `_or_10_to_90` (see PERCENTILE_REF builder below) for filtering
@@ -504,9 +507,9 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
             try:
                 _result = _config['fit_fn'](_formula, _df_scaled)
                 fitted[_key][_spec['label']] = _result
-                print(f"  OK: {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
+                logger.info(f"  OK: {_spec['label']} / {_config['outcome']} / {_config['model_type']}")
             except Exception as e:
-                print(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
+                logger.info(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
     return HURDLE_INDICATORS, MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fitted, np, re
 
 
@@ -529,7 +532,7 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
     sa_all = pd.concat(sa_results, ignore_index=True)
     _sa_path = f'output_to_share/{SITE_NAME}/models/sensitivity_analysis.csv'
     sa_all.to_csv(_sa_path, index=False)
-    print(f"Saved {_sa_path} ({len(sa_all)} rows)")
+    logger.info(f"Saved {_sa_path} ({len(sa_all)} rows)")
 
     # ── Wide comparison tables per (outcome, model_type, param) ───────
     def _pretty_label(varname):
@@ -604,7 +607,7 @@ def _(MODEL_CONFIGS, SITE_NAME, VAR_DISPLAY, fitted, np, pd, re):
         }
         _wide = build_wide_table(_results_for_table)
         _wide.to_csv(_fname)
-        print(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
+        logger.info(f"Saved {_fname} ({len(_wide)} rows x {_wide.shape[1]} cols)")
     return (OUTCOME_SHORT,)
 
 
@@ -832,7 +835,7 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
         )
         fig.savefig(out_path, dpi=250, bbox_inches='tight', facecolor='white')
         _plt.close(fig)
-        print(f"Saved: {out_path}")
+        logger.info(f"Saved: {out_path}")
         return pd.DataFrame(grid_rows)
 
     # Generate one 2×3 figure per (outcome, model_type, spec).
@@ -859,7 +862,7 @@ def _(HURDLE_INDICATORS, OUTCOME_SHORT, SBT_VARIANT_OUTCOMES, SITE_NAME, VAR_DIS
         _grid_df = pd.concat(_grid_frames, ignore_index=True)
         _grid_path = f"output_to_share/{SITE_NAME}/models/marginal_effects_grid.csv"
         _grid_df.to_csv(_grid_path, index=False)
-        print(f"Saved {_grid_path} ({len(_grid_df)} rows)")
+        logger.info(f"Saved {_grid_path} ({len(_grid_df)} rows)")
     return
 
 
@@ -991,10 +994,10 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
             'delta_scaled': (_x90 - _x10) / _scale,
             'subset': _subset,
         }
-    print("PERCENTILE_REF (raw clinical units, 10th and 90th percentiles):")
+    logger.info("PERCENTILE_REF (raw clinical units, 10th and 90th percentiles):")
     for _pred, _info in PERCENTILE_REF.items():
         _tag = f"  [{_info['subset']}]" if _info['subset'] != 'all' else ''
-        print(f"  {_pred:<24s}: x10={_info['x10_raw']:>+8.3f}, x90={_info['x90_raw']:>+8.3f}{_tag}")
+        logger.info(f"  {_pred:<24s}: x10={_info['x10_raw']:>+8.3f}, x90={_info['x90_raw']:>+8.3f}{_tag}")
 
     # Reference row (median for numeric, mode for categorical) over the
     # SCALED dataset — same construction as the marginal-effects cell.
@@ -1089,7 +1092,7 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
     forest_df = pd.DataFrame(forest_rows)
     _forest_csv = f'output_to_share/{SITE_NAME}/models/forest_data.csv'
     forest_df.to_csv(_forest_csv, index=False)
-    print(f"Saved {_forest_csv} ({len(forest_df)} rows)")
+    logger.info(f"Saved {_forest_csv} ({len(forest_df)} rows)")
 
     # ── Render one PNG per (outcome, model_type) ─────────────────────
     def plot_forest(rows_df, outcome, model_type, site, predictors, percentile_ref, out_path):
@@ -1169,7 +1172,7 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
             forest_df, _outcome, _mt, SITE_NAME,
             FOREST_PREDICTORS, PERCENTILE_REF, _out_path,
         )
-        print(f"Saved: {_out_path}")
+        logger.info(f"Saved: {_out_path}")
     return (FOREST_PREDICTORS, PERCENTILE_REF, forest_df)
 
 

@@ -29,9 +29,12 @@ import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from clifpy.utils.config import get_config_or_params
+from clifpy.utils.logging_config import get_logger
 from patsy import dmatrix
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+logger = get_logger("epi_sedation.models_cascade")
 
 
 # ── Site config ─────────────────────────────────────────────────────────
@@ -40,7 +43,7 @@ cfg = get_config_or_params(CONFIG_PATH)
 SITE_NAME = cfg["site_name"].lower()
 OUT_DIR = f"output_to_share/{SITE_NAME}/models"
 os.makedirs(OUT_DIR, exist_ok=True)
-print(f"Site: {SITE_NAME}")
+logger.info(f"Site: {SITE_NAME}")
 
 
 # ── Constants copied from 08_models.py (source of truth = 08) ──────────
@@ -116,7 +119,7 @@ SPEC_COLORS = {
 
 # ── Load modeling dataset and derive extub_event_v2_next_day ───────────
 df_full = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
-print(f"Modeling dataset: {len(df_full)} rows")
+logger.info(f"Modeling dataset: {len(df_full)} rows")
 
 if "extub_event_v2_next_day" not in df_full.columns:
     daily = pd.read_parquet(f"output/{SITE_NAME}/outcomes_by_id_imvday.parquet")
@@ -132,7 +135,7 @@ if "extub_event_v2_next_day" not in df_full.columns:
         on=["hospitalization_id", "_nth_day"],
         how="left",
     )
-    print(
+    logger.info(
         f"Derived extub_event_v2_next_day: "
         f"{int((df_full['extub_event_v2_next_day'] == 1).sum())} positive rows of {len(df_full)}"
     )
@@ -322,12 +325,12 @@ forest_rows = []
 _df_scaled_full = _scale_df(df_full)
 PERCENTILE_REF = _percentile_ref(df_full)
 REF_ROW = _build_reference_row(_df_scaled_full)
-print()
-print("PERCENTILE_REF (raw clinical units, anchored to full IMV-day distribution):")
+logger.info()
+logger.info("PERCENTILE_REF (raw clinical units, anchored to full IMV-day distribution):")
 for pred, info in PERCENTILE_REF.items():
     tag = f"  [{info['subset']}]" if info["subset"] == "non-zero" else ""
-    print(f"  {pred:<24s}: x10={info['x10_raw']:>+8.3f}, x90={info['x90_raw']:>+8.3f}{tag}")
-print()
+    logger.info(f"  {pred:<24s}: x10={info['x10_raw']:>+8.3f}, x90={info['x90_raw']:>+8.3f}{tag}")
+logger.info()
 
 for stage in STAGES:
     cohort = stage["filter"](df_full)
@@ -336,7 +339,7 @@ for stage in STAGES:
     n_pat = cohort["hospitalization_id"].nunique()
     out_col = stage["outcome"]
     if out_col not in cohort.columns:
-        print(f"  WARN {stage['label']}: outcome column '{out_col}' not in cohort, skipping")
+        logger.warning(f"{stage['label']}: outcome column '{out_col}' not in cohort, skipping")
         continue
     out_rate = cohort[out_col].mean()
     rows_per_pat = cohort.groupby("hospitalization_id").size()
@@ -350,8 +353,8 @@ for stage in STAGES:
         "rows_per_patient_median": float(rows_per_pat.median()),
         "rows_per_patient_p90": float(rows_per_pat.quantile(0.90)),
     })
-    print(f"=== {stage['title']} ===")
-    print(
+    logger.info(f"=== {stage['title']} ===")
+    logger.info(
         f"  cohort: n_rows={n_rows}, n_patients={n_pat}, "
         f"outcome_rate={out_rate:.3f}"
     )
@@ -367,7 +370,7 @@ for stage in STAGES:
             try:
                 result = fit_fn(formula, cohort_scaled_fit)
                 all_fits[(stage["label"], mt, spec["label"])] = result
-                print(f"  OK: {spec['label']} / {mt}")
+                logger.info(f"  OK: {spec['label']} / {mt}")
                 # extract forest cells
                 for pred, _ in FOREST_PREDICTORS:
                     or_, lo, hi = _or_10_to_90(result, pred, PERCENTILE_REF, REF_ROW)
@@ -380,20 +383,20 @@ for stage in STAGES:
                         "OR": or_, "OR_lo": lo, "OR_hi": hi,
                     })
             except Exception as e:
-                print(f"  FAIL: {spec['label']} / {mt}: {e}")
-    print()
+                logger.info(f"  FAIL: {spec['label']} / {mt}: {e}")
+    logger.info()
 
 forest_df = pd.DataFrame(forest_rows)
 forest_csv = f"{OUT_DIR}/cascade_forest_data.csv"
 forest_df.to_csv(forest_csv, index=False)
-print(f"Saved {forest_csv} ({len(forest_df)} rows)")
+logger.info(f"Saved {forest_csv} ({len(forest_df)} rows)")
 
 cohort_summary_df = pd.DataFrame(cohort_summaries)
 summary_csv = f"{OUT_DIR}/cascade_cohort_summary.csv"
 cohort_summary_df.to_csv(summary_csv, index=False)
-print(f"Saved {summary_csv}")
-print()
-print(cohort_summary_df.to_string(index=False))
+logger.info(f"Saved {summary_csv}")
+logger.info()
+logger.info(cohort_summary_df.to_string(index=False))
 
 
 # ── Forest plots: 1 per (stage, method) ───────────────────────────────
@@ -465,7 +468,7 @@ for stage in STAGES:
             forest_df, stage["label"], mt, stage["title"],
             FOREST_PREDICTORS, PERCENTILE_REF, out_path,
         )
-        print(f"Saved: {out_path}")
+        logger.info(f"Saved: {out_path}")
 
 
 # ── Marginal effects: 1 per (stage, method) at sofa_rcs ───────────────
@@ -550,7 +553,7 @@ for stage in STAGES:
             continue
         out_path = f"{OUT_DIR}/cascade_{stage['label']}_marginal_effects_{mt}_sofa_rcs.png"
         plot_marginal_effects(all_fits[key], stage["label"], mt, stage["title"], cohort, out_path)
-        print(f"Saved: {out_path}")
+        logger.info(f"Saved: {out_path}")
 
 
 # ── Per-stage model_comparison CSVs ────────────────────────────────────
@@ -608,7 +611,7 @@ for stage in STAGES:
             continue
         out_csv = f"{OUT_DIR}/cascade_model_comparison_{stage['label']}_{mt}.csv"
         wide.to_csv(out_csv)
-        print(f"Saved {out_csv} ({len(wide)} rows x {wide.shape[1]} cols)")
+        logger.info(f"Saved {out_csv} ({len(wide)} rows x {wide.shape[1]} cols)")
 
 
 # ── Cascade flow diagram ───────────────────────────────────────────────
@@ -642,7 +645,7 @@ fig.tight_layout()
 diag_path = f"{OUT_DIR}/cascade_flow_diagram.png"
 fig.savefig(diag_path, dpi=200, bbox_inches="tight", facecolor="white")
 plt.close(fig)
-print(f"Saved {diag_path}")
+logger.info(f"Saved {diag_path}")
 
-print()
-print("Done.")
+logger.info()
+logger.info("Done.")

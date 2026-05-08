@@ -20,6 +20,10 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    # Module-level logger (matches the pattern in 02_exposure.py).
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.outcomes")
+
 
 @app.cell(hide_code=True)
 def _():
@@ -55,9 +59,15 @@ def _(CONFIG_PATH, get_config_or_params):
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     SITE_TZ = cfg['timezone']
+    # Reintubation classification window. Drives `_fail_extub` and
+    # `_fail_extub_v2` below; downstream `04_covariates.py` consumes the
+    # already-derived flag to assign `exit_mechanism`. Default 48h
+    # matches the ventilator-liberation literature (Esteban, Thille,
+    # ABC-trial); set to 24 in the per-site config for sensitivity.
+    REINTUB_WINDOW_HRS = cfg['reintub_window_hrs']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    print(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
-    return SITE_NAME, SITE_TZ
+    logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ}); reintub window: {REINTUB_WINDOW_HRS}h")
+    return REINTUB_WINDOW_HRS, SITE_NAME, SITE_TZ
 
 
 @app.cell(hide_code=True)
@@ -76,7 +86,7 @@ def _(SITE_NAME, pd):
     )
     resp_p = pd.read_parquet(resp_processed_path)
     resp_p['tracheostomy'] = resp_p['tracheostomy'].fillna(0).astype(int)
-    print(f"resp_p: {len(resp_p)} rows from {resp_processed_path}")
+    logger.info(f"resp_p: {len(resp_p)} rows from {resp_processed_path}")
     return (resp_p,)
 
 
@@ -91,7 +101,7 @@ def _():
 @app.cell
 def _(SITE_NAME, pd):
     cohort_hrly_grids_f = pd.read_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet")
-    print(f"cohort_hrly_grids_f: {len(cohort_hrly_grids_f)} rows")
+    logger.info(f"cohort_hrly_grids_f: {len(cohort_hrly_grids_f)} rows")
     return (cohort_hrly_grids_f,)
 
 
@@ -131,7 +141,7 @@ def _(SITE_TZ, hosp, localize_naive_to_site_tz):
     # localize_naive_to_site_tz handles DST fall-back ambiguity (UCMC has
     # admits/discharges falling on 01:00-02:00 of fall-back days).
     hosp_df['discharge_dttm'] = localize_naive_to_site_tz(hosp_df['discharge_dttm'], SITE_TZ)
-    print(f"hosp_df: {len(hosp_df)} rows")
+    logger.info(f"hosp_df: {len(hosp_df)} rows")
     return (hosp_df,)
 
 
@@ -149,7 +159,7 @@ def _(CONFIG_PATH, SITE_TZ, hosp, localize_naive_to_site_tz):
     # Same clifpy convention: start_dttm is naive site-local on load.
     cs_df['start_dttm'] = localize_naive_to_site_tz(cs_df['start_dttm'], SITE_TZ)
     cs_df = cs_df.sort_values(['hospitalization_id', 'start_dttm']).reset_index(drop=True)
-    print(f"cs_df: {len(cs_df)} rows (mapped to hospitalization_id)")
+    logger.info(f"cs_df: {len(cs_df)} rows (mapped to hospitalization_id)")
     return (cs_df,)
 
 
@@ -288,7 +298,7 @@ def _(sbt_t1):
 
 
 @app.cell
-def _(sbt_t1, sbt_t2):
+def _(REINTUB_WINDOW_HRS, sbt_t1, sbt_t2):
     sbt_t3 = mo.sql(
         f"""
         -- Assign block IDs (per-hospitalization gap-island over _sbt_state)
@@ -309,7 +319,7 @@ def _(sbt_t1, sbt_t2):
                     WHERE sbt_t1.hospitalization_id = sbt_t2.hospitalization_id
                       AND sbt_t1._intub = 1
                       AND sbt_t1.recorded_dttm > sbt_t2.recorded_dttm
-                      AND sbt_t1.recorded_dttm <= sbt_t2.recorded_dttm + INTERVAL 24 HOUR
+                      AND sbt_t1.recorded_dttm <= sbt_t2.recorded_dttm + INTERVAL '{REINTUB_WINDOW_HRS} HOUR'
                 ) THEN 1 ELSE 0 END
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY recorded_dttm)
         """
@@ -467,7 +477,7 @@ def _(count_intubations_v2, pd, resp_p):
         count_intubations_v2
     )
     resp_p_v2 = pd.concat([_sorted, _events], axis=1)
-    print(
+    logger.info(
         f"resp_p_v2: {len(resp_p_v2)} rows | "
         f"_intub_event_v2 fired on {int(resp_p_v2['_intub_event_v2'].sum())} rows | "
         f"_extub_event_v2 fired on {int(resp_p_v2['_extub_event_v2'].sum())} rows | "
@@ -606,9 +616,10 @@ def _(resp_p_v2, sbt_t4):
 
 
 @app.cell
-def _(sbt_t5_v2):
-    # Compute v2 fail-extub: re-intub event within 24h after _extub_1st_v2 fires.
-    # Mirror of sbt_t3's existing _fail_extub but using v2 event flags.
+def _(REINTUB_WINDOW_HRS, sbt_t5_v2):
+    # Compute v2 fail-extub: re-intub event within REINTUB_WINDOW_HRS after
+    # _extub_1st_v2 fires. Mirror of sbt_t3's existing _fail_extub but using
+    # v2 event flags.
     sbt_t5_v2_w_fail = mo.sql(
         f"""
         FROM sbt_t5_v2 AS a
@@ -620,7 +631,7 @@ def _(sbt_t5_v2):
                     WHERE b.hospitalization_id = a.hospitalization_id
                       AND b._intub_event_v2 = 1
                       AND b.recorded_dttm > a.recorded_dttm
-                      AND b.recorded_dttm <= a.recorded_dttm + INTERVAL 24 HOUR
+                      AND b.recorded_dttm <= a.recorded_dttm + INTERVAL '{REINTUB_WINDOW_HRS} HOUR'
                 ) THEN 1 ELSE 0 END
         """
     )
@@ -864,7 +875,7 @@ def _(SITE_NAME, SITE_TZ, retag_to_local_tz, sbt_outcomes):
     _out = retag_to_local_tz(_out, _dttm_cols, SITE_TZ)
     _path = f"output/{SITE_NAME}/outcomes_by_event.parquet"
     _out.to_parquet(_path)
-    print(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
+    logger.info(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
     return
 
 
@@ -1005,7 +1016,7 @@ def _(SITE_NAME, cohort_sbt_outcomes_daily):
     _out = cohort_sbt_outcomes_daily.df()
     _path = f"output/{SITE_NAME}/outcomes_by_id_imvday.parquet"
     _out.to_parquet(_path)
-    print(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
+    logger.info(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
     return
 
 

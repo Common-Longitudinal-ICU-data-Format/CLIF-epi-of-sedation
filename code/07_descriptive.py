@@ -23,6 +23,9 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.descriptive")
+
 
 @app.cell(hide_code=True)
 def _():
@@ -47,21 +50,21 @@ def _():
     # Path B++ refactor: descriptive (night-vs-day) outputs land FLAT in
     # {site}/descriptive/ — PNGs and CSVs side-by-side, no nested figures/.
     os.makedirs(f"output_to_share/{SITE_NAME}/descriptive", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
+    logger.info(f"Site: {SITE_NAME}")
     return CONFIG_PATH, SITE_NAME, pd
 
 
 @app.cell
 def _(SITE_NAME, pd):
     cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
-    print(f"Modeling dataset: {len(cohort_merged_final)} rows")
+    logger.info(f"Modeling dataset: {len(cohort_merged_final)} rows")
     return (cohort_merged_final,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
     sed_dose_by_hr = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
-    print(f"sed_dose_by_hr: {len(sed_dose_by_hr)} rows")
+    logger.info(f"sed_dose_by_hr: {len(sed_dose_by_hr)} rows")
     return (sed_dose_by_hr,)
 
 
@@ -72,7 +75,7 @@ def _(SITE_NAME, pd):
     # Used by the "Dose by Shift" cell below for per-patient hourly-rate
     # computation that correctly handles single-shift bias.
     sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
-    print(f"sed_dose_daily: {len(sed_dose_daily)} rows")
+    logger.info(f"sed_dose_daily: {len(sed_dose_daily)} rows")
     return (sed_dose_daily,)
 
 
@@ -103,13 +106,13 @@ def _(SITE_NAME, cohort_merged_final):
     _plt.tight_layout()
     _corr_path = f'output_to_share/{SITE_NAME}/descriptive/pairwise_corr_matrix.csv'
     corr_matrix.to_csv(_corr_path)
-    print(f"Saved {_corr_path}")
+    logger.info(f"Saved {_corr_path}")
     # PNG companion to the CSV — used to visually scan for collinearity blocks
     # when investigating counterintuitive coefficient signs (e.g., the
     # `_dif_*` ↔ `_day_*` linear-combination structure).
     _corr_png = _corr_path.replace('.csv', '.png')
     _plt.savefig(_corr_png, dpi=120, bbox_inches='tight')
-    print(f"Saved {_corr_png}")
+    logger.info(f"Saved {_corr_png}")
     _plt.gcf()
     return
 
@@ -240,7 +243,7 @@ def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
     for _cohort_name, _sed_frame in [('full', _sed_filtered_full),
                                        ('matched', _sed_filtered_matched)]:
         _per_pt = _per_pt_rates(_sed_frame)
-        print(f"[{_cohort_name}] per-patient rates: {len(_per_pt)} hospitalizations")
+        logger.info(f"[{_cohort_name}] per-patient rates: {len(_per_pt)} hospitalizations")
         for _label, _night_col, _day_col in [
             ('Fentanyl equivalents dose rate (mcg/hr)', 'fenteq_rate_night', 'fenteq_rate_day'),
             ('Midazolam equivalents dose rate (mg/hr)', 'midazeq_rate_night', 'midazeq_rate_day'),
@@ -263,8 +266,8 @@ def _(SITE_NAME, cohort_merged_final, pd, sed_dose_daily):
     sed_dose_by_shift = pd.DataFrame(_rows)
     _shift_path = f'output_to_share/{SITE_NAME}/descriptive/sed_dose_by_shift.csv'
     sed_dose_by_shift.to_csv(_shift_path, index=False)
-    print(f"Saved {_shift_path}")
-    print(sed_dose_by_shift.to_string(index=False))
+    logger.info(f"Saved {_shift_path}")
+    logger.info(sed_dose_by_shift.to_string(index=False))
     return
 
 
@@ -378,7 +381,7 @@ def _(SITE_NAME, sed_dose_by_hr, sed_dose_daily):
     _df = sed_dose_by_hr_of_day.df()
     _hr_csv_path = f'output_to_share/{SITE_NAME}/descriptive/sed_dose_by_hr_of_day.csv'
     _df.to_csv(_hr_csv_path, index=False)
-    print(f"Saved {_hr_csv_path} ({len(_df.columns)} columns)")
+    logger.info(f"Saved {_hr_csv_path} ({len(_df.columns)} columns)")
     return (sed_dose_by_hr_of_day,)
 
 
@@ -507,7 +510,7 @@ def _(SITE_NAME, sed_dose_by_hr_of_day):
 
     _hr_png_path = f'output_to_share/{SITE_NAME}/descriptive/sed_dose_by_hr_of_day.png'
     plt.savefig(_hr_png_path, bbox_inches='tight', dpi=250)
-    print(f"Saved {_hr_png_path}")
+    logger.info(f"Saved {_hr_png_path}")
     fig
     return
 

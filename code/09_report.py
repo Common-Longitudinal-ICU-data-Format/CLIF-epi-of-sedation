@@ -21,6 +21,9 @@ with app.setup:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
+    from clifpy.utils.logging_config import get_logger
+    logger = get_logger("epi_sedation.report")
+
 
 @app.cell(hide_code=True)
 def _():
@@ -111,7 +114,7 @@ def _():
     # navigating into a subdir.
     os.makedirs(f"output_to_share/{SITE_NAME}/descriptive", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
-    print(f"Site: {SITE_NAME}")
+    logger.info(f"Site: {SITE_NAME}")
     return SITE_NAME, datetime, pd
 
 
@@ -345,7 +348,7 @@ def _(SITE_NAME, pd):
         cohort_stats = pd.read_csv(f"output_to_share/{SITE_NAME}/models/cohort_stats.csv").iloc[0].to_dict()
     except FileNotFoundError:
         cohort_stats = {'site': 'unknown', 'n_hospitalizations': 'n/a', 'n_unique_patients': 'n/a'}
-    print(f"Cohort stats: {cohort_stats}")
+    logger.info(f"Cohort stats: {cohort_stats}")
     return (cohort_stats,)
 
 
@@ -355,7 +358,7 @@ def _(SITE_NAME, pd):
     table1_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/table1.csv")
     # Replace NaN with empty string for cleaner display
     table1_df = table1_df.fillna('')
-    print(f"Table 1: {len(table1_df)} rows, {len(table1_df.columns)} cols")
+    logger.info(f"Table 1: {len(table1_df)} rows, {len(table1_df.columns)} cols")
     return (table1_df,)
 
 
@@ -364,7 +367,7 @@ def _(SITE_NAME, pd):
     # Dose by Shift (from 07_descriptive.py) — paired + unpaired day-vs-night
     # sedation rates, long/tidy format (6 rows × 6 columns).
     dose_by_shift_df = pd.read_csv(f"output_to_share/{SITE_NAME}/descriptive/sed_dose_by_shift.csv")
-    print(f"Dose by Shift: {dose_by_shift_df.shape}")
+    logger.info(f"Dose by Shift: {dose_by_shift_df.shape}")
     return (dose_by_shift_df,)
 
 
@@ -372,7 +375,7 @@ def _(SITE_NAME, pd):
 def _(SITE_NAME, pd):
     # Correlation matrix (from 07_descriptive.py)
     corr_df = pd.read_csv(f"output_to_share/{SITE_NAME}/descriptive/pairwise_corr_matrix.csv", index_col=0)
-    print(f"Correlation matrix: {corr_df.shape}")
+    logger.info(f"Correlation matrix: {corr_df.shape}")
     return (corr_df,)
 
 
@@ -386,7 +389,7 @@ def _(SITE_NAME, pd):
     sbt_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_gee.csv", index_col=0)
     extub_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_success_extub_gee.csv", index_col=0)
     extub_logit_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_success_extub_logit.csv", index_col=0)
-    print(f"SBT GEE: {sbt_gee_df.shape}, Extub GEE: {extub_gee_df.shape}, Extub Logit: {extub_logit_df.shape}")
+    logger.info(f"SBT GEE: {sbt_gee_df.shape}, Extub GEE: {extub_gee_df.shape}, Extub Logit: {extub_logit_df.shape}")
     return extub_gee_df, extub_logit_df, sbt_gee_df
 
 
@@ -404,7 +407,7 @@ def _(SITE_NAME, pd):
             sbt_variant_dfs[_v] = pd.read_csv(_path, index_col=0)
         except FileNotFoundError:
             sbt_variant_dfs[_v] = None
-    print(f"SBT variant comparison tables loaded: "
+    logger.info(f"SBT variant comparison tables loaded: "
           f"{[_v for _v, _df in sbt_variant_dfs.items() if _df is not None]}")
     return (sbt_variant_dfs,)
 
@@ -423,7 +426,7 @@ def _(SITE_NAME, pd):
         vif_df['severity'] = vif_df['vif'].apply(_bucket)
         vif_df['vif'] = vif_df['vif'].map(lambda _v: f"{_v:.2f}")
         vif_df = vif_df.set_index('term')
-        print(f"VIF table: {vif_df.shape}")
+        logger.info(f"VIF table: {vif_df.shape}")
     except FileNotFoundError:
         vif_df = None
     return (vif_df,)
@@ -459,7 +462,7 @@ def _(SITE_NAME, pd):
             .set_index('term')
             .reindex(_dose_terms)
         )
-        print(f"Day-0 comparison: {day0_compare_df.shape}")
+        logger.info(f"Day-0 comparison: {day0_compare_df.shape}")
     except FileNotFoundError:
         day0_compare_df = None
     return (day0_compare_df,)
@@ -478,7 +481,7 @@ def _(SITE_NAME, pd):
     except FileNotFoundError:
         subcohort_df = None
     if subcohort_df is not None:
-        print(f"Dose-pattern subgroup table (propofol): {subcohort_df.shape}")
+        logger.info(f"Dose-pattern subgroup table (propofol): {subcohort_df.shape}")
     return (subcohort_df,)
 
 
@@ -897,7 +900,7 @@ def _(
                     ],
                 )
 
-    print(f"Saved unified PDF report: {_pdf_path}")
+    logger.info(f"Saved unified PDF report: {_pdf_path}")
     return
 
 
