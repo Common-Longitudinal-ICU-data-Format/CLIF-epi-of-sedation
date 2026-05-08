@@ -1,47 +1,43 @@
-"""Cross-site hour-of-day sedation dose figures.
+"""Cross-site sedation dose: concatenated 7-day timeline (Phase 3 overhaul).
 
-For each site (`output/{site}/sed_dose_by_hr.parquet` joined to
-`sed_dose_daily.parquet`) we compute 5-cohort × 24-hour aggregates of
-three rate metrics per drug, stack them, and render one PNG per drug
-showing how the diurnal pattern compares across sites.
+Replaces the prior 3-rate × 5-cohort × per-drug grid (15 panels per PNG,
+24-hour x-axis) with a single concatenated 7-day timeline (168 hours,
+2 panels per PNG). Per-site lines overlay on each panel.
 
-Cohorts (columns of each PNG):
-  - `day1`     — first ICU day, **full 24-hr only** (n_hours_day == 12
-                 AND n_hours_night == 12). Patients extubated or
-                 exiting the cohort mid-day-1 are excluded so the
-                 hour-by-hour curve is not contaminated by survival
-                 bias (~7-14% of `_nth_day=1` patient-hours come from
-                 partial days).
-  - `day2`     — second ICU day, full 24-hr only.
-  - `day3`     — third ICU day, full 24-hr only.
-  - `matched`  — ALL days where BOTH shifts had any IMV coverage
-                 (n_hours_day > 0 AND n_hours_night > 0). Pools across
-                 all ICU days. Same row set the per-site `*_mean_matched`
-                 columns use.
-  - `strict`   — ALL days with full 12+12h coverage
-                 (n_hours_day == 12 AND n_hours_night == 12). Pools
-                 across all ICU days; `day1`/`day2`/`day3` are
-                 day-stratified subsets of this cohort.
+Per-site computation: DuckDB query joins
+`output/{site}/seddose_by_id_imvhr.parquet` to
+`output/{site}/cohort_meta_by_id_imvday.parquet` on
+`(hospitalization_id, _nth_day)`. The registry join inherits the
+canonical post-stitch / post-weight-QC cohort definition (Phase 1
+deliverable). The user's "first 7 days OR extubation" cohort only
+requires `_nth_day >= 1` since `seddose_by_id_imvhr` has rows only for
+on-IMV hours.
 
-A single hourly row can belong to MULTIPLE cohorts (e.g., a `_nth_day=1`
-row from a full-24-hr day contributes to `day1`, `matched`, and
-`strict`). DuckDB's UNNEST handles this in a single scan.
-
-Rates (columns of each PNG):
-  - `mean_on_drug`  — avg dose rate among hours with rate > 0
-  - `mean_all_imv`  — avg dose rate across all IMV hours (zeros included)
-  - `pct_on_drug`   — % of IMV patient-hours with rate > 0
-
-X-axis: hour-of-day in 7am→7pm→7am order so the day shift sits in the
-left half and night shift in the right half (matches
-`07_descriptive.py:395-397`). Red dashed vertical at the day↔night
-boundary (7pm).
+`hour_of_stay` runs 0..167 where hour 0 = `_nth_day=1` 7am (the
+patient's first full ICU day's morning) and hour 167 = `_nth_day=7`
+6am. Mapping: `hour_of_stay = (_nth_day - 1) * 24 + ((_hr - 7 + 24) % 24)`.
 
 Outputs:
-  - output_to_agg/sed_dose_by_hr_of_day_cross_site.csv        (long-ish wide)
-  - output_to_agg/figures/sed_dose_by_hr_of_day_cross_site_prop.png
-  - output_to_agg/figures/sed_dose_by_hr_of_day_cross_site_fenteq.png
-  - output_to_agg/figures/sed_dose_by_hr_of_day_cross_site_midazeq.png
+  - `output_to_agg/sed_dose_by_hr_of_day_cross_site.csv` (long-format,
+    one row per (site, hour_of_stay))
+  - `output_to_agg/figures/sed_dose_by_hr_of_day_cross_site_prop.png`
+  - `output_to_agg/figures/sed_dose_by_hr_of_day_cross_site_fenteq.png`
+  - `output_to_agg/figures/sed_dose_by_hr_of_day_cross_site_midazeq.png`
+
+Per-PNG layout: figsize=(16, 6), 2 rows × 1 col, sharex.
+  - Row 0: avg rate across all IMV patient-hours (drug-specific units)
+  - Row 1: % on drug, y-axis fixed [0, 100]
+  - X-axis: hour-of-stay 0..167. Major ticks at 0/24/48/.../168
+    labelled "Day N 7am". Minor ticks at 12/36/60/... labelled "7pm".
+    Faint dashed gray vertical day-boundary lines at hours 24, 48, 72,
+    96, 120, 144 on every row.
+  - Lines: one per site, SITE_PALETTE colors, no markers. Site labels
+    via site_label() so ANONYMIZE_SITES=1 produces "Site A" / "Site B".
+
+Survivor-bias note (encoded as an annotation): n_imv decreases as
+hour_of_stay increases (extubated patients drop out). The figure
+displays the n_imv attrition (hour 0 → hour 167) per site as a small
+textbox on Row 0 so the caveat is explicit.
 
 Usage:
     uv run python code/agg/sed_dose_by_hr_of_day_cross_site.py
@@ -61,6 +57,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
+    DRUG_COLORS,
     DRUG_LABELS,
     DRUG_UNITS,
     SITE_PALETTE,
@@ -72,285 +69,321 @@ from _shared import (  # noqa: E402
 )
 
 
-# ── Figure-fixed selectors ────────────────────────────────────────────────
-# Cohort axis (columns after the row/col flip). Order = left-to-right.
-# day1/2/3 are now restricted to FULL 24-hr ICU days only — patients
-# extubated or exiting mid-day are excluded so the diurnal curve is not
-# contaminated by survival bias at later hours of the day.
-COHORTS: list[tuple[str, str]] = [
-    ("day1",    "Day 1\n(full 24h)"),
-    ("day2",    "Day 2\n(full 24h)"),
-    ("day3",    "Day 3\n(full 24h)"),
-    ("matched", "Matched\n(any-shift coverage)"),
-    ("strict",  "Strict\n(any day, 12 + 12h)"),
+# ── Drug spec ─────────────────────────────────────────────────────────────
+# Three drugs render as three PNGs. Each tuple: (drug_key, csv_mean_col,
+# csv_n_col, y_label_for_avg_panel). The csv_mean_col carries the
+# drug-specific avg-rate metric in clinical units; csv_n_col carries the
+# "on drug" patient-hour count needed for pct_on_drug computation.
+DRUGS: list[tuple[str, str, str, str]] = [
+    ("prop",
+     "propofol_mcg_kg_min_mean",
+     "n_on_drug_propofol",
+     f"Propofol avg rate ({DRUG_UNITS['prop']})"),
+    ("fenteq",
+     "fenteq_mcg_mean",
+     "n_on_drug_fenteq",
+     f"Fentanyl-eq avg rate ({DRUG_UNITS['fenteq']})"),
+    ("midazeq",
+     "midazeq_mg_mean",
+     "n_on_drug_midazeq",
+     f"Midazolam-eq avg rate ({DRUG_UNITS['midazeq']})"),
 ]
 
-# Rate axis (cols). The 3rd col uses a different y-scale (% vs absolute
-# rate) — `_render` uses sharey='col' so the column groups stay coherent.
-# Each rate spec is keyed by drug; the script substitutes drug-specific
-# column names from the wide CSV at render time.
-RATES: list[tuple[str, str, str]] = [
-    # (rate_key, column-suffix-in-wide-csv, column-title)
-    ("mean_on_drug", "_mean_on_drug", "Avg rate (on-drug only)"),
-    ("mean_all_imv", "_mean_all_imv", "Avg rate (all IMV-hrs)"),
-    ("pct_on_drug",  "_pct_on_drug",  "% of pt-hrs on drug"),
-]
 
-# Drugs (one PNG per drug). The wide CSV uses these as column-name prefixes.
-DRUGS: list[tuple[str, str, str]] = [
-    # (key, csv-prefix, drug-key for DRUG_LABELS / DRUG_UNITS lookup)
-    ("prop",    "propofol_mcg_kg_min", "prop"),
-    ("fenteq",  "fenteq_mcg",          "fenteq"),
-    ("midazeq", "midazeq_mg",          "midazeq"),
-]
+# ── Day-boundary x-axis layout ────────────────────────────────────────────
+# Hour 0 of the timeline = patient's _nth_day=1, 7am (first full ICU
+# day's morning). Day boundaries land at hours 24, 48, ..., 144 (where
+# _nth_day rolls over). Major ticks at every 24h crossing labelled
+# "Day N 7am". Minor ticks at the 12h offsets labelled "7pm" so the
+# day↔night transitions inside each day are still visible without
+# crowding the major-tick labels.
+_HOUR_BOUNDARIES = [24, 48, 72, 96, 120, 144]
+_MAJOR_TICKS = list(range(0, 169, 24))
+_MAJOR_TICK_LABELS = [f"Day {i + 1} 7am" for i in range(len(_MAJOR_TICKS))]
+# Show "7pm" labels every other minor tick to keep the axis readable
+# (every 24h interval has a 7pm midpoint at hours 12, 36, 60, ...).
+_MINOR_TICKS = [12, 36, 60, 84, 108, 132, 156]
+_MINOR_TICK_LABELS = ["7pm"] * len(_MINOR_TICKS)
 
-# Hour-of-day reordering: 7am → 7pm → 7am (matches per-site figure).
-# Hour 19 (7pm) lands at x-position 12 in the reordered list. The
-# day↔night boundary line is drawn AT x=12 (right under the labelled
-# "19" tick) rather than at x=11.5: x=12 is where the first night-shift
-# hour (19:00–20:00) begins on the axis, and aligning the line with the
-# labelled tick avoids the visual offset that x=11.5 creates.
-_HOUR_ORDER = list(range(7, 24)) + list(range(0, 7))
-_DAY_NIGHT_BOUNDARY_IDX = 12  # 7pm tick position
-_HOUR_INDEX = {h: i for i, h in enumerate(_HOUR_ORDER)}
+# Night-shift bands — each (start, end) pair brackets a 12h 7pm→7am
+# block on the timeline. Hour-of-stay 12 = first 7pm; the night runs
+# 12 hours to the next 7am at hour 24, etc. Seven night blocks cover
+# the 7-day timeline. Shaded with a faint gray axvspan so the
+# day/night cycle is visible at a glance without competing with data.
+_NIGHT_BANDS = [(12, 24), (36, 48), (60, 72), (84, 96),
+                (108, 120), (132, 144), (156, 168)]
+
+# Title-color overrides — DRUG_COLORS (skyblue / salmon / mediumseagreen)
+# are tuned for filled-bar charts where a pastel reads well; for a
+# big-bold title we want a darker, higher-contrast hue that still
+# tracks the drug "channel" so readers can flip between PNGs and
+# instantly tell which drug they're looking at.
+_DRUG_TITLE_COLORS = {
+    "prop":    "#1f4e79",  # deep blue
+    "fenteq":  "#a61d24",  # firebrick red
+    "midazeq": "#1f6e1f",  # forest green
+}
 
 
-# ── Per-site DuckDB aggregation ──────────────────────────────────────────
-def _aggregate_site(site: str) -> pd.DataFrame:
-    """Return a DataFrame with cohort × _hr × per-drug stats for one site.
+def _compute_per_site(site: str) -> pd.DataFrame:
+    """Compute the 168-row hour-of-stay aggregate for one site.
 
-    Single-scan UNNEST: one hourly row may emit up to 5 cohort labels
-    (it's in `day1` AND `matched` AND `strict` if all conditions hold);
-    DuckDB UNNEST expands that array, NULL entries are filtered out via
-    WHERE before the GROUP BY. Propofol's hourly column (`prop_mcg_kg_total`)
-    is in mcg/kg/HR upstream; we divide by 60 to land at the
-    clinician-preferred mcg/kg/MIN units used everywhere downstream.
+    Returns a DataFrame with columns:
+      site, hour_of_stay, propofol_mcg_kg_min_mean, fenteq_mcg_mean,
+      midazeq_mg_mean, n_on_drug_propofol, n_on_drug_fenteq,
+      n_on_drug_midazeq, n_imv
+
+    Joins `seddose_by_id_imvhr` to `cohort_meta_by_id_imvday` on
+    (hospitalization_id, _nth_day) — the join restricts to the
+    post-Phase-1 canonical cohort. Filter `_nth_day >= 1` excludes
+    the first_partial intubation-day rows (which would shift hour_of_stay
+    negative).
     """
+    seddose_path = Path(f"output/{site}/seddose_by_id_imvhr.parquet")
+    meta_path = Path(f"output/{site}/cohort_meta_by_id_imvday.parquet")
+    if not seddose_path.exists() or not meta_path.exists():
+        print(f"  WARN: missing inputs for {site} ({seddose_path} or {meta_path}); skipping")
+        return pd.DataFrame()
+
     sql = f"""
-        WITH daily AS (
-            FROM read_parquet('output/{site}/sed_dose_daily.parquet')
-            SELECT hospitalization_id, _nth_day, n_hours_day, n_hours_night
-        ),
-        hours AS (
-            FROM read_parquet('output/{site}/sed_dose_by_hr.parquet')
+        WITH hours AS (
+            FROM read_parquet('{seddose_path}') h
+            JOIN read_parquet('{meta_path}') USING (hospitalization_id, _nth_day)
             SELECT
-                hospitalization_id,
-                _nth_day,
-                _hr,
-                prop_mcg_kg_total,
-                _fenteq_mcg_total,
-                _midazeq_mg_total
-        ),
-        cohort_assigned AS (
-            FROM hours h
-            LEFT JOIN daily d USING (hospitalization_id, _nth_day)
-            SELECT
-                h.*,
-                -- day1/2/3 require full 12+12h coverage so partial-day
-                -- patients (extubation / cohort exit during the day)
-                -- don't bias later hours of the diurnal curve. matched
-                -- and strict still pool ACROSS all ICU days.
-                cohort: UNNEST([
-                    CASE WHEN h._nth_day = 1
-                         AND d.n_hours_day = 12 AND d.n_hours_night = 12
-                         THEN 'day1' END,
-                    CASE WHEN h._nth_day = 2
-                         AND d.n_hours_day = 12 AND d.n_hours_night = 12
-                         THEN 'day2' END,
-                    CASE WHEN h._nth_day = 3
-                         AND d.n_hours_day = 12 AND d.n_hours_night = 12
-                         THEN 'day3' END,
-                    CASE WHEN d.n_hours_day > 0 AND d.n_hours_night > 0
-                         THEN 'matched' END,
-                    CASE WHEN d.n_hours_day = 12 AND d.n_hours_night = 12
-                         THEN 'strict' END
-                ])
+                h.hospitalization_id, h._nth_day, h._hr
+                , h.prop_mcg_kg_total, h._fenteq_mcg_total, h._midazeq_mg_total
+                , hour_of_stay: ((h._nth_day - 1) * 24 + ((h._hr - 7 + 24) % 24))::INT
+            WHERE h._nth_day >= 1
         )
-        FROM cohort_assigned
+        FROM hours
         SELECT
-            cohort
-            , _hr
-            -- avg-on-drug (excludes 0-dose hours)
-            , propofol_mcg_kg_min_mean_on_drug:
-                AVG(CASE WHEN prop_mcg_kg_total > 0
-                         THEN prop_mcg_kg_total / 60.0 END)
-            , fenteq_mcg_mean_on_drug:
-                AVG(CASE WHEN _fenteq_mcg_total > 0
-                         THEN _fenteq_mcg_total END)
-            , midazeq_mg_mean_on_drug:
-                AVG(CASE WHEN _midazeq_mg_total > 0
-                         THEN _midazeq_mg_total END)
-            -- avg-all-imv (zeros included)
-            , propofol_mcg_kg_min_mean_all_imv:
-                AVG(COALESCE(prop_mcg_kg_total, 0) / 60.0)
-            , fenteq_mcg_mean_all_imv:
-                AVG(COALESCE(_fenteq_mcg_total, 0))
-            , midazeq_mg_mean_all_imv:
-                AVG(COALESCE(_midazeq_mg_total, 0))
-            -- counts
+            hour_of_stay
+            -- propofol divides by 60 to land in mcg/kg/min (the
+            -- clinical unit; upstream column is mcg/kg/HR).
+            , propofol_mcg_kg_min_mean: AVG(COALESCE(prop_mcg_kg_total, 0) / 60.0)
+            , fenteq_mcg_mean:          AVG(COALESCE(_fenteq_mcg_total, 0))
+            , midazeq_mg_mean:          AVG(COALESCE(_midazeq_mg_total, 0))
             , n_on_drug_propofol: COUNT(*) FILTER (WHERE prop_mcg_kg_total > 0)
             , n_on_drug_fenteq:   COUNT(*) FILTER (WHERE _fenteq_mcg_total  > 0)
             , n_on_drug_midazeq:  COUNT(*) FILTER (WHERE _midazeq_mg_total  > 0)
+            -- Per-hour union: patient-hours with ANY of the three
+            -- sedative drugs running. Drug-independent baseline
+            -- rendered identically on all 3 PNGs so reviewers can
+            -- compare each drug's curve to the larger pie.
+            , n_on_drug_any: COUNT(*) FILTER (
+                WHERE prop_mcg_kg_total > 0
+                   OR _fenteq_mcg_total > 0
+                   OR _midazeq_mg_total > 0
+            )
             , n_imv: COUNT(*)
-        WHERE cohort IS NOT NULL
-        GROUP BY cohort, _hr
-        ORDER BY cohort, _hr
+        WHERE hour_of_stay BETWEEN 0 AND 167
+        GROUP BY hour_of_stay
+        ORDER BY hour_of_stay
     """
     df = duckdb.sql(sql).df()
     df.insert(0, "site", site)
+
+    # Compute pct_on_drug per drug + the "any sedative" baseline.
+    # Federated-safe: only counts and ratios derived from counts.
+    for _drug, _, n_col, _ in DRUGS:
+        pct_col = n_col.replace("n_on_drug_", "pct_on_drug_")
+        df[pct_col] = 100.0 * df[n_col] / df["n_imv"].replace(0, np.nan)
+    df["pct_on_drug_any"] = (
+        100.0 * df["n_on_drug_any"] / df["n_imv"].replace(0, np.nan)
+    )
     return df
 
 
-def _stack_per_site() -> pd.DataFrame:
-    """Concat per-site aggregates; skip sites missing the required parquets."""
-    sites = list_sites()
-    if not sites:
-        print("No sites found under output_to_share/. Nothing to plot.")
+def _stack_per_site(sites: list[str]) -> pd.DataFrame:
+    parts = []
+    for site in sites:
+        sub = _compute_per_site(site)
+        if not sub.empty:
+            parts.append(sub)
+    if not parts:
         return pd.DataFrame()
-    print(f"Discovered sites: {sites}")
-
-    frames: list[pd.DataFrame] = []
-    for s in sites:
-        hr_path = Path(f"output/{s}/sed_dose_by_hr.parquet")
-        daily_path = Path(f"output/{s}/sed_dose_daily.parquet")
-        if not (hr_path.exists() and daily_path.exists()):
-            print(f"  SKIP {s}: missing parquets — re-run 02_exposure.py for this site.")
-            continue
-        frames.append(_aggregate_site(s))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return pd.concat(parts, ignore_index=True)
 
 
-def _add_pct_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute pct_on_drug = n_on_drug / n_imv * 100 per drug."""
-    out = df.copy()
-    safe_n = out["n_imv"].where(out["n_imv"] > 0, np.nan)
-    for csv_prefix, n_col in [
-        ("propofol_mcg_kg_min", "n_on_drug_propofol"),
-        ("fenteq_mcg",          "n_on_drug_fenteq"),
-        ("midazeq_mg",          "n_on_drug_midazeq"),
-    ]:
-        out[f"{csv_prefix}_pct_on_drug"] = out[n_col] / safe_n * 100.0
-    return out
+def _apply_x_axis(ax) -> None:
+    """Apply the shared 0..168 hour-of-stay tick layout to one axis.
 
-
-# ── Render one PNG per drug ──────────────────────────────────────────────
-def _format_panel(ax, *, top_row: bool, left_col: bool,
-                  col_title: str | None, row_label: str | None,
-                  ylabel: str | None) -> None:
-    """Common per-panel styling shared by every cell of every figure."""
-    ax.axvline(_DAY_NIGHT_BOUNDARY_IDX, color="firebrick",
-               linestyle="--", linewidth=0.9, alpha=0.6, zorder=0)
-    ax.grid(True, axis="y", linewidth=0.4, alpha=0.4, zorder=0)
-    if top_row and col_title:
-        ax.set_title(col_title, fontsize=11)
-    if left_col and row_label:
-        ax.set_ylabel(row_label + (f"\n({ylabel})" if ylabel else ""),
-                      fontsize=10)
-    elif left_col and ylabel:
-        ax.set_ylabel(ylabel, fontsize=10)
-
-
-def _render_drug(df: pd.DataFrame, drug_key: str, csv_prefix: str,
-                 drug_label_key: str) -> plt.Figure:
-    """Build one 3×5 forest-of-curves figure for a single drug.
-
-    Rows = rate type (3), cols = cohort (5). `sharey="row"` so each rate
-    row uses its own y-axis (drug-specific units for `mean_on_drug` and
-    `mean_all_imv` rows; 0–100 for the `pct_on_drug` row).
+    Also draws the seven 12-hour night-shift shading bands and the
+    day-boundary dashed lines (both behind data via zorder=0/-1).
     """
-    sites = sorted(df["site"].unique().tolist())
-    n_rows, n_cols = len(RATES), len(COHORTS)
-    fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(16.0, 9.0),
-        sharex=True, sharey="row",
-    )
-    axes = np.atleast_2d(axes)
+    ax.set_xlim(-1, 168)
+    ax.set_xticks(_MAJOR_TICKS)
+    ax.set_xticklabels(_MAJOR_TICK_LABELS, fontsize=9)
+    ax.set_xticks(_MINOR_TICKS, minor=True)
+    ax.set_xticklabels(_MINOR_TICK_LABELS, minor=True, fontsize=7,
+                       color="0.45")
 
-    drug_pretty = DRUG_LABELS[drug_label_key]
-    drug_unit = DRUG_UNITS[drug_label_key]
+    # Night-shift bands (7pm-7am): light-gray rectangles behind data.
+    # zorder=-1 keeps them behind both grid lines and data lines.
+    for night_start, night_end in _NIGHT_BANDS:
+        ax.axvspan(night_start, night_end,
+                   facecolor="0.85", alpha=0.45, zorder=-1, linewidth=0)
 
-    # X tick positions: label every 2nd hour. With the reordering starting
-    # at 07, this hits 07, 09, 11, 13, 15, 17, 19, 21, 23, 01, 03, 05 —
-    # the 7pm boundary tick "19" is visible (index 12 is even).
-    xtick_idx = [i for i, _ in enumerate(_HOUR_ORDER) if i % 2 == 0]
-    xtick_lbl = [f"{_HOUR_ORDER[i]:02d}" for i in xtick_idx]
+    # Day-boundary cutoff lines — faint dashed gray, on top of shading
+    # but behind data lines.
+    for h in _HOUR_BOUNDARIES:
+        ax.axvline(h, color="0.55", linestyle="--",
+                   linewidth=0.7, alpha=0.7, zorder=0)
 
-    for ri, (_rate_key, rate_suffix, rate_title) in enumerate(RATES):
-        for ci, (cohort_key, cohort_label) in enumerate(COHORTS):
-            ax = axes[ri, ci]
-            value_col = f"{csv_prefix}{rate_suffix}"
 
-            for si, s in enumerate(sites):
-                cell = df[(df["site"] == s) & (df["cohort"] == cohort_key)]
-                if cell.empty or value_col not in cell.columns:
-                    continue
-                cell = cell.set_index("_hr").reindex(_HOUR_ORDER)
-                ys = cell[value_col].to_numpy(dtype=float)
-                xs = np.arange(len(_HOUR_ORDER))
-                color = SITE_PALETTE[si % len(SITE_PALETTE)]
-                # Label only on the (top-left) panel — single fig-level
-                # legend entry per site.
-                label = site_label(s) if (ri == 0 and ci == 0) else None
-                ax.plot(
-                    xs, ys,
-                    color=color, linewidth=1.6,
-                    marker="o", markersize=3.5,
-                    label=label,
-                )
+def _figure_for_drug(
+    df: pd.DataFrame,
+    sites: list[str],
+    drug_key: str,
+    mean_col: str,
+    n_col: str,
+    rate_label: str,
+):
+    """Render the 4-row PNG for one drug.
 
-            # Y-axis units differ between absolute-rate rows and pct row.
-            ylabel = drug_unit if rate_suffix != "_pct_on_drug" else "%"
-            # Build the row label as "Rate title\n(units)" for the leftmost
-            # column only — single multi-line ylabel keeps the row identity
-            # explicit without needing an extra rotated text element.
-            row_label = f"{rate_title}\n({ylabel})" if ci == 0 else None
-            _format_panel(
-                ax,
-                top_row=(ri == 0),
-                left_col=(ci == 0),
-                col_title=cohort_label,
-                row_label=row_label,
-                ylabel=None,  # already folded into row_label above
-            )
+    Row 0: avg rate across all on-IMV patient-hours (drug-specific).
+    Row 1: % of on-IMV patient-hours with this drug > 0 (drug-specific).
+    Row 2: % of on-IMV patient-hours with ANY of {prop, fenteq, midaz}
+           > 0 — drug-independent baseline, identical on all 3 PNGs.
+    Row 3: N (n_imv per (site, hour_of_stay)) — patient-hour count
+           contributing to each point. Drug-independent; identical on
+           all 3 PNGs.
 
-            if rate_suffix == "_pct_on_drug":
-                ax.set_ylim(0, 100)
+    All four panels share the 0..167 hour-of-stay x-axis and inherit
+    the night-shift shading + day-boundary dashed lines from
+    `_apply_x_axis`.
+    """
+    fig, axes = plt.subplots(4, 1, figsize=(16, 11), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 2, 2, 2]})
+    ax_rate, ax_pct, ax_pct_any, ax_n = axes
 
-            if ri == n_rows - 1:
-                ax.set_xticks(xtick_idx)
-                ax.set_xticklabels(xtick_lbl, fontsize=9)
-                ax.set_xlabel("Hour of day (local, 7am →)", fontsize=9)
+    pct_col = n_col.replace("n_on_drug_", "pct_on_drug_")
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles, labels,
-            loc="upper center", bbox_to_anchor=(0.5, 1.01),
-            ncol=len(handles), frameon=False, fontsize=10,
-            title="Site",
+    for i, site in enumerate(sites):
+        sub = (
+            df[df["site"] == site]
+            .sort_values("hour_of_stay")
         )
+        if sub.empty:
+            continue
+        color = SITE_PALETTE[i % len(SITE_PALETTE)]
+        label = site_label(site)
 
-    fig.suptitle(
-        f"Cross-site diurnal pattern — {drug_pretty} "
-        "(per-site lines, no pooling)",
-        fontsize=13, y=1.04,
+        # Row 0: avg rate (across ALL on-IMV hours, including zeros).
+        ax_rate.plot(sub["hour_of_stay"], sub[mean_col],
+                     color=color, linewidth=1.4, label=label, zorder=2)
+        # Row 1: % on this specific drug.
+        ax_pct.plot(sub["hour_of_stay"], sub[pct_col],
+                    color=color, linewidth=1.4, zorder=2)
+        # Row 2: % on ANY of the 3 sedatives — same data on every PNG.
+        ax_pct_any.plot(sub["hour_of_stay"], sub["pct_on_drug_any"],
+                        color=color, linewidth=1.4, zorder=2)
+        # Row 3: raw N (patient-hour count), thousands.
+        ax_n.plot(sub["hour_of_stay"], sub["n_imv"],
+                  color=color, linewidth=1.4, zorder=2)
+
+    # Y-axis labels & ranges per panel.
+    ax_rate.set_ylabel(rate_label, fontsize=10)
+    ax_rate.grid(axis="y", alpha=0.3)
+
+    ax_pct.set_ylabel(
+        f"% on {DRUG_LABELS[drug_key]}\n(per-hour cohort)", fontsize=10,
     )
+    ax_pct.set_ylim(0, 100)
+    ax_pct.grid(axis="y", alpha=0.3)
+
+    ax_pct_any.set_ylabel("% on any sedative\n(prop / fenteq / midaz)",
+                          fontsize=10)
+    ax_pct_any.set_ylim(0, 100)
+    ax_pct_any.grid(axis="y", alpha=0.3)
+
+    ax_n.set_ylabel("N (on-IMV\npatient-hours)", fontsize=10)
+    ax_n.grid(axis="y", alpha=0.3)
+    # N axis: comma-formatted integers for readability.
+    ax_n.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda v, _: f"{int(v):,}")
+    )
+
+    for _ax in axes:
+        _apply_x_axis(_ax)
+    ax_n.set_xlabel("Hour of stay (anchored at first full-ICU-day 7am)",
+                    fontsize=10)
+
     fig.tight_layout()
+
+    # ── Two-tier title: drug name in big colored-bold so each PNG is
+    # immediately distinguishable at a glance, with a smaller subtitle
+    # below describing the figure. The legend sits above the plot area
+    # but below the title block.
+    fig.legend(
+        loc="upper center", bbox_to_anchor=(0.5, 1.01),
+        ncol=len(sites), frameon=False, fontsize=10,
+    )
+    fig.text(
+        0.5, 1.07, DRUG_LABELS[drug_key],
+        ha="center", va="bottom",
+        fontsize=20, fontweight="bold",
+        color=_DRUG_TITLE_COLORS.get(drug_key, "0.15"),
+    )
+    fig.text(
+        0.5, 1.045,
+        "dosing trajectory across the first 7 ICU days, by site",
+        ha="center", va="bottom", fontsize=11, color="0.30",
+    )
+
+    # ── Footnote — journal-style prose. No SQL formulas: the
+    # cohort definition and computation rules belong here in plain
+    # English so a reader can audit the figure without opening the
+    # codebase. Detailed implementation notes live in the per-cell
+    # comments in the source.
+    fig.text(
+        0.5, -0.045,
+        "For each site, hourly sedation totals were joined to the canonical "
+        "patient-day registry (Phase 1 cohort: post-encounter-stitch dedup "
+        "and post-weight-QC) and aggregated by hour-of-stay. Hour 0 is "
+        "anchored at 7am of each patient's first complete 24-hour ICU day; "
+        "the timeline then runs hour-by-hour through 7 days, with the day "
+        "shift (7am–7pm) on white background and the night shift (7pm–7am) "
+        "shaded light gray. "
+        "First panel — mean dose rate averaged across all on-IMV patient-"
+        "hours at that point, including zero-dose hours; this reflects the "
+        "average across the cohort rather than among recipients only. "
+        "Second/third panels — percentage of on-IMV patient-hours with a "
+        "non-zero dose; the third panel is the union across propofol, "
+        "fentanyl-equivalent, and midazolam-equivalent and is rendered "
+        "identically on all three figures so the drug-specific curve in the "
+        "second panel can be read against a common saturation reference. "
+        "Bottom panel — N, the number of patients still on invasive "
+        "mechanical ventilation at each hour-of-stay (one count per site "
+        "per hour); equivalently, the patient-hour count contributing to "
+        "each data point. N declines monotonically as patients are "
+        "extubated, so late-timeline values reflect a smaller, sicker, "
+        "longer-staying subset and should be interpreted with that "
+        "selection bias in mind.",
+        ha="center", va="top", fontsize=8.5, color="0.30", wrap=True,
+    )
     return fig
 
 
-# ── Entry point ──────────────────────────────────────────────────────────
 def main() -> None:
     apply_style()
-    raw = _stack_per_site()
-    if raw.empty:
-        return
-    df = _add_pct_columns(raw)
 
+    sites = list_sites()
+    if not sites:
+        print("No site dirs under output_to_share/. Run per-site pipelines first.")
+        return
+
+    df = _stack_per_site(sites)
+    if df.empty:
+        print("No per-site data computed; nothing to render.")
+        return
+
+    # Persist the long-format CSV (federated-safe — group-level aggregates
+    # only, no IDs). 168 rows per site × n_sites total.
     save_agg_csv(df, "sed_dose_by_hr_of_day_cross_site")
 
-    for drug_key, csv_prefix, drug_label_key in DRUGS:
-        fig = _render_drug(df, drug_key, csv_prefix, drug_label_key)
+    for drug_key, mean_col, n_col, rate_label in DRUGS:
+        fig = _figure_for_drug(df, sites, drug_key, mean_col, n_col, rate_label)
         save_agg_fig(fig, f"sed_dose_by_hr_of_day_cross_site_{drug_key}")
         plt.close(fig)
 

@@ -57,10 +57,11 @@ from _shared import (  # noqa: E402
 
 
 # ── Figure-fixed selectors ────────────────────────────────────────────────
-OUTCOMES: list[tuple[str, str]] = [
-    ("sbt_elig_next_day",          "SBT eligible (next day)"),
-    ("sbt_done_multiday_next_day", "SBT delivered (multiday)"),
-    ("success_extub_next_day",     "Successful extubation"),
+# Each tuple: (outcome_key, model_type, display_label). See parallel
+# comment in forest_night_day_cross_site.py for why model_type is per-outcome.
+OUTCOMES: list[tuple[str, str, str]] = [
+    ("sbt_done_multiday_next_day", "gee",   "SBT delivered (multiday)"),
+    ("success_extub_next_day",     "logit", "Successful extubation"),
 ]
 
 SPECS: list[tuple[str, str, dict]] = [
@@ -79,9 +80,12 @@ PREDICTORS: list[tuple[str, str]] = [
 def _filter(df_all: pd.DataFrame) -> pd.DataFrame:
     if df_all.empty:
         return df_all
+    # Match (outcome, model_type) pairs since each outcome carries its own
+    # preferred model type (sbt_done_multiday → gee; success_extub → logit).
+    allowed_om = {(o, mt) for o, mt, _ in OUTCOMES}
+    om_pairs = list(zip(df_all["outcome"], df_all["model_type"]))
     return df_all[
-        df_all["outcome"].isin([o for o, _ in OUTCOMES])
-        & (df_all["model_type"] == "gee")
+        pd.Series([p in allowed_om for p in om_pairs], index=df_all.index)
         & df_all["spec"].isin([s for s, *_ in SPECS])
         & df_all["predictor"].isin([p for p, _ in PREDICTORS])
     ].copy()
@@ -93,7 +97,7 @@ def _render(df: pd.DataFrame) -> plt.Figure:
 
     n_rows, n_cols = len(PREDICTORS), len(OUTCOMES)
     fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(13.0, 8.5),
+        n_rows, n_cols, figsize=(10.0, 8.5),
         sharex=True, sharey=True,
     )
     axes = np.atleast_2d(axes)
@@ -105,7 +109,7 @@ def _render(df: pd.DataFrame) -> plt.Figure:
     )
 
     for ri, (pred_key, _pred_label) in enumerate(PREDICTORS):
-        for ci, (outcome_key, outcome_label) in enumerate(OUTCOMES):
+        for ci, (outcome_key, outcome_mt, outcome_label) in enumerate(OUTCOMES):
             ax = axes[ri, ci]
             add_or_reference_line(ax)
 
@@ -118,6 +122,7 @@ def _render(df: pd.DataFrame) -> plt.Figure:
                         & (df["spec"] == spec_key)
                         & (df["predictor"] == pred_key)
                         & (df["outcome"] == outcome_key)
+                        & (df["model_type"] == outcome_mt)
                     ]
                     if cell.empty:
                         continue
