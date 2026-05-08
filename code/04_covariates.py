@@ -1026,5 +1026,149 @@ def _(SITE_NAME, weight_daily):
     return
 
 
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Per-Stay Metadata Registry
+
+    Build `cohort_meta_by_id` — the canonical per-stay registry.
+    One row per hospitalization. Aggregates the day-grain registry to a
+    stay-grain summary (`n_days_total`, `n_days_full_24h`,
+    `has_first_partial`, `has_last_partial`), joins in the IMV streak
+    boundaries (`imv_first_dttm`, `imv_last_dttm`, `imv_dur_hrs`), and
+    derives a mutually-exclusive `exit_mechanism` categorical from the
+    existing per-event flags in `sbt_outcomes_daily.parquet` plus the
+    discharge_category from CLIF Hospitalization.
+
+    Categorization order (first match wins): `tracheostomy` →
+    `died_on_imv` → `palliative_extubation` → `failed_extubation` →
+    `successful_extubation` → `discharge_on_imv` → `unknown`. Phase 1
+    uses the existing `_fail_extub` / `_withdrawl_lst` / `_success_extub`
+    flags from `03_outcomes.py` (whose underlying reintubation window
+    is currently 24 h hardcoded — Phase 5 will plumb the new
+    `reintub_window_hrs` config through to those flag derivations).
+    """)
+    return
+
+
+@app.cell
+def _(
+    CONFIG_PATH,
+    SITE_NAME,
+    SITE_TZ,
+    cohort_hosp_ids,
+    duckdb,
+):
+    # Imports are `_`-prefixed to keep them cell-local — `localize_naive_to_site_tz`
+    # is also imported by an earlier cell, and marimo enforces single
+    # cross-cell binding.
+    from clifpy import Hospitalization as _Hospitalization
+    from _utils import localize_naive_to_site_tz as _loc_tz
+
+    # Load discharge metadata for the cohort. Naive *_dttm gets tz-localized
+    # to SITE_TZ (clifpy convention: from_file returns naive wall-clock that
+    # is already site-local; we just attach the tz tag).
+    _hosp = _Hospitalization.from_file(
+        config_path=CONFIG_PATH,
+        columns=['hospitalization_id', 'discharge_category', 'discharge_dttm'],
+        filters={'hospitalization_id': cohort_hosp_ids},
+    )
+    hosp_meta_df = _hosp.df.copy()
+    hosp_meta_df['discharge_dttm'] = _loc_tz(
+        hosp_meta_df['discharge_dttm'], SITE_TZ,
+    )
+
+    cohort_meta_by_id = duckdb.sql(f"""
+        WITH per_hosp_meta AS (
+            -- Aggregate the day-grain registry → per-stay rollups.
+            FROM read_parquet('output/{SITE_NAME}/cohort_meta_by_id_imvday.parquet')
+            SELECT
+                hospitalization_id
+                , encounter_block: MIN(encounter_block)
+                , n_days_total:     COUNT(*)
+                , n_days_full_24h:  COUNT(*) FILTER (WHERE _is_full_24h_day)
+                , has_first_partial: BOOL_OR(_is_first_day)
+                , has_last_partial:  BOOL_OR(_is_last_day)
+            GROUP BY hospitalization_id
+        )
+        , per_hosp_outcomes AS (
+            -- Roll daily outcome flags → per-stay flags via MAX. The daily
+            -- file already replicates these flags onto every row of a hosp,
+            -- so MAX is a no-op aggregator (matches the convention used by
+            -- 05_modeling_dataset's analytical_dataset assembly).
+            FROM read_parquet('output/{SITE_NAME}/sbt_outcomes_daily.parquet')
+            SELECT
+                hospitalization_id
+                , ever_extubated:     COALESCE(MAX(_extub_1st),    0)
+                , ever_trach:         COALESCE(MAX(_trach_1st),    0)
+                , ever_success_extub: COALESCE(MAX(_success_extub), 0)
+                , ever_failed_extub:  COALESCE(MAX(_fail_extub),   0)
+                , ever_withdrawl:     COALESCE(MAX(_withdrawl_lst), 0)
+            GROUP BY hospitalization_id
+        )
+        FROM read_parquet('output/{SITE_NAME}/cohort_imv_streaks.parquet') s
+        LEFT JOIN per_hosp_meta m USING (hospitalization_id)
+        LEFT JOIN per_hosp_outcomes o USING (hospitalization_id)
+        LEFT JOIN hosp_meta_df h USING (hospitalization_id)
+        SELECT
+            s.hospitalization_id
+            , m.encounter_block
+            , m.n_days_total
+            , m.n_days_full_24h
+            , m.has_first_partial
+            , m.has_last_partial
+            , imv_first_dttm: s._start_dttm
+            , imv_last_dttm:  s._end_dttm
+            , imv_dur_hrs:    s._duration_hrs
+            , successful_extubation:    COALESCE(o.ever_success_extub, 0) = 1
+            , reintubated_within_window: COALESCE(o.ever_failed_extub, 0) = 1
+            -- Mutually-exclusive exit_mechanism. Order matters: trach wins
+            -- over death-on-IMV when both happen (trach is the cohort exit
+            -- event); withdrawal-of-care wins over fail/success (different
+            -- clinical category — the patient was extubated in anticipation
+            -- of death, not as a recovery attempt).
+            , exit_mechanism: CASE
+                WHEN o.ever_trach = 1 THEN 'tracheostomy'
+                WHEN COALESCE(o.ever_extubated, 0) = 0
+                    AND TRIM(LOWER(h.discharge_category)) = 'expired' THEN 'died_on_imv'
+                WHEN o.ever_withdrawl = 1 THEN 'palliative_extubation'
+                WHEN o.ever_failed_extub = 1 THEN 'failed_extubation'
+                WHEN o.ever_success_extub = 1 THEN 'successful_extubation'
+                WHEN COALESCE(o.ever_extubated, 0) = 0 THEN 'discharge_on_imv'
+                ELSE 'unknown'
+            END
+        ORDER BY s.hospitalization_id
+    """).df()
+
+    _n = len(cohort_meta_by_id)
+    _n_unknown = int((cohort_meta_by_id['exit_mechanism'] == 'unknown').sum())
+    print(
+        f"cohort_meta_by_id: {_n:,} rows; "
+        f"unknown exit_mechanism count = {_n_unknown:,} (should be 0 in healthy data)"
+    )
+    return (cohort_meta_by_id,)
+
+
+@app.cell
+def _(SITE_NAME, SITE_TZ, cohort_meta_by_id, retag_to_local_tz):
+    # Persist with site-local tz tags on the boundary timestamps (mirrors
+    # cohort_imv_streaks save convention).
+    _df = retag_to_local_tz(
+        cohort_meta_by_id, ["imv_first_dttm", "imv_last_dttm"], SITE_TZ,
+    )
+    _path = f"output/{SITE_NAME}/cohort_meta_by_id.parquet"
+    _df.to_parquet(_path, index=False)
+
+    _exit_counts = (
+        _df['exit_mechanism']
+        .value_counts(dropna=False)
+        .sort_index()
+        .to_dict()
+    )
+    print(f"Saved: {_path} ({len(_df):,} hospitalizations)")
+    print(f"  exit_mechanism distribution: {_exit_counts}")
+    return
+
+
 if __name__ == "__main__":
     app.run()

@@ -176,6 +176,10 @@ def _(adt_rel, hosp_ids_w_icu_stays, load_data):
         stitch_dropped_hosp_ids: list = []
         stitch_block_sizes = None  # sentinel — QA cell skips
         n_unmapped_singletons = 0
+        # encounter_mapping = None propagates as the OFF sentinel — the
+        # downstream `cohort_meta_by_id_imvday` builder treats this as "no
+        # mapping" and emits encounter_block = NULL on every row.
+        encounter_mapping = None
         logger.info("Encounter stitch-dedup: OFF (COHORT_STITCH_DEDUP_ON=0)")
     else:
         from clifpy.utils.stitching_encounters import stitch_encounters
@@ -239,6 +243,15 @@ def _(adt_rel, hosp_ids_w_icu_stays, load_data):
         ]
         stitch_block_sizes = _encounter_mapping.groupby('encounter_block').size()
 
+        # Surface the (hospitalization_id, encounter_block) mapping as a
+        # cross-cell variable so downstream cells (notably the
+        # `cohort_meta_by_id_imvday` / `cohort_meta_by_id` builders) can
+        # propagate `encounter_block` without re-running stitch_encounters.
+        # Restrict to the two ID columns to keep memory footprint minimal.
+        encounter_mapping = _encounter_mapping[
+            ['hospitalization_id', 'encounter_block']
+        ].copy()
+
         logger.info(
             f"Encounter stitch-dedup (12h window): {n_dropped_stitch:,} "
             f"hospitalizations stitched out (kept first per encounter block; "
@@ -248,6 +261,7 @@ def _(adt_rel, hosp_ids_w_icu_stays, load_data):
 
     return (
         cohort_hosp_ids_post_stitch,
+        encounter_mapping,
         n_dropped_stitch,
         n_unmapped_singletons,
         stitch_dropped_hosp_ids,
@@ -908,6 +922,137 @@ def _(cohort_hrly_grids_f):
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
+    ## Patient-Day Metadata Registry
+
+    Build `cohort_meta_by_id_imvday` — the canonical per-day registry. One
+    row per `(hospitalization_id, _nth_day)`. Pure cohort metadata: shift-
+    hour counts, day boundary timestamps, derived `day_type` ∈
+    {`first_partial`, `full`, `last_partial`}, and the canonical
+    `_is_full_24h_day` flag (= `n_hrs_day == 12 AND n_hrs_night == 12`).
+    No doses, no outcomes — those join in downstream.
+
+    `encounter_block` is LEFT-JOINed in from the stitch cell's
+    `encounter_mapping`; NULL when stitch is OFF or the hosp is an
+    unmapped singleton (clifpy data-quality edge case).
+
+    Saved at terminal-materialization time as
+    `output/{site}/cohort_meta_by_id_imvday.parquet`, filtered to the
+    final cohort.
+    """)
+    return
+
+
+@app.cell
+def _(cohort_hrly_grids_f, duckdb, encounter_mapping):
+    # Aggregate hourly grid → one row per (hosp, _nth_day). Window functions
+    # over PARTITION BY hospitalization_id give us min/max _nth_day per hosp
+    # so we can label the partial-vs-full day_type. Within a kept IMV streak
+    # the hourly grid is contiguous, so middle days are full by construction
+    # — only the first and last days can be partial. Edge case: a patient
+    # extubated at 6:59am produces a max-`_nth_day` row that is still full
+    # (24 chargeable hours under the 7am-cross convention); day_type='full'
+    # is correct for those.
+    #
+    # `encounter_block` propagation: when stitch is ON, `encounter_mapping`
+    # is a pandas df with (hosp_id, encounter_block); when OFF it's None.
+    # We branch the SQL between two single-shot queries so the only objects
+    # referenced from SQL are cross-cell (no underscore prefix) — DuckDB's
+    # replacement scan is cell-scope-aware in marimo script mode and
+    # doesn't see `_`-prefixed cell-local intermediates by name.
+
+    _common_per_day_cte = """
+        WITH per_day AS (
+            FROM cohort_hrly_grids_f
+            SELECT
+                hospitalization_id
+                , _nth_day
+                , n_hrs_day:   COUNT(*) FILTER (WHERE _shift = 'day')
+                , n_hrs_night: COUNT(*) FILTER (WHERE _shift = 'night')
+                , day_start_dttm: MIN(event_dttm)
+                , day_end_dttm:   MAX(event_dttm)
+            GROUP BY hospitalization_id, _nth_day
+        )
+        , with_extremes AS (
+            FROM per_day
+            SELECT *
+                , _is_full_24h_day: (n_hrs_day = 12 AND n_hrs_night = 12)
+                , _max_nth: MAX(_nth_day) OVER (PARTITION BY hospitalization_id)
+                , _min_nth: MIN(_nth_day) OVER (PARTITION BY hospitalization_id)
+        )
+        , typed AS (
+            FROM with_extremes
+            SELECT
+                hospitalization_id
+                , _nth_day
+                , day_type: CASE
+                    WHEN NOT _is_full_24h_day AND _nth_day = _min_nth THEN 'first_partial'
+                    WHEN NOT _is_full_24h_day AND _nth_day = _max_nth THEN 'last_partial'
+                    ELSE 'full'
+                END
+                , _is_full_24h_day
+                , n_hrs_day
+                , n_hrs_night
+                , day_start_dttm
+                , day_end_dttm
+        )
+    """
+
+    if encounter_mapping is None:
+        cohort_meta_by_id_imvday = duckdb.sql(_common_per_day_cte + """
+            FROM typed t
+            SELECT
+                t.hospitalization_id
+                , encounter_block: CAST(NULL AS VARCHAR)
+                , t._nth_day
+                , t.day_type
+                , _is_first_day: (t.day_type = 'first_partial')
+                , _is_last_day:  (t.day_type = 'last_partial')
+                , t._is_full_24h_day
+                , t.n_hrs_day
+                , t.n_hrs_night
+                , t.day_start_dttm
+                , t.day_end_dttm
+            ORDER BY t.hospitalization_id, t._nth_day
+        """)
+    else:
+        cohort_meta_by_id_imvday = duckdb.sql(_common_per_day_cte + """
+            FROM typed t
+            LEFT JOIN encounter_mapping em USING (hospitalization_id)
+            SELECT
+                t.hospitalization_id
+                , em.encounter_block
+                , t._nth_day
+                , t.day_type
+                , _is_first_day: (t.day_type = 'first_partial')
+                , _is_last_day:  (t.day_type = 'last_partial')
+                , t._is_full_24h_day
+                , t.n_hrs_day
+                , t.n_hrs_night
+                , t.day_start_dttm
+                , t.day_end_dttm
+            ORDER BY t.hospitalization_id, t._nth_day
+        """)
+
+    _n_rows = cohort_meta_by_id_imvday.count("*").fetchone()[0]
+    _n_hosps = duckdb.sql(
+        "FROM cohort_meta_by_id_imvday SELECT COUNT(DISTINCT hospitalization_id)"
+    ).fetchone()[0]
+    logger.info(
+        f"cohort_meta_by_id_imvday: {_n_rows:,} (hosp×day) rows across "
+        f"{_n_hosps:,} hospitalizations (pre-cohort filter)"
+    )
+    return (cohort_meta_by_id_imvday,)
+
+
+@app.cell
+def _(cohort_meta_by_id_imvday):
+    cohort_meta_by_id_imvday
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
     ## NMB Exclusion
 
     Exclude patient-days with >1 hour of neuromuscular blockade.
@@ -1006,6 +1151,7 @@ def _(
     cohort_hosp_ids,
     cohort_hrly_grids_f,
     cohort_imv_streaks,
+    cohort_meta_by_id_imvday,
     consort_counts,
     duckdb,
     icu_type_df,
@@ -1135,6 +1281,10 @@ def _(
         FROM cohort_hrly_grids_f
         WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
     """)
+    _meta_imvday_kept_rel = duckdb.sql(f"""
+        FROM cohort_meta_by_id_imvday
+        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+    """)
 
     # Tz-tagged outputs via Polars (preserves site-local tz tag on disk;
     # DuckDB native .to_parquet would normalize to UTC tag — see
@@ -1154,18 +1304,32 @@ def _(
         .with_columns(pl.col('event_dttm').dt.convert_time_zone(SITE_TZ))
         .write_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
     )
+    (
+        _meta_imvday_kept_rel
+        .pl()
+        .with_columns(
+            pl.col('day_start_dttm').dt.convert_time_zone(SITE_TZ),
+            pl.col('day_end_dttm').dt.convert_time_zone(SITE_TZ),
+        )
+        .write_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvday.parquet")
+    )
 
     # Non-tz outputs: DuckDB native .to_parquet() directly on the relation.
     nmb_excluded_patient_days.to_parquet(f"output/{SITE_NAME}/nmb_excluded.parquet")
     icu_type_df.to_parquet(f"output/{SITE_NAME}/icu_type.parquet")
 
     _n_grids_rows = _grids_kept_rel.count("*").fetchone()[0]
+    _n_meta_imvday_rows = _meta_imvday_kept_rel.count("*").fetchone()[0]
     _n_icu = icu_type_df.count("*").fetchone()[0]
     logger.info(
         f"Saved: output/{SITE_NAME}/cohort_imv_streaks.parquet "
         f"({len(cohort_hosp_ids):,} hospitalizations)"
     )
     logger.info(f"Saved: output/{SITE_NAME}/cohort_hrly_grids.parquet ({_n_grids_rows:,} rows)")
+    logger.info(
+        f"Saved: output/{SITE_NAME}/cohort_meta_by_id_imvday.parquet "
+        f"({_n_meta_imvday_rows:,} hosp×day rows)"
+    )
     logger.info(f"Saved: output/{SITE_NAME}/nmb_excluded.parquet ({_n_nmb_patient_days:,} patient-days)")
     logger.info(f"Saved: output/{SITE_NAME}/icu_type.parquet ({_n_icu:,} hospitalizations)")
 
