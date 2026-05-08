@@ -1054,10 +1054,8 @@ def _():
 @app.cell
 def _(
     CONFIG_PATH,
-    SITE_NAME,
     SITE_TZ,
     cohort_hosp_ids,
-    duckdb,
 ):
     # Imports are `_`-prefixed to keep them cell-local — `localize_naive_to_site_tz`
     # is also imported by an earlier cell, and marimo enforces single
@@ -1080,7 +1078,11 @@ def _(
     hosp_meta_df['discharge_dttm'] = _loc_tz(
         hosp_meta_df['discharge_dttm'], SITE_TZ,
     )
+    return (hosp_meta_df,)
 
+
+@app.cell
+def _(SITE_NAME, hosp_meta_df):
     # Phase 2 fold-ins: pull per-stay covariates from their (renamed)
     # standalone files into the canonical registry. Standalones stay on
     # disk; the canonical *read source* for these columns becomes
@@ -1092,7 +1094,7 @@ def _(
     #                                    pf_1st24h_source, sepsis_ase
     #   - `covariates_cci.parquet`     → cci_score
     #   - `covariates_elix.parquet`    → elix_score
-    cohort_meta_by_id = duckdb.sql(f"""
+    cohort_meta_by_id = mo.sql(f"""
         WITH per_hosp_meta AS (
             -- Aggregate the day-grain registry → per-stay rollups.
             FROM read_parquet('output/{SITE_NAME}/cohort_meta_by_id_imvday.parquet')
@@ -1141,7 +1143,7 @@ def _(
             , imv_last_dttm:  s._end_dttm
             , imv_dur_hrs:    s._duration_hrs
             -- Discharge metadata
-            , h.age_at_admission AS age
+            , age:                h.age_at_admission
             , h.discharge_category
             , h.discharge_dttm
             -- Per-stay fold-ins (Phase 2)
@@ -1181,23 +1183,20 @@ def _(
                 ELSE 'unknown'
             END
         ORDER BY s.hospitalization_id
-    """).df()
-
-    _n = len(cohort_meta_by_id)
-    _n_unknown = int((cohort_meta_by_id['exit_mechanism'] == 'unknown').sum())
-    print(
-        f"cohort_meta_by_id: {_n:,} rows × {cohort_meta_by_id.shape[1]} columns; "
-        f"unknown exit_mechanism count = {_n_unknown:,} (should be 0 in healthy data)"
-    )
+    """)
     return (cohort_meta_by_id,)
 
 
 @app.cell
 def _(SITE_NAME, SITE_TZ, cohort_meta_by_id, retag_to_local_tz):
-    # Persist with site-local tz tags on the boundary timestamps (mirrors
-    # cohort_imv_streaks save convention).
+    # Materialize the lazy registry to pandas at the parquet-write boundary
+    # (per `pyCLIF/docs/duckdb_perf_guide.md §11.4`: tz-tagged outputs route
+    # through pandas/Polars to preserve the site-local tz tag on disk).
+    # Up to this point the registry has stayed lazy through the upstream
+    # mo.sql cell.
+    _df = cohort_meta_by_id.df()
     _df = retag_to_local_tz(
-        cohort_meta_by_id,
+        _df,
         ["imv_first_dttm", "imv_last_dttm", "discharge_dttm"],
         SITE_TZ,
     )

@@ -945,7 +945,6 @@ def _():
 @app.cell
 def _(
     cohort_hrly_grids_f,
-    duckdb,
     encounter_mapping,
     nmb_excluded_patient_days,
 ):
@@ -959,11 +958,11 @@ def _(
     # is correct for those.
     #
     # `encounter_block` propagation: when stitch is ON, `encounter_mapping`
-    # is a pandas df with (hosp_id, encounter_block); when OFF it's None.
-    # We branch the SQL between two single-shot queries so the only objects
-    # referenced from SQL are cross-cell (no underscore prefix) — DuckDB's
-    # replacement scan is cell-scope-aware in marimo script mode and
-    # doesn't see `_`-prefixed cell-local intermediates by name.
+    # is a (hospitalization_id, encounter_block) pandas df; when OFF it's
+    # None. To keep the SQL a single mo.sql call (rather than branching
+    # between two duckdb.sql variants), we synthesize an empty-but-schema-
+    # stable mapping df when stitch is OFF — the LEFT JOIN unifies both
+    # cases and the encounter_block column is NULL on the OFF path.
     #
     # Phase 2 fold-in (2026-05-07): NMB exclusion info from
     # `cohort_nmb_excluded.parquet` is LEFT-JOINed in additively as
@@ -971,8 +970,23 @@ def _(
     # `nmb_total_min` (float — total NMB minutes that day, NULL on
     # non-flagged days). Standalone file stays on disk; canonical read
     # source for the per-day NMB flag becomes the registry.
+    import pandas as _pd
+    if encounter_mapping is None:
+        encounter_map_df = _pd.DataFrame({
+            "hospitalization_id": _pd.Series([], dtype="object"),
+            "encounter_block":    _pd.Series([], dtype="Int64"),
+        })
+    else:
+        encounter_map_df = encounter_mapping
 
-    _common_per_day_cte = """
+    # Materialize the NMB-excluded patient-days as a pandas DataFrame.
+    # DuckDB's replacement scan in marimo script mode reliably resolves
+    # pandas DFs by name; cross-cell DuckDBPyRelation handoffs into a
+    # consumer mo.sql block also resolve, but materializing here keeps
+    # this cell self-contained.
+    nmb_excluded_pd = nmb_excluded_patient_days.df()
+
+    cohort_meta_by_id_imvday = mo.sql(f"""
         WITH per_day AS (
             FROM cohort_hrly_grids_f
             SELECT
@@ -1007,20 +1021,22 @@ def _(
                 , day_start_dttm
                 , day_end_dttm
         )
-    """
-
-    # Materialize the NMB-excluded patient-days as a pandas DataFrame so
-    # DuckDB's replacement scan can find it by name in SQL. (DuckDB's
-    # replacement scan in marimo script mode reliably resolves pandas DFs
-    # but not all cross-cell DuckDBPyRelation handoffs — so eager-render
-    # this one before referencing it in the SQL below.)
-    nmb_excluded_pd = nmb_excluded_patient_days.df()
-
-    # Suffix shared across both branches to attach the NMB fold-in.
-    # After the LEFT JOIN, `nmb_excluded` is TRUE where the row exists in
-    # the flagged-days relation; `nmb_total_min` carries the NMB-minute
-    # count and is NULL on non-flagged days.
-    _nmb_join_suffix = """
+        , joined AS (
+            FROM typed t
+            LEFT JOIN encounter_map_df em USING (hospitalization_id)
+            SELECT
+                t.hospitalization_id
+                , em.encounter_block
+                , t._nth_day
+                , t.day_type
+                , _is_first_day: (t.day_type = 'first_partial')
+                , _is_last_day:  (t.day_type = 'last_partial')
+                , t._is_full_24h_day
+                , t.n_hrs_day
+                , t.n_hrs_night
+                , t.day_start_dttm
+                , t.day_end_dttm
+        )
         FROM joined j
         LEFT JOIN nmb_excluded_pd n USING (hospitalization_id, _nth_day)
         SELECT
@@ -1028,53 +1044,12 @@ def _(
             , nmb_excluded:  (n._nmb_total_min IS NOT NULL)
             , nmb_total_min: n._nmb_total_min
         ORDER BY j.hospitalization_id, j._nth_day
-    """
-
-    if encounter_mapping is None:
-        cohort_meta_by_id_imvday = duckdb.sql(_common_per_day_cte + """
-            , joined AS (
-                FROM typed t
-                SELECT
-                    t.hospitalization_id
-                    , encounter_block: CAST(NULL AS VARCHAR)
-                    , t._nth_day
-                    , t.day_type
-                    , _is_first_day: (t.day_type = 'first_partial')
-                    , _is_last_day:  (t.day_type = 'last_partial')
-                    , t._is_full_24h_day
-                    , t.n_hrs_day
-                    , t.n_hrs_night
-                    , t.day_start_dttm
-                    , t.day_end_dttm
-            )
-        """ + _nmb_join_suffix)
-    else:
-        cohort_meta_by_id_imvday = duckdb.sql(_common_per_day_cte + """
-            , joined AS (
-                FROM typed t
-                LEFT JOIN encounter_mapping em USING (hospitalization_id)
-                SELECT
-                    t.hospitalization_id
-                    , em.encounter_block
-                    , t._nth_day
-                    , t.day_type
-                    , _is_first_day: (t.day_type = 'first_partial')
-                    , _is_last_day:  (t.day_type = 'last_partial')
-                    , t._is_full_24h_day
-                    , t.n_hrs_day
-                    , t.n_hrs_night
-                    , t.day_start_dttm
-                    , t.day_end_dttm
-            )
-        """ + _nmb_join_suffix)
+    """)
 
     _n_rows = cohort_meta_by_id_imvday.count("*").fetchone()[0]
-    _n_hosps = duckdb.sql(
-        "FROM cohort_meta_by_id_imvday SELECT COUNT(DISTINCT hospitalization_id)"
-    ).fetchone()[0]
     logger.info(
-        f"cohort_meta_by_id_imvday: {_n_rows:,} (hosp×day) rows across "
-        f"{_n_hosps:,} hospitalizations (pre-cohort filter)"
+        f"cohort_meta_by_id_imvday: {_n_rows:,} (hosp×day) rows "
+        f"(pre-cohort filter)"
     )
     return (cohort_meta_by_id_imvday,)
 

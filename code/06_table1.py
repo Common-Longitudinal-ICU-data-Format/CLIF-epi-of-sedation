@@ -63,7 +63,7 @@ def _(SITE_NAME, pd):
 
 
 @app.cell
-def _(SITE_NAME, duckdb):
+def _(SITE_NAME):
     # Phase 2 (2026-05-07): `sed_dose_agg.parquet` was deleted as a redundant
     # within-script intermediate of `02_exposure.py`. Its long-format
     # (hosp, day, shift) per-shift dose totals are now derived on-the-fly
@@ -71,7 +71,7 @@ def _(SITE_NAME, duckdb):
     # `*_day_*` / `*_night_*` columns). Same variable name preserved so
     # downstream cells continue to read `sed_dose_agg` from the cross-cell
     # DAG without any join changes.
-    sed_dose_agg = duckdb.sql(f"""
+    sed_dose_agg = mo.sql(f"""
         FROM read_parquet('output/{SITE_NAME}/seddose_by_id_imvday.parquet')
         SELECT hospitalization_id, _nth_day
             , _shift: 'day'
@@ -87,8 +87,7 @@ def _(SITE_NAME, duckdb):
             , fenteq_mcg:  fenteq_night_mcg
             , midazeq_mg:  midazeq_night_mg
             , n_hours:     n_hours_night
-    """).df()
-    print(f"sed_dose_agg (derived from seddose_by_id_imvday): {len(sed_dose_agg)} rows")
+    """)
     return (sed_dose_agg,)
 
 
