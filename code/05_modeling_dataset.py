@@ -85,28 +85,28 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    sbt_outcomes_daily = pd.read_parquet(f"output/{SITE_NAME}/sbt_outcomes_daily.parquet")
+    sbt_outcomes_daily = pd.read_parquet(f"output/{SITE_NAME}/outcomes_by_id_imvday.parquet")
     print(f"sbt_outcomes_daily: {len(sbt_outcomes_daily)} rows")
     return (sbt_outcomes_daily,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
-    sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet")
+    sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
     print(f"sed_dose_daily: {len(sed_dose_daily)} rows")
     return (sed_dose_daily,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
-    covs_daily = pd.read_parquet(f"output/{SITE_NAME}/covariates_daily.parquet")
+    covs_daily = pd.read_parquet(f"output/{SITE_NAME}/covariates_by_id_imvday.parquet")
     print(f"covs_daily: {len(covs_daily)} rows")
     return (covs_daily,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
-    nmb_excluded = pd.read_parquet(f"output/{SITE_NAME}/nmb_excluded.parquet")
+    nmb_excluded = pd.read_parquet(f"output/{SITE_NAME}/cohort_nmb_excluded.parquet")
     print(f"nmb_excluded patient-days: {len(nmb_excluded)}")
     return (nmb_excluded,)
 
@@ -138,12 +138,12 @@ def _(CONFIG_PATH):
 
 @app.cell
 def _(SITE_NAME, pd):
-    sofa_daily = pd.read_parquet(f"output/{SITE_NAME}/sofa_daily.parquet")
-    icu_type_df = pd.read_parquet(f"output/{SITE_NAME}/icu_type.parquet")
-    cci_df = pd.read_parquet(f"output/{SITE_NAME}/cci.parquet")
-    elix_df = pd.read_parquet(f"output/{SITE_NAME}/elix.parquet")
+    sofa_daily = pd.read_parquet(f"output/{SITE_NAME}/sofa_by_id_imvday.parquet")
+    icu_type_df = pd.read_parquet(f"output/{SITE_NAME}/cohort_icu_type.parquet")
+    cci_df = pd.read_parquet(f"output/{SITE_NAME}/covariates_cci.parquet")
+    elix_df = pd.read_parquet(f"output/{SITE_NAME}/covariates_elix.parquet")
     covariates_t1 = pd.read_parquet(f"output/{SITE_NAME}/covariates_t1.parquet")
-    weight_daily = pd.read_parquet(f"output/{SITE_NAME}/weight_daily.parquet")
+    weight_daily = pd.read_parquet(f"output/{SITE_NAME}/weight_by_id_imvday.parquet")
     print(
         f"sofa_daily: {len(sofa_daily)}, icu_type: {len(icu_type_df)}, "
         f"cci: {len(cci_df)}, elix: {len(elix_df)}, "
@@ -235,7 +235,7 @@ def _(
         -- matters when characterizing *exposure* (vs predicting outcomes).
         -- Column-name convention (2026-04-24): every dose column has its unit
         -- encoded as a suffix. `_mg_hr` = per-hour rate in mg; `_mcg_hr` = per-
-        -- hour rate in mcg. Source shift totals in sed_dose_daily.parquet
+        -- hour rate in mcg. Source shift totals in seddose_by_id_imvday.parquet
         -- likewise carry `_mg` / `_mcg` suffixes (total dose over 12-hour shift).
         -- Phase 2: propofol rates are now in mcg/kg/min (was mg/hr).
         -- The shift total `prop_day_mcg_kg` is total mcg/kg over 12h →

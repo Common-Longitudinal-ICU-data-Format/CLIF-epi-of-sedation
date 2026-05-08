@@ -58,7 +58,7 @@ def _():
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
 
-    # All timestamps in this script are tz-aware: cohort_hrly_grids.parquet
+    # All timestamps in this script are tz-aware: cohort_meta_by_id_imvhr.parquet
     # arrives site-tz tagged (per 01_cohort.py's retag_to_local_tz boundary);
     # clifpy-loaded admin/recorded times are UTC tz-aware. Local-hour
     # extraction uses explicit `AT TIME ZONE '{SITE_TZ}'` per query (see
@@ -102,7 +102,7 @@ def _(SITE_NAME, duckdb):
     # carries the correct local tz on disk; downstream SQL still uses
     # AT TIME ZONE for explicit local-hour extraction.
     cohort_hrly_grids_f = duckdb.sql(
-        f"FROM 'output/{SITE_NAME}/cohort_hrly_grids.parquet' SELECT *"
+        f"FROM 'output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet' SELECT *"
     )
     if logger.isEnabledFor(logging.DEBUG):
         _n = cohort_hrly_grids_f.count("*").fetchone()[0]
@@ -454,7 +454,7 @@ def _(SITE_TZ, cohort_hrly_grids_f, cont_sed_w):
     #
     # `_dh`/`_hr` derived from `event_dttm AT TIME ZONE '{SITE_TZ}'` —
     # explicit local-tz extraction, session-tz-independent. `event_dttm` may
-    # arrive as site-tz tagged (from cohort_hrly_grids.parquet, post
+    # arrive as site-tz tagged (from cohort_meta_by_id_imvhr.parquet, post
     # 01_cohort retag) or as UTC tz-aware (from cont_sed_w via clifpy load);
     # DuckDB normalizes both to TIMESTAMPTZ internally and `AT TIME ZONE`
     # operates on the underlying instant, so the result is correct
@@ -914,32 +914,35 @@ def _():
     mo.md(r"""
     ## Save Outputs
 
-    Terminal materialization. `sed_dose_daily` and `sed_dose_agg` write via
-    DuckDB native `.to_parquet()` (no `*_dttm` columns). `sed_dose_by_hr`
-    has `event_dttm` from the cohort grid join — DuckDB's parquet writer
-    normalizes TIMESTAMPTZ to a UTC tag, which would lose our site-local
-    tag on disk, so it routes through Polars (preserves the tz tag via
-    Arrow). See `pyCLIF/docs/duckdb_perf_guide.md §11.4`.
+    Terminal materialization. `sed_dose_daily` writes via DuckDB native
+    `.to_parquet()` (no `*_dttm` columns). `sed_dose_by_hr` has `event_dttm`
+    from the cohort grid join — DuckDB's parquet writer normalizes
+    TIMESTAMPTZ to a UTC tag, which would lose our site-local tag on disk,
+    so it routes through Polars (preserves the tz tag via Arrow). See
+    `pyCLIF/docs/duckdb_perf_guide.md §11.4`.
+
+    Phase 2 (2026-05-07): `sed_dose_agg.parquet` is no longer written.
+    Its per-shift dose totals were already mirrored as separate day/night
+    columns in `seddose_by_id_imvday.parquet`, so the aggregate file was
+    a pure intra-script intermediate with no external readers.
     """)
     return
 
 
 @app.cell
-def _(SITE_NAME, SITE_TZ, sed_dose_agg, sed_dose_by_hr, sed_dose_daily):
+def _(SITE_NAME, SITE_TZ, sed_dose_by_hr, sed_dose_daily):
     import polars as pl  # cell-local — used only for the tz-bearing parquet write
 
-    sed_dose_daily.to_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet")
-    sed_dose_agg.to_parquet(f"output/{SITE_NAME}/sed_dose_agg.parquet")
+    sed_dose_daily.to_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
     (
         sed_dose_by_hr
         .pl()
         .with_columns(pl.col("event_dttm").dt.convert_time_zone(SITE_TZ))
-        .write_parquet(f"output/{SITE_NAME}/sed_dose_by_hr.parquet")
+        .write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
     )
 
-    logger.info(f"Saved: output/{SITE_NAME}/sed_dose_daily.parquet")
-    logger.info(f"Saved: output/{SITE_NAME}/sed_dose_agg.parquet")
-    logger.info(f"Saved: output/{SITE_NAME}/sed_dose_by_hr.parquet")
+    logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvday.parquet")
+    logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
     return
 
 

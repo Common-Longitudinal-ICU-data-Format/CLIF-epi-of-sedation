@@ -119,7 +119,7 @@ df_full = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
 print(f"Modeling dataset: {len(df_full)} rows")
 
 if "extub_event_v2_next_day" not in df_full.columns:
-    daily = pd.read_parquet(f"output/{SITE_NAME}/sbt_outcomes_daily.parquet")
+    daily = pd.read_parquet(f"output/{SITE_NAME}/outcomes_by_id_imvday.parquet")
     daily["_extub_event_v2"] = (
         (daily["_success_extub_v2"] == 1) | (daily["_fail_extub_v2"] == 1)
     ).astype(int)

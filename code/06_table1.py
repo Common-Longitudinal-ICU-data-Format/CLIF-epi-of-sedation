@@ -63,15 +63,38 @@ def _(SITE_NAME, pd):
 
 
 @app.cell
-def _(SITE_NAME, pd):
-    sed_dose_agg = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_agg.parquet")
-    print(f"sed_dose_agg: {len(sed_dose_agg)} rows")
+def _(SITE_NAME, duckdb):
+    # Phase 2 (2026-05-07): `sed_dose_agg.parquet` was deleted as a redundant
+    # within-script intermediate of `02_exposure.py`. Its long-format
+    # (hosp, day, shift) per-shift dose totals are now derived on-the-fly
+    # by UNPIVOTing the wide-form `seddose_by_id_imvday.parquet` (separate
+    # `*_day_*` / `*_night_*` columns). Same variable name preserved so
+    # downstream cells continue to read `sed_dose_agg` from the cross-cell
+    # DAG without any join changes.
+    sed_dose_agg = duckdb.sql(f"""
+        FROM read_parquet('output/{SITE_NAME}/seddose_by_id_imvday.parquet')
+        SELECT hospitalization_id, _nth_day
+            , _shift: 'day'
+            , prop_mcg_kg: prop_day_mcg_kg
+            , fenteq_mcg:  fenteq_day_mcg
+            , midazeq_mg:  midazeq_day_mg
+            , n_hours:     n_hours_day
+        UNION ALL
+        FROM read_parquet('output/{SITE_NAME}/seddose_by_id_imvday.parquet')
+        SELECT hospitalization_id, _nth_day
+            , _shift: 'night'
+            , prop_mcg_kg: prop_night_mcg_kg
+            , fenteq_mcg:  fenteq_night_mcg
+            , midazeq_mg:  midazeq_night_mg
+            , n_hours:     n_hours_night
+    """).df()
+    print(f"sed_dose_agg (derived from seddose_by_id_imvday): {len(sed_dose_agg)} rows")
     return (sed_dose_agg,)
 
 
 @app.cell
 def _(SITE_NAME, pd):
-    covs_shift = pd.read_parquet(f"output/{SITE_NAME}/covariates_shift.parquet")
+    covs_shift = pd.read_parquet(f"output/{SITE_NAME}/covariates_by_id_shift.parquet")
     print(f"covs_shift: {len(covs_shift)} rows")
     return (covs_shift,)
 

@@ -70,7 +70,7 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    resp_processed_path = f"output/{SITE_NAME}/resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
     assert os.path.exists(resp_processed_path), (
         f"Missing {resp_processed_path} — run 01_cohort.py first"
     )
@@ -90,7 +90,7 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    cohort_hrly_grids_f = pd.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
+    cohort_hrly_grids_f = pd.read_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet")
     print(f"cohort_hrly_grids_f: {len(cohort_hrly_grids_f)} rows")
     return (cohort_hrly_grids_f,)
 
@@ -331,7 +331,7 @@ def _():
     **Simplifications from the ABT-RISE reference doc**:
 
     - **Stability gates for `sbt_elig`** use only row-level FiO2 ≤ 0.5 AND
-      PEEP ≤ 8 (both available in `resp_processed_bf.parquet`). The full
+      PEEP ≤ 8 (both available in `cohort_resp_processed_bf.parquet`). The full
       ABT-RISE spec also gates on NEE ≤ 0.2 mcg/kg/min and SpO2 ≥ 88 — those
       are computed at the daily level (`nee_7am`/`nee_7pm`) but not at
       `recorded_dttm` row level in this project. Defer to a follow-up round
@@ -853,7 +853,7 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
 def _(SITE_NAME, SITE_TZ, retag_to_local_tz, sbt_outcomes):
     # Persist the raw row-level table for audit / QC dashboard consumption.
     # Naming convention: this is the second-to-last aggregation tier (before
-    # hourly + daily roll-ups), saved alongside `sbt_outcomes_daily.parquet`.
+    # hourly + daily roll-ups), saved alongside `outcomes_by_id_imvday.parquet`.
     # Retag every *_dttm column to SITE_TZ before writing — DuckDB's .df()
     # stamps TIMESTAMPTZ columns with the session tz, which leaks the
     # runner's OS tz into the on-disk schema. Auto-detect over column
@@ -862,7 +862,7 @@ def _(SITE_NAME, SITE_TZ, retag_to_local_tz, sbt_outcomes):
     _out = sbt_outcomes.df()
     _dttm_cols = [c for c in _out.columns if c.endswith('_dttm')]
     _out = retag_to_local_tz(_out, _dttm_cols, SITE_TZ)
-    _path = f"output/{SITE_NAME}/sbt_outcomes.parquet"
+    _path = f"output/{SITE_NAME}/outcomes_by_event.parquet"
     _out.to_parquet(_path)
     print(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
     return
@@ -887,7 +887,7 @@ def _(SITE_TZ, sbt_outcomes):
         -- `_dh` derived via `event_dttm AT TIME ZONE site_tz` so the result
         -- is naive local — matches cohort_hrly_grids' `_dh` for the LEFT
         -- JOIN below. event_dttm here is UTC tz-aware (sbt_outcomes inherits
-        -- from resp_p; resp_processed_bf.parquet predates the tz reflag in
+        -- from resp_p; cohort_resp_processed_bf.parquet predates the tz reflag in
         -- 01 and stays UTC for waterfall reentry compat). Both sides of the
         -- downstream join must be naive local TIMESTAMP with the same value.
         FROM sbt_outcomes
@@ -1003,7 +1003,7 @@ def _():
 @app.cell
 def _(SITE_NAME, cohort_sbt_outcomes_daily):
     _out = cohort_sbt_outcomes_daily.df()
-    _path = f"output/{SITE_NAME}/sbt_outcomes_daily.parquet"
+    _path = f"output/{SITE_NAME}/outcomes_by_id_imvday.parquet"
     _out.to_parquet(_path)
     print(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
     return

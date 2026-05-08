@@ -1,6 +1,6 @@
 """Distribution of `n_hours_day` and `n_hours_night` across patient-days.
 
-Reads `output/{site}/sed_dose_daily.parquet` (the pre-filter table — the
+Reads `output/{site}/seddose_by_id_imvday.parquet` (the pre-filter table — the
 modeling dataset drops most single-shift days via its
 `sbt_done_next_day IS NOT NULL` filter). Two panels:
 
@@ -53,7 +53,7 @@ def _summary_row(s: pd.Series, label: str) -> dict:
 def main() -> None:
     apply_style()
 
-    sd = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet")
+    sd = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
     ad = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
 
     # Flag kept-vs-dropped from the modeling filter so the plot shows how

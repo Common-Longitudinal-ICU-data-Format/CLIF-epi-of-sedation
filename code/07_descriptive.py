@@ -60,7 +60,7 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
-    sed_dose_by_hr = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_by_hr.parquet")
+    sed_dose_by_hr = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
     print(f"sed_dose_by_hr: {len(sed_dose_by_hr)} rows")
     return (sed_dose_by_hr,)
 
@@ -71,7 +71,7 @@ def _(SITE_NAME, pd):
     # shift totals AND n_hours_day/n_hours_night (added in 02_exposure.py).
     # Used by the "Dose by Shift" cell below for per-patient hourly-rate
     # computation that correctly handles single-shift bias.
-    sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/sed_dose_daily.parquet")
+    sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
     print(f"sed_dose_daily: {len(sed_dose_daily)} rows")
     return (sed_dose_daily,)
 

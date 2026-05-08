@@ -32,7 +32,7 @@ def _():
 
     Computes shift-level and daily covariates: pH, P/F ratio, vasopressors/NEE.
     Reads hourly grids from 01_cohort and resp_processed for FiO2.
-    Writes `output/covariates_shift.parquet` and `output/covariates_daily.parquet`.
+    Writes `output/covariates_by_id_shift.parquet` and `output/covariates_by_id_imvday.parquet`.
     """)
     return
 
@@ -77,7 +77,7 @@ def _(CONFIG_PATH, get_config_or_params):
 
 @app.cell
 def _(SITE_NAME, pd):
-    cohort_hrly_grids = pd.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
+    cohort_hrly_grids = pd.read_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet")
     print(f"Hourly grid rows: {len(cohort_hrly_grids)}")
     return (cohort_hrly_grids,)
 
@@ -98,7 +98,7 @@ def _(cohort_hrly_grids):
 
 @app.cell
 def _(SITE_NAME, pd):
-    resp_processed_path = f"output/{SITE_NAME}/resp_processed_bf.parquet"
+    resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
     resp_p = pd.read_parquet(resp_processed_path)
     print(f"resp_p: {len(resp_p)} rows (from {resp_processed_path})")
     return (resp_p,)
@@ -425,7 +425,7 @@ def _():
 def _(SITE_NAME):
     import polars as pl
 
-    _grids = pl.read_parquet(f"output/{SITE_NAME}/cohort_hrly_grids.parquet")
+    _grids = pl.read_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet")
     sofa_cohort = (
         _grids
         .group_by(['hospitalization_id', '_nth_day'])
@@ -491,7 +491,7 @@ def _(SITE_NAME, sofa_raw):
             "sofa_renal",
         ]
     )
-    _sofa_path = f"output/{SITE_NAME}/sofa_daily.parquet"
+    _sofa_path = f"output/{SITE_NAME}/sofa_by_id_imvday.parquet"
     sofa_daily.to_pandas().to_parquet(_sofa_path)
     print(f"Saved: {_sofa_path} ({sofa_daily.height} patient-days)")
     return
@@ -576,9 +576,9 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids):
     elix_df = calculate_elix(_dx, hierarchy=True)
     print(f"CCI: {len(cci_df)} rows, Elixhauser: {len(elix_df)} rows")
 
-    cci_df.to_parquet(f"output/{SITE_NAME}/cci.parquet", index=False)
-    elix_df.to_parquet(f"output/{SITE_NAME}/elix.parquet", index=False)
-    print(f"Saved: output/{SITE_NAME}/cci.parquet, output/{SITE_NAME}/elix.parquet")
+    cci_df.to_parquet(f"output/{SITE_NAME}/covariates_cci.parquet", index=False)
+    elix_df.to_parquet(f"output/{SITE_NAME}/covariates_elix.parquet", index=False)
+    print(f"Saved: output/{SITE_NAME}/covariates_cci.parquet, output/{SITE_NAME}/covariates_elix.parquet")
     return
 
 
@@ -898,9 +898,9 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
     # Cell G — Sepsis CDC Adult Sepsis Event (ASE) via clifpy (cached).
     # compute_ase independently loads many CLIF tables (Hospitalization, MedAdmin-cont,
     # MedAdmin-intermittent, Labs, MicrobiologyCulture, Adt, RespiratorySupport) and can
-    # take 5–15 minutes for ~thousand hospitalizations. Cached to output/{site}/ase.parquet
+    # take 5–15 minutes for ~thousand hospitalizations. Cached to output/{site}/covariates_ase.parquet
     # and re-used on subsequent notebook runs unless RERUN_ASE flag is True.
-    _ase_path = f"output/{SITE_NAME}/ase.parquet"
+    _ase_path = f"output/{SITE_NAME}/covariates_ase.parquet"
     if (not os.path.exists(_ase_path)) or RERUN_ASE:
         from clifpy.utils import compute_ase
         ase_full = compute_ase(
@@ -1002,12 +1002,12 @@ def _(SITE_NAME, SITE_TZ, covs, covs_daily, retag_to_local_tz):
     # covariates_shift has event_dttm (shift-grain). covariates_daily is a
     # pure aggregate (groups by hospitalization_id, _nth_day) so no retag.
     _covs_shift_df = retag_to_local_tz(_covs_shift_df, ["event_dttm"], SITE_TZ)
-    _covs_shift_path = f"output/{SITE_NAME}/covariates_shift.parquet"
+    _covs_shift_path = f"output/{SITE_NAME}/covariates_by_id_shift.parquet"
     _covs_shift_df.to_parquet(_covs_shift_path)
     print(f"Saved: {_covs_shift_path} ({len(_covs_shift_df)} rows)")
 
     _covs_daily_df = covs_daily.df()
-    _covs_daily_path = f"output/{SITE_NAME}/covariates_daily.parquet"
+    _covs_daily_path = f"output/{SITE_NAME}/covariates_by_id_imvday.parquet"
     _covs_daily_df.to_parquet(_covs_daily_path)
     print(f"Saved: {_covs_daily_path} ({len(_covs_daily_df)} rows)")
     return
@@ -1016,7 +1016,7 @@ def _(SITE_NAME, SITE_TZ, covs, covs_daily, retag_to_local_tz):
 @app.cell
 def _(SITE_NAME, weight_daily):
     _weight_daily_df = weight_daily.df()
-    _weight_path = f"output/{SITE_NAME}/weight_daily.parquet"
+    _weight_path = f"output/{SITE_NAME}/weight_by_id_imvday.parquet"
     _weight_daily_df.to_parquet(_weight_path)
     _n_nonnull = _weight_daily_df["weight_kg_asof_day_start"].notna().sum()
     print(
@@ -1037,7 +1037,7 @@ def _():
     `has_first_partial`, `has_last_partial`), joins in the IMV streak
     boundaries (`imv_first_dttm`, `imv_last_dttm`, `imv_dur_hrs`), and
     derives a mutually-exclusive `exit_mechanism` categorical from the
-    existing per-event flags in `sbt_outcomes_daily.parquet` plus the
+    existing per-event flags in `outcomes_by_id_imvday.parquet` plus the
     discharge_category from CLIF Hospitalization.
 
     Categorization order (first match wins): `tracheostomy` →
@@ -1065,12 +1065,15 @@ def _(
     from clifpy import Hospitalization as _Hospitalization
     from _utils import localize_naive_to_site_tz as _loc_tz
 
-    # Load discharge metadata for the cohort. Naive *_dttm gets tz-localized
-    # to SITE_TZ (clifpy convention: from_file returns naive wall-clock that
-    # is already site-local; we just attach the tz tag).
+    # Load discharge metadata + age for the cohort. Naive *_dttm gets
+    # tz-localized to SITE_TZ (clifpy convention: from_file returns naive
+    # wall-clock that is already site-local; we just attach the tz tag).
     _hosp = _Hospitalization.from_file(
         config_path=CONFIG_PATH,
-        columns=['hospitalization_id', 'discharge_category', 'discharge_dttm'],
+        columns=[
+            'hospitalization_id', 'discharge_category', 'discharge_dttm',
+            'age_at_admission',
+        ],
         filters={'hospitalization_id': cohort_hosp_ids},
     )
     hosp_meta_df = _hosp.df.copy()
@@ -1078,6 +1081,17 @@ def _(
         hosp_meta_df['discharge_dttm'], SITE_TZ,
     )
 
+    # Phase 2 fold-ins: pull per-stay covariates from their (renamed)
+    # standalone files into the canonical registry. Standalones stay on
+    # disk; the canonical *read source* for these columns becomes
+    # `cohort_meta_by_id`. Folded columns:
+    #   - `cohort_icu_type.parquet`    → icu_type
+    #   - `covariates_t1.parquet`      → height_cm, weight_kg, bmi,
+    #                                    sofa_1st24h (+ subscores),
+    #                                    ever_pressor, pf_1st24h_min,
+    #                                    pf_1st24h_source, sepsis_ase
+    #   - `covariates_cci.parquet`     → cci_score
+    #   - `covariates_elix.parquet`    → elix_score
     cohort_meta_by_id = duckdb.sql(f"""
         WITH per_hosp_meta AS (
             -- Aggregate the day-grain registry → per-stay rollups.
@@ -1096,7 +1110,7 @@ def _(
             -- file already replicates these flags onto every row of a hosp,
             -- so MAX is a no-op aggregator (matches the convention used by
             -- 05_modeling_dataset's analytical_dataset assembly).
-            FROM read_parquet('output/{SITE_NAME}/sbt_outcomes_daily.parquet')
+            FROM read_parquet('output/{SITE_NAME}/outcomes_by_id_imvday.parquet')
             SELECT
                 hospitalization_id
                 , ever_extubated:     COALESCE(MAX(_extub_1st),    0)
@@ -1110,16 +1124,45 @@ def _(
         LEFT JOIN per_hosp_meta m USING (hospitalization_id)
         LEFT JOIN per_hosp_outcomes o USING (hospitalization_id)
         LEFT JOIN hosp_meta_df h USING (hospitalization_id)
+        LEFT JOIN read_parquet('output/{SITE_NAME}/cohort_icu_type.parquet') it USING (hospitalization_id)
+        LEFT JOIN read_parquet('output/{SITE_NAME}/covariates_t1.parquet') t1 USING (hospitalization_id)
+        LEFT JOIN read_parquet('output/{SITE_NAME}/covariates_cci.parquet') cci USING (hospitalization_id)
+        LEFT JOIN read_parquet('output/{SITE_NAME}/covariates_elix.parquet') ex USING (hospitalization_id)
         SELECT
             s.hospitalization_id
             , m.encounter_block
+            -- Day-grain rollups
             , m.n_days_total
             , m.n_days_full_24h
             , m.has_first_partial
             , m.has_last_partial
+            -- IMV streak boundaries
             , imv_first_dttm: s._start_dttm
             , imv_last_dttm:  s._end_dttm
             , imv_dur_hrs:    s._duration_hrs
+            -- Discharge metadata
+            , h.age_at_admission AS age
+            , h.discharge_category
+            , h.discharge_dttm
+            -- Per-stay fold-ins (Phase 2)
+            , icu_type:           it.icu_type
+            , height_cm:          t1.height_cm
+            , weight_kg:          t1.weight_kg
+            , bmi:                t1.bmi
+            , sofa_1st24h:        t1.sofa_1st24h
+            , sofa_cv_97_1st24h:  t1.sofa_cv_97_1st24h
+            , sofa_coag_1st24h:   t1.sofa_coag_1st24h
+            , sofa_liver_1st24h:  t1.sofa_liver_1st24h
+            , sofa_resp_1st24h:   t1.sofa_resp_1st24h
+            , sofa_cns_1st24h:    t1.sofa_cns_1st24h
+            , sofa_renal_1st24h:  t1.sofa_renal_1st24h
+            , ever_pressor:       t1.ever_pressor
+            , pf_1st24h_min:      t1.pf_1st24h_min
+            , pf_1st24h_source:   t1.pf_1st24h_source
+            , sepsis_ase:         t1.sepsis_ase
+            , cci_score:          cci.cci_score
+            , elix_score:         ex.elix_score
+            -- Outcome shortcuts + exit_mechanism categorical
             , successful_extubation:    COALESCE(o.ever_success_extub, 0) = 1
             , reintubated_within_window: COALESCE(o.ever_failed_extub, 0) = 1
             -- Mutually-exclusive exit_mechanism. Order matters: trach wins
@@ -1143,7 +1186,7 @@ def _(
     _n = len(cohort_meta_by_id)
     _n_unknown = int((cohort_meta_by_id['exit_mechanism'] == 'unknown').sum())
     print(
-        f"cohort_meta_by_id: {_n:,} rows; "
+        f"cohort_meta_by_id: {_n:,} rows × {cohort_meta_by_id.shape[1]} columns; "
         f"unknown exit_mechanism count = {_n_unknown:,} (should be 0 in healthy data)"
     )
     return (cohort_meta_by_id,)
@@ -1154,7 +1197,9 @@ def _(SITE_NAME, SITE_TZ, cohort_meta_by_id, retag_to_local_tz):
     # Persist with site-local tz tags on the boundary timestamps (mirrors
     # cohort_imv_streaks save convention).
     _df = retag_to_local_tz(
-        cohort_meta_by_id, ["imv_first_dttm", "imv_last_dttm"], SITE_TZ,
+        cohort_meta_by_id,
+        ["imv_first_dttm", "imv_last_dttm", "discharge_dttm"],
+        SITE_TZ,
     )
     _path = f"output/{SITE_NAME}/cohort_meta_by_id.parquet"
     _df.to_parquet(_path, index=False)
