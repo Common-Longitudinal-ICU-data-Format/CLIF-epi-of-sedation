@@ -1107,7 +1107,7 @@ def _(SITE_NAME, hosp_meta_df):
                 , n_days_total:     COUNT(*)
                 , n_days_full_24h:  COUNT(*) FILTER (WHERE _is_full_24h_day)
                 , has_first_partial: BOOL_OR(_is_first_day)
-                , has_last_partial:  BOOL_OR(_is_last_day)
+                , has_last_partial:  BOOL_OR(_is_last_partial_day)
             GROUP BY hospitalization_id
         )
         , per_hosp_outcomes AS (

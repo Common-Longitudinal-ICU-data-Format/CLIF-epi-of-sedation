@@ -1021,16 +1021,35 @@ def _(
                 , day_start_dttm
                 , day_end_dttm
         )
+        -- Compute the `_nth_day` of each patient's last full day in a separate
+        -- CTE because `day_type` was derived in `typed` above; window functions
+        -- can't reference an alias from the same SELECT.
+        , with_last_full AS (
+            FROM typed
+            SELECT *
+                , _max_full_nth: MAX(CASE WHEN day_type = 'full' THEN _nth_day END)
+                                 OVER (PARTITION BY hospitalization_id)
+        )
         , joined AS (
-            FROM typed t
+            FROM with_last_full t
             LEFT JOIN encounter_map_df em USING (hospitalization_id)
             SELECT
                 t.hospitalization_id
                 , em.encounter_block
                 , t._nth_day
                 , t.day_type
+                -- _is_first_day = patient had a partial intubation day AND this
+                -- row is it. Narrow semantic — patients whose IMV starts at 7am
+                -- exactly have NO first_partial row and therefore no row flagged.
                 , _is_first_day: (t.day_type = 'first_partial')
-                , _is_last_day:  (t.day_type = 'last_partial')
+                -- _is_last_partial_day = the truncated extubation day (the row
+                -- removed by analyses that require full 24-h coverage).
+                , _is_last_partial_day:  (t.day_type = 'last_partial')
+                -- _is_last_full_day = the patient's final full-24h day, i.e.
+                -- the last row that survives the modeling-cohort filter. For
+                -- patients with no full days at all, this is False everywhere.
+                , _is_last_full_day: (t.day_type = 'full'
+                                       AND t._nth_day = t._max_full_nth)
                 , t._is_full_24h_day
                 , t.n_hrs_day
                 , t.n_hrs_night

@@ -631,10 +631,20 @@ def _():
     because the outcome filter implicitly drops every partial-shift row
     (where `n_hrs_day == 12 AND n_hrs_night == 12`, the two formulas agree).
 
-    `_is_first_day`, `_is_last_day`, `_is_full_24h_day`, `n_hrs_day`,
-    `n_hrs_night`, `day_type`, `day_start_dttm`, `day_end_dttm`,
-    `encounter_block`, `nmb_excluded`, `nmb_total_min` come from the
-    registry directly — no inline window-function recomputation.
+    `_is_first_day`, `_is_last_partial_day`, `_is_last_full_day`,
+    `_is_full_24h_day`, `n_hrs_day`, `n_hrs_night`, `day_type`,
+    `day_start_dttm`, `day_end_dttm`, `encounter_block`, `nmb_excluded`,
+    `nmb_total_min` come from the registry directly — no inline
+    window-function recomputation.
+
+    Two distinct "last day" semantics are now explicit:
+    - `_is_last_partial_day` = `day_type='last_partial'` (truncated
+      extubation day, removed by analyses requiring full coverage).
+    - `_is_last_full_day` = the patient's final full-24h row (last row
+      that survives the modeling-cohort filter).
+    Legacy `exposure_dataset._is_last_day` (= `_nth_day == max(_nth_day)`
+    per hosp) maps to `_is_last_partial_day OR _is_last_full_day` —
+    Phase 5 consumer migrations pick whichever they actually want.
 
     `_rel_day` is **dropped**. Phase 5 migrates the 3 binning consumers
     (`dose_pattern_6group_count_by_icu_day*`,
@@ -695,7 +705,12 @@ def _(
             , reg.encounter_block
             , reg.day_type
             , reg._is_first_day
-            , reg._is_last_day
+            -- _is_last_partial_day = truncated extubation day (day_type='last_partial').
+            -- _is_last_full_day    = patient's final full-24h row (last row that
+            --                        survives the modeling-cohort filter).
+            -- See registry build cell in 01_cohort.py for full definitions.
+            , reg._is_last_partial_day
+            , reg._is_last_full_day
             , reg._is_full_24h_day
             , reg.n_hrs_day
             , reg.n_hrs_night
