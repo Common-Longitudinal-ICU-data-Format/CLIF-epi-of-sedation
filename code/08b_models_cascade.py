@@ -117,9 +117,17 @@ SPEC_COLORS = {
 }
 
 
-# ── Load modeling dataset and derive extub_event_v2_next_day ───────────
-df_full = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
-logger.info(f"Modeling dataset: {len(df_full)} rows")
+# ── Load modeling cohort and derive extub_event_v2_next_day ────────────
+# Phase 4 cutover (2026-05-08): reads consolidated parquet + applies
+# outcome-modeling filter inline. Byte-equivalent to legacy
+# modeling_dataset.parquet on the surviving cohort.
+_full = pd.read_parquet(f"output/{SITE_NAME}/model_input_by_id_imvday.parquet")
+df_full = _full.loc[
+    (_full["_nth_day"] > 0)
+    & _full["sbt_done_next_day"].notna()
+    & _full["success_extub_next_day"].notna()
+].reset_index(drop=True)
+logger.info(f"Modeling cohort: {len(df_full)} rows")
 
 if "extub_event_v2_next_day" not in df_full.columns:
     daily = pd.read_parquet(f"output/{SITE_NAME}/outcomes_by_id_imvday.parquet")
@@ -325,12 +333,12 @@ forest_rows = []
 _df_scaled_full = _scale_df(df_full)
 PERCENTILE_REF = _percentile_ref(df_full)
 REF_ROW = _build_reference_row(_df_scaled_full)
-logger.info()
+logger.info("")
 logger.info("PERCENTILE_REF (raw clinical units, anchored to full IMV-day distribution):")
 for pred, info in PERCENTILE_REF.items():
     tag = f"  [{info['subset']}]" if info["subset"] == "non-zero" else ""
     logger.info(f"  {pred:<24s}: x10={info['x10_raw']:>+8.3f}, x90={info['x90_raw']:>+8.3f}{tag}")
-logger.info()
+logger.info("")
 
 for stage in STAGES:
     cohort = stage["filter"](df_full)
@@ -384,7 +392,7 @@ for stage in STAGES:
                     })
             except Exception as e:
                 logger.info(f"  FAIL: {spec['label']} / {mt}: {e}")
-    logger.info()
+    logger.info("")
 
 forest_df = pd.DataFrame(forest_rows)
 forest_csv = f"{OUT_DIR}/cascade_forest_data.csv"
@@ -395,7 +403,7 @@ cohort_summary_df = pd.DataFrame(cohort_summaries)
 summary_csv = f"{OUT_DIR}/cascade_cohort_summary.csv"
 cohort_summary_df.to_csv(summary_csv, index=False)
 logger.info(f"Saved {summary_csv}")
-logger.info()
+logger.info("")
 logger.info(cohort_summary_df.to_string(index=False))
 
 
@@ -647,5 +655,5 @@ fig.savefig(diag_path, dpi=200, bbox_inches="tight", facecolor="white")
 plt.close(fig)
 logger.info(f"Saved {diag_path}")
 
-logger.info()
+logger.info("")
 logger.info("Done.")

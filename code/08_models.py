@@ -52,8 +52,18 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    cohort_merged_final = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
-    logger.info(f"Analytical dataset: {len(cohort_merged_final)} rows")
+    # Phase 4 cutover (2026-05-08): read consolidated parquet + apply
+    # outcome-modeling filter inline. Byte-equivalent to the legacy
+    # modeling_dataset.parquet on the surviving cohort. The day-0
+    # sensitivity analysis below flips `>` to `>=` to keep partial
+    # intubation-day rows (no separate parquet needed).
+    _full = pd.read_parquet(f"output/{SITE_NAME}/model_input_by_id_imvday.parquet")
+    cohort_merged_final = _full.loc[
+        (_full["_nth_day"] > 0)
+        & _full["sbt_done_next_day"].notna()
+        & _full["success_extub_next_day"].notna()
+    ].reset_index(drop=True)
+    logger.info(f"Modeling cohort: {len(cohort_merged_final)} rows")
     return (cohort_merged_final,)
 
 

@@ -60,8 +60,16 @@ def _():
 
 @app.cell
 def _(SITE_NAME, pd):
-    analytical_df = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
-    logger.info(f"Modeling dataset: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
+    # Phase 4 cutover (2026-05-08): read consolidated parquet + apply
+    # outcome-modeling filter inline. Byte-equivalent to the legacy
+    # modeling_dataset.parquet on the surviving cohort (verified at both sites).
+    _full = pd.read_parquet(f"output/{SITE_NAME}/model_input_by_id_imvday.parquet")
+    analytical_df = _full.loc[
+        (_full["_nth_day"] > 0)
+        & _full["sbt_done_next_day"].notna()
+        & _full["success_extub_next_day"].notna()
+    ].reset_index(drop=True)
+    logger.info(f"Modeling cohort: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
     return (analytical_df,)
 
 
