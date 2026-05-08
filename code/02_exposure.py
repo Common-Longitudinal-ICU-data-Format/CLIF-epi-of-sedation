@@ -11,7 +11,7 @@
 import marimo
 
 __generated_with = "0.22.5"
-app = marimo.App(width="columns", sql_output="native")
+app = marimo.App(width="full", sql_output="polars")
 
 with app.setup:
     import marimo as mo
@@ -407,6 +407,23 @@ def _(cont_sed_outliered):
 
 
 @app.cell
+def _(cont_sed_outliered):
+    cont_sed_long = mo.sql(
+        f"""
+        FROM cont_sed_outliered
+        SELECT hospitalization_id
+            , admin_dttm AS event_dttm
+            , med_category_unit:
+                med_category || '_'
+                || REPLACE(med_dose_unit, '/', '_')
+                || '_cont'
+            , med_dose: CASE WHEN mar_action_category IN ('stop', 'not_given') THEN 0 ELSE med_dose END
+        """
+    )
+    return
+
+
+@app.cell
 def _():
     # Pivot continuous sedation to wide format. F4 fix: the column-name
     # builder embeds the post-aggregation unit (`_hr_`) directly so the
@@ -424,19 +441,9 @@ def _():
     # stale rates (audit H1).
     cont_sed_w = mo.sql(
         f"""
-        WITH t1 AS (
-        FROM cont_sed_outliered
-        SELECT hospitalization_id
-            , admin_dttm AS event_dttm
-            , med_category_unit:
-                med_category || '_'
-                || REPLACE(REPLACE(med_dose_unit, '/min', ''), '/', '_')
-                || '_hr_cont'
-            , med_dose: CASE WHEN mar_action_category IN ('stop', 'not_given') THEN 0 ELSE med_dose END
-        )
-        PIVOT_WIDER t1
+        PIVOT_WIDER cont_sed_long
         ON med_category_unit
-        USING FIRST(med_dose)
+        USING AVG(med_dose)
         ORDER BY hospitalization_id, event_dttm
         """
     )
@@ -461,6 +468,7 @@ def _(SITE_TZ, cohort_hrly_grids_f, cont_sed_w):
     # regardless of which path supplied the row.
     cont_sed_wg = mo.sql(
         f"""
+        -- after inserting the hourly grid
         WITH grid AS (
             FROM cohort_hrly_grids_f
             SELECT hospitalization_id, event_dttm
@@ -495,18 +503,20 @@ def _():
 
 @app.cell
 def _(cont_sed_wg):
-    # Forward-fill continuous sedation rates and compute duration between events.
-    # `_duration` for the last event of a partition is 0 (LEAD's third arg
-    # falls back to event_dttm itself, yielding zero diff).
     cont_sed_filled = mo.sql(
         f"""
+        -- Forward-fill continuous sedation rates and compute duration between events.
+        -- `_duration` for the last event of a partition is 0 (LEAD's third arg
+        -- falls back to event_dttm itself, yielding zero diff).
         FROM cont_sed_wg g
         SELECT hospitalization_id, event_dttm, _dh, _hr
             , LAST_VALUE(COLUMNS('_cont') IGNORE NULLS) OVER (
                 PARTITION BY hospitalization_id ORDER BY event_dttm
             )
+            -- in mins
             , _duration: EXTRACT(EPOCH FROM (LEAD(event_dttm, 1, event_dttm) OVER w - event_dttm)) / 60.0
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY event_dttm)
+        ORDER BY hospitalization_id, event_dttm
         """
     )
     return (cont_sed_filled,)
@@ -532,7 +542,12 @@ def _(cont_sed_zeroed):
         f"""
         FROM cont_sed_zeroed
         SELECT hospitalization_id, event_dttm, _dh, _hr, _duration
-            , COLUMNS('_cont') * _duration
+            -- now the actual units are mcg, mg, or mcg/kg
+            , fentanyl_mcg_cont: fentanyl_mcg_min_cont * _duration
+            , hydromorphone_mg_cont: hydromorphone_mg_min_cont * _duration
+            , lorazepam_mg_cont: lorazepam_mg_min_cont * _duration
+            , midazolam_mg_cont: midazolam_mg_min_cont * _duration
+            , propofol_mcg_kg_cont: propofol_mcg_kg_min_cont * _duration
         """
     )
     return (cont_sed_per_event,)
@@ -551,17 +566,12 @@ def _(cont_sed_per_event):
         FROM cont_sed_per_event
         SELECT hospitalization_id, _dh, _hr
             , SUM(COLUMNS('_cont'))
+            , _duration_within_hr: SUM(_duration)
         GROUP BY hospitalization_id, _dh, _hr
         ORDER BY hospitalization_id, _dh
         """
     )
     return (cont_sed_dose_by_hr,)
-
-
-@app.cell
-def _(cont_sed_dose_by_hr):
-    cont_sed_dose_by_hr
-    return
 
 
 @app.cell(hide_code=True)
@@ -591,7 +601,7 @@ def _(cohort_hosp_ids, duckdb, load_data):
             # 'mar_action_category': ['given', 'bolus', 'other'],
         }
     )
-    intm_sed_rel = duckdb.sql("FROM intm_sed_rel WHERE med_dose IS NOT NULL")
+    intm_sed_rel = duckdb.sql("FROM intm_sed_rel WHERE med_dose IS NOT NULL AND mar_action_category != 'not_given'")
     if logger.isEnabledFor(logging.DEBUG):
         _n = intm_sed_rel.count("*").fetchone()[0]
         logger.debug(f"Intermittent sedation: {_n:,} non-null-dose rows")
@@ -705,12 +715,6 @@ def _(apply_outlier_handling_duckdb, intm_sed_renamed):
         logger.debug(f"intm_sed post-outlier: {_n:,} rows")
     else:
         logger.info("intm_sed post-outlier: lazy relation built")
-    return (intm_sed_outliered,)
-
-
-@app.cell
-def _(intm_sed_outliered):
-    intm_sed_outliered
     return
 
 
@@ -730,22 +734,16 @@ def _():
             , med_category_unit:
                 med_category || '_'
                 || REPLACE(med_dose_unit, '/', '_')
-                || '_hr_intm'
+                || '_intm'
             , med_dose: CASE WHEN mar_action_category = 'not_given' THEN 0 ELSE med_dose END
         )
         PIVOT_WIDER t1
         ON med_category_unit
-        USING FIRST(med_dose)
+        USING AVG(med_dose)
         ORDER BY hospitalization_id, event_dttm
         """
     )
     return (intm_sed_w,)
-
-
-@app.cell
-def _(intm_sed_w):
-    intm_sed_w.df()
-    return
 
 
 @app.cell
@@ -813,10 +811,10 @@ def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
         )
         FROM t1
         SELECT *
-            , fentanyl_mcg_total: fentanyl_mcg_hr_intm + fentanyl_mcg_hr_cont
-            , hydromorphone_mg_total: hydromorphone_mg_hr_intm + hydromorphone_mg_hr_cont
-            , lorazepam_mg_total: lorazepam_mg_hr_intm + lorazepam_mg_hr_cont
-            , midazolam_mg_total: midazolam_mg_hr_intm + midazolam_mg_hr_cont
+            , fentanyl_mcg_total: fentanyl_mcg_intm + fentanyl_mcg_cont
+            , hydromorphone_mg_total: hydromorphone_mg_intm + hydromorphone_mg_cont
+            , lorazepam_mg_total: lorazepam_mg_intm + lorazepam_mg_cont
+            , midazolam_mg_total: midazolam_mg_intm + midazolam_mg_cont
             -- Phase 2: propofol is now in mcg/kg/hr (continuous-only). The
             -- intermittent propofol path (`propofol_mg_hr_intm`) is bolus
             -- mg/dose with no defined duration, so converting to mcg/kg/min
@@ -824,9 +822,20 @@ def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
             -- compared to continuous pump infusion, which dominates the
             -- exposure signal. We track intm propofol separately (still as
             -- mg/hr) but exclude it from the rate-based descriptive.
-            , prop_mcg_kg_total: propofol_mcg_kg_hr_cont
-            , _midazeq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
-            , _fenteq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
+            -- TODO: we need to add propofol_mcg_kg_intm soon
+            , prop_mcg_kg_total: propofol_mcg_kg_cont
+            , midazeq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
+            , fenteq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
+
+            -- convert back to rate including both cont and intm
+            , prop_mcg_kg_min_avg: prop_mcg_kg_total / 60
+            , fenteq_mcg_hr_avg: fenteq_mcg_total
+            , midazeq_mg_hr_avg: midazeq_mg_total
+
+            -- convert back to rate including only cont
+            , prop_mcg_kg_min_cont: propofol_mcg_kg_cont / 60
+            , fenteq_mcg_hr_cont: hydromorphone_mg_cont * 50 + fentanyl_mcg_cont
+            , midazeq_mg_hr_cont: lorazepam_mg_cont * 2 + midazolam_mg_cont
         ORDER BY hospitalization_id, _dh
         """
     )
@@ -863,8 +872,8 @@ def _(sed_dose_by_hr):
             -- (continuous infusion only). Downstream 05 divides by hours
             -- and minutes to produce the per-min rate `_prop_day_mcg_kg_min`.
             , prop_mcg_kg: SUM(prop_mcg_kg_total)
-            , fenteq_mcg:  SUM(_fenteq_mcg_total)
-            , midazeq_mg:  SUM(_midazeq_mg_total)
+            , fenteq_mcg:  SUM(fenteq_mcg_total)
+            , midazeq_mg:  SUM(midazeq_mg_total)
             , n_hours:     COUNT(*)
         GROUP BY hospitalization_id, _nth_day, _shift
         ORDER BY hospitalization_id, _nth_day, _shift
@@ -901,12 +910,6 @@ def _(sed_dose_agg):
         """
     )
     return (sed_dose_daily,)
-
-
-@app.cell
-def _(sed_dose_daily):
-    sed_dose_daily
-    return
 
 
 @app.cell(hide_code=True)
