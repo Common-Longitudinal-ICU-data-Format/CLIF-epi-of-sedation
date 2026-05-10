@@ -40,7 +40,7 @@ def _():
 @app.cell
 def _():
     from clifpy.utils.config import get_config_or_params
-    from _utils import localize_naive_to_site_tz, retag_to_local_tz
+    from _utils import to_utc
     import pandas as pd
     import duckdb
 
@@ -50,7 +50,7 @@ def _():
     CONFIG_PATH = "config/config.json"
 
     os.makedirs("output", exist_ok=True)
-    return CONFIG_PATH, get_config_or_params, localize_naive_to_site_tz, pd, retag_to_local_tz
+    return CONFIG_PATH, get_config_or_params, pd, to_utc
 
 
 @app.cell
@@ -133,20 +133,20 @@ def _(CONFIG_PATH):
 
 
 @app.cell
-def _(SITE_TZ, hosp, localize_naive_to_site_tz):
+def _(SITE_TZ, hosp, to_utc):
     hosp_df = hosp.df[['hospitalization_id', 'discharge_category', 'discharge_dttm']].copy()
-    # clifpy's `from_file` returns discharge_dttm NAIVE but already in the
-    # config's site tz; attach the tag so downstream DuckDB joins see
-    # TIMESTAMPTZ and the on-disk tag survives the parquet round-trip.
-    # localize_naive_to_site_tz handles DST fall-back ambiguity (UCMC has
-    # admits/discharges falling on 01:00-02:00 of fall-back days).
-    hosp_df['discharge_dttm'] = localize_naive_to_site_tz(hosp_df['discharge_dttm'], SITE_TZ)
+    # clifpy's `from_file` returns discharge_dttm NAIVE site-local; to_utc
+    # localizes to SITE_TZ then converts to UTC so downstream DuckDB joins
+    # see TIMESTAMPTZ and the on-disk tag survives the parquet round-trip.
+    # to_utc handles DST fall-back ambiguity (UCMC has admits/discharges
+    # falling on 01:00-02:00 of fall-back days).
+    hosp_df = to_utc(hosp_df, 'discharge_dttm', naive_means=SITE_TZ)
     logger.info(f"hosp_df: {len(hosp_df)} rows")
     return (hosp_df,)
 
 
 @app.cell
-def _(CONFIG_PATH, SITE_TZ, hosp, localize_naive_to_site_tz):
+def _(CONFIG_PATH, SITE_TZ, hosp, to_utc):
     cs = CodeStatus.from_file(
         config_path=CONFIG_PATH,
         columns=['patient_id', 'code_status_category', 'start_dttm'],
@@ -157,7 +157,7 @@ def _(CONFIG_PATH, SITE_TZ, hosp, localize_naive_to_site_tz):
     cs_df = cs.df.merge(_pid_to_hid, on='patient_id', how='inner')
     cs_df = cs_df[['hospitalization_id', 'code_status_category', 'start_dttm']].copy()
     # Same clifpy convention: start_dttm is naive site-local on load.
-    cs_df['start_dttm'] = localize_naive_to_site_tz(cs_df['start_dttm'], SITE_TZ)
+    cs_df = to_utc(cs_df, 'start_dttm', naive_means=SITE_TZ)
     cs_df = cs_df.sort_values(['hospitalization_id', 'start_dttm']).reset_index(drop=True)
     logger.info(f"cs_df: {len(cs_df)} rows (mapped to hospitalization_id)")
     return (cs_df,)
@@ -861,18 +861,18 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
 
 
 @app.cell
-def _(SITE_NAME, SITE_TZ, retag_to_local_tz, sbt_outcomes):
+def _(SITE_NAME, sbt_outcomes, to_utc):
     # Persist the raw row-level table for audit / QC dashboard consumption.
     # Naming convention: this is the second-to-last aggregation tier (before
     # hourly + daily roll-ups), saved alongside `outcomes_by_id_imvday.parquet`.
-    # Retag every *_dttm column to SITE_TZ before writing — DuckDB's .df()
+    # Retag every *_dttm column to UTC before writing — DuckDB's .df()
     # stamps TIMESTAMPTZ columns with the session tz, which leaks the
     # runner's OS tz into the on-disk schema. Auto-detect over column
     # suffix so derived/renamed *_dttm columns (event_dttm, cs_start_dttm,
     # discharge_dttm, _imv_streak_start_dttm, etc.) all get normalized.
     _out = sbt_outcomes.df()
     _dttm_cols = [c for c in _out.columns if c.endswith('_dttm')]
-    _out = retag_to_local_tz(_out, _dttm_cols, SITE_TZ)
+    _out = to_utc(_out, _dttm_cols)
     _path = f"output/{SITE_NAME}/outcomes_by_event.parquet"
     _out.to_parquet(_path)
     logger.info(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")

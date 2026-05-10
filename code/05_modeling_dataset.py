@@ -57,10 +57,12 @@ def _():
       apply `_nth_day >= 0 AND <outcome filters>` at read time — a
       2-character switch (`>` → `>=`) on the modeling filter.
 
-    Rate convention: hour-normalized via `NULLIF(n_hrs_*, 0)`. Verified
-    byte-equivalent to the legacy `/12.0` divisor on the modeling
-    cohort because partial-shift rows are filtered out anyway (so
-    `n_hrs_day == n_hrs_night == 12` always).
+    Rate convention: dose columns arrive from `seddose_by_id_imvday.parquet`
+    as per-shift avg rates (computed upstream as `AVG(hourly_rate)` over
+    the shift's hours in `02_exposure.py`'s `sed_dose_agg`/`seddose_by_id_imvday`
+    cells). No /n_hrs/60 arithmetic is needed at this layer — we just
+    rename the columns onto the modeling-cohort namespace. `n_hrs_day` /
+    `n_hrs_night` flow through as coverage metadata only.
 
     Hospitalization-level NMB exclusion is applied during the
     consolidated cell below.
@@ -77,7 +79,7 @@ def _():
 def _():
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
-    from _utils import retag_to_local_tz
+    from _utils import to_utc
     import pandas as pd
     import duckdb
 
@@ -90,7 +92,7 @@ def _():
     # MultipleDefinitionError.
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
-    return CONFIG_PATH, SITE_NAME, SITE_TZ, apply_outlier_handling, pd, retag_to_local_tz
+    return CONFIG_PATH, SITE_NAME, SITE_TZ, apply_outlier_handling, pd, to_utc
 
 
 @app.cell(hide_code=True)
@@ -110,9 +112,9 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
-    sed_dose_daily = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
-    logger.info(f"sed_dose_daily: {len(sed_dose_daily)} rows")
-    return (sed_dose_daily,)
+    seddose_by_id_imvday = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
+    logger.info(f"seddose_by_id_imvday: {len(seddose_by_id_imvday)} rows")
+    return (seddose_by_id_imvday,)
 
 
 @app.cell
@@ -191,10 +193,11 @@ def _():
       `WHERE _nth_day >= 0 AND <outcome filters>` — a 2-character switch
       (`>` → `>=`) on the modeling filter.
 
-    Rate convention: hour-normalized via `NULLIF(n_hrs_*, 0)` (the exposure
-    style). Verified equivalent to legacy `/12.0` on the modeling cohort
-    because the outcome filter implicitly drops every partial-shift row
-    (where `n_hrs_day == 12 AND n_hrs_night == 12`, the two formulas agree).
+    Rate convention: dose columns are already per-shift avg rates upstream
+    (Phase-3 refactor 2026-05-08 — `02_exposure.py:seddose_by_id_imvday` now
+    pivots AVG-of-hourly-rates per shift; `n_hrs_day`/`n_hrs_night` carry
+    only as coverage metadata). This SELECT is a pure rename onto the
+    modeling-cohort namespace.
 
     `_is_first_day`, `_is_last_partial_day`, `_is_last_full_day`,
     `_is_full_24h_day`, `n_hrs_day`, `n_hrs_night`, `day_type`,
@@ -230,7 +233,7 @@ def _(
     icu_type_df,
     patient_df,
     sbt_outcomes_daily,
-    sed_dose_daily,
+    seddose_by_id_imvday,
     sofa_daily,
     weight_daily,
 ):
@@ -246,7 +249,7 @@ def _(
         -- modeling cohort because partial-shift rows are filtered out).
         FROM read_parquet('output/{SITE_NAME}/cohort_meta_by_id_imvday.parquet') reg
         LEFT JOIN sbt_outcomes_daily o USING (hospitalization_id, _nth_day)
-        LEFT JOIN sed_dose_daily s USING (hospitalization_id, _nth_day)
+        LEFT JOIN seddose_by_id_imvday s USING (hospitalization_id, _nth_day)
         LEFT JOIN covs_daily c USING (hospitalization_id, _nth_day)
         LEFT JOIN hosp_df h USING (hospitalization_id)
         LEFT JOIN patient_df p USING (patient_id)
@@ -309,51 +312,39 @@ def _(
             , sbt_done_v2_next_day: LEAD(o.sbt_done_v2) OVER w
             , _success_extub_v2_today: o._success_extub_v2
             , success_extub_v2_next_day: LEAD(o._success_extub_v2) OVER w
-            -- Hour-normalized rates (NULLIF on n_hrs_* yields NULL on zero-
-            -- hour shifts; for full 12+12 days this == /12.0 exactly).
-            , _prop_day_mcg_kg_min:
-                COALESCE(s.prop_day_mcg_kg, 0) / NULLIF(reg.n_hrs_day, 0) / 60.0
-            , _prop_night_mcg_kg_min:
-                COALESCE(s.prop_night_mcg_kg, 0) / NULLIF(reg.n_hrs_night, 0) / 60.0
-            , _fenteq_day_mcg_hr:
-                COALESCE(s.fenteq_day_mcg, 0) / NULLIF(reg.n_hrs_day, 0)
-            , _fenteq_night_mcg_hr:
-                COALESCE(s.fenteq_night_mcg, 0) / NULLIF(reg.n_hrs_night, 0)
-            , _midazeq_day_mg_hr:
-                COALESCE(s.midazeq_day_mg, 0) / NULLIF(reg.n_hrs_day, 0)
-            , _midazeq_night_mg_hr:
-                COALESCE(s.midazeq_night_mg, 0) / NULLIF(reg.n_hrs_night, 0)
-            -- Hurdle-binary flags (any 24h exposure to this drug)
-            , _prop_any:   CAST(COALESCE(s.prop_day_mcg_kg, 0) > 0
-                                 OR COALESCE(s.prop_night_mcg_kg, 0) > 0 AS INTEGER)
-            , _fenteq_any: CAST(COALESCE(s.fenteq_day_mcg, 0) > 0
-                                 OR COALESCE(s.fenteq_night_mcg, 0) > 0 AS INTEGER)
-            , _midazeq_any: CAST(COALESCE(s.midazeq_day_mg, 0) > 0
-                                  OR COALESCE(s.midazeq_night_mg, 0) > 0 AS INTEGER)
-            -- Day-night rate differences
+            -- Per-shift avg rates (already per-shift averages upstream;
+            -- COALESCE handles the rare LEFT-JOIN-miss case). Both `_cont`
+            -- (continuous-only) and `_total` (cont + intm) variants are
+            -- exposed so model specs can choose analytical scope.
+            , _prop_day_mcg_kg_min_cont:    COALESCE(s.prop_day_mcg_kg_min_cont, 0)
+            , _prop_night_mcg_kg_min_cont:  COALESCE(s.prop_night_mcg_kg_min_cont, 0)
+            , _prop_day_mcg_kg_min_total:   COALESCE(s.prop_day_mcg_kg_min_total, 0)
+            , _prop_night_mcg_kg_min_total: COALESCE(s.prop_night_mcg_kg_min_total, 0)
+            , _fenteq_day_mcg_hr_cont:      COALESCE(s.fenteq_day_mcg_hr_cont, 0)
+            , _fenteq_night_mcg_hr_cont:    COALESCE(s.fenteq_night_mcg_hr_cont, 0)
+            , _fenteq_day_mcg_hr_total:     COALESCE(s.fenteq_day_mcg_hr_total, 0)
+            , _fenteq_night_mcg_hr_total:   COALESCE(s.fenteq_night_mcg_hr_total, 0)
+            , _midazeq_day_mg_hr_cont:      COALESCE(s.midazeq_day_mg_hr_cont, 0)
+            , _midazeq_night_mg_hr_cont:    COALESCE(s.midazeq_night_mg_hr_cont, 0)
+            , _midazeq_day_mg_hr_total:     COALESCE(s.midazeq_day_mg_hr_total, 0)
+            , _midazeq_night_mg_hr_total:   COALESCE(s.midazeq_night_mg_hr_total, 0)
+            -- Hurdle-binary flags (any 24h exposure on the total scope)
+            , _prop_any:   CAST(COALESCE(s.prop_day_mcg_kg_min_total, 0) > 0
+                                 OR COALESCE(s.prop_night_mcg_kg_min_total, 0) > 0 AS INTEGER)
+            , _fenteq_any: CAST(COALESCE(s.fenteq_day_mcg_hr_total, 0) > 0
+                                 OR COALESCE(s.fenteq_night_mcg_hr_total, 0) > 0 AS INTEGER)
+            , _midazeq_any: CAST(COALESCE(s.midazeq_day_mg_hr_total, 0) > 0
+                                  OR COALESCE(s.midazeq_night_mg_hr_total, 0) > 0 AS INTEGER)
+            -- Day-night rate differences (night − day) on the total scope.
             , prop_dif_mcg_kg_min:
-                (COALESCE(s.prop_night_mcg_kg, 0) / NULLIF(reg.n_hrs_night, 0) / 60.0)
-                - (COALESCE(s.prop_day_mcg_kg, 0) / NULLIF(reg.n_hrs_day, 0) / 60.0)
+                COALESCE(s.prop_night_mcg_kg_min_total, 0)
+                - COALESCE(s.prop_day_mcg_kg_min_total, 0)
             , fenteq_dif_mcg_hr:
-                (COALESCE(s.fenteq_night_mcg, 0) / NULLIF(reg.n_hrs_night, 0))
-                - (COALESCE(s.fenteq_day_mcg, 0) / NULLIF(reg.n_hrs_day, 0))
+                COALESCE(s.fenteq_night_mcg_hr_total, 0)
+                - COALESCE(s.fenteq_day_mcg_hr_total, 0)
             , midazeq_dif_mg_hr:
-                (COALESCE(s.midazeq_night_mg, 0) / NULLIF(reg.n_hrs_night, 0))
-                - (COALESCE(s.midazeq_day_mg, 0) / NULLIF(reg.n_hrs_day, 0))
-            -- Absolute totals (per-shift over actual coverage hours; useful
-            -- for absolute-amount sensitivity SAs).
-            , _prop_day_mcg_kg:   COALESCE(s.prop_day_mcg_kg, 0)
-            , _prop_night_mcg_kg: COALESCE(s.prop_night_mcg_kg, 0)
-            , _fenteq_day_mcg:    COALESCE(s.fenteq_day_mcg, 0)
-            , _fenteq_night_mcg:  COALESCE(s.fenteq_night_mcg, 0)
-            , _midazeq_day_mg:    COALESCE(s.midazeq_day_mg, 0)
-            , _midazeq_night_mg:  COALESCE(s.midazeq_night_mg, 0)
-            , prop_dif_mcg_kg:
-                COALESCE(s.prop_night_mcg_kg, 0) - COALESCE(s.prop_day_mcg_kg, 0)
-            , fenteq_dif_mcg:
-                COALESCE(s.fenteq_night_mcg, 0) - COALESCE(s.fenteq_day_mcg, 0)
-            , midazeq_dif_mg:
-                COALESCE(s.midazeq_night_mg, 0) - COALESCE(s.midazeq_day_mg, 0)
+                COALESCE(s.midazeq_night_mg_hr_total, 0)
+                - COALESCE(s.midazeq_day_mg_hr_total, 0)
             -- Per-day covariate columns (7am/7pm vital snapshots etc.)
             , COLUMNS('(7am)|(7pm)')
             -- Per-stay rollups
@@ -404,9 +395,9 @@ def _(model_input_relation, nmb_excluded):
 
 
 @app.cell
-def _(SITE_NAME, SITE_TZ, model_input_filtered, retag_to_local_tz):
+def _(SITE_NAME, model_input_filtered, to_utc):
     _df = model_input_filtered.df()
-    _df = retag_to_local_tz(_df, ["_first_icu_dttm"], SITE_TZ)
+    _df = to_utc(_df, ["_first_icu_dttm"])
     _path = f"output/{SITE_NAME}/model_input_by_id_imvday.parquet"
     _df.to_parquet(_path, index=False)
     _n_full = int(_df['_is_full_24h_day'].sum())

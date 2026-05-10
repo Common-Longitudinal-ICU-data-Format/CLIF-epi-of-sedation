@@ -24,12 +24,12 @@ with app.setup:
     RERUN_WATERFALL = False
     # Hoisted into setup so any cell can call them without re-importing
     # (marimo flags duplicate top-level imports across cells as
-    # cross-cell shadowing). retag_to_local_tz is metadata-only tz_convert
-    # at parquet boundaries; add_day_shift_id is the SQL-based local-hour
-    # derivation (tested in tests/test_timezone.py); plot_consort and
-    # consort_to_markdown render the CONSORT artifacts.
+    # cross-cell shadowing). to_utc is the canonical tz-normalization helper
+    # used at every parquet-write boundary; add_day_shift_id is the
+    # SQL-based local-hour derivation (tested in tests/test_timezone.py);
+    # plot_consort and consort_to_markdown render the CONSORT artifacts.
     from _utils import (
-        retag_to_local_tz,
+        to_utc,
         add_day_shift_id,
         plot_consort,
         consort_to_markdown,
@@ -491,14 +491,11 @@ def _(
             data=_resp_rel.df(),
         )
         cohort_resp_p = cohort_resp.waterfall(bfill=True)
-        # Re-tag UTC tz-aware recorded_dttm → site-local tz-aware before
-        # persisting. Pre-waterfall data must stay UTC (waterfall reentry
-        # compat); the retag at the parquet-write boundary is the project
-        # convention for `output/{site}/*.parquet`. See _utils.py for the
-        # helper and tests/test_timezone.py for invariants.
-        cohort_resp_p.df = retag_to_local_tz(
-            cohort_resp_p.df, ["recorded_dttm"], SITE_TZ
-        )
+        # Re-tag recorded_dttm to UTC display tag at the parquet-write
+        # boundary (project convention: every *_dttm column on disk is
+        # UTC tz-aware — see docs/timezone_audit.md). Same UTC instants;
+        # tz_convert is metadata-only.
+        cohort_resp_p.df = to_utc(cohort_resp_p.df, ["recorded_dttm"])
         cohort_resp_p.df.to_parquet(resp_processed_path)
         resp_p = cohort_resp_p.df
     else:
@@ -1315,30 +1312,31 @@ def _(
         WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
     """)
 
-    # Tz-tagged outputs via Polars (preserves site-local tz tag on disk;
-    # DuckDB native .to_parquet would normalize to UTC tag — see
-    # duckdb_perf_guide.md §11.4).
+    # UTC-on-disk: every *_dttm column is written as UTC tz-aware
+    # (see docs/timezone_audit.md). tz_convert is metadata-only — same
+    # UTC instants, just the display tag is UTC. Polars `write_parquet`
+    # round-trips the tag through Arrow.
     (
         _streaks_kept_rel
         .pl()
         .with_columns(
-            pl.col('_start_dttm').dt.convert_time_zone(SITE_TZ),
-            pl.col('_end_dttm').dt.convert_time_zone(SITE_TZ),
+            pl.col('_start_dttm').dt.convert_time_zone("UTC"),
+            pl.col('_end_dttm').dt.convert_time_zone("UTC"),
         )
         .write_parquet(f"output/{SITE_NAME}/cohort_imv_streaks.parquet")
     )
     (
         _grids_kept_rel
         .pl()
-        .with_columns(pl.col('event_dttm').dt.convert_time_zone(SITE_TZ))
+        .with_columns(pl.col('event_dttm').dt.convert_time_zone("UTC"))
         .write_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet")
     )
     (
         _meta_imvday_kept_rel
         .pl()
         .with_columns(
-            pl.col('day_start_dttm').dt.convert_time_zone(SITE_TZ),
-            pl.col('day_end_dttm').dt.convert_time_zone(SITE_TZ),
+            pl.col('day_start_dttm').dt.convert_time_zone("UTC"),
+            pl.col('day_end_dttm').dt.convert_time_zone("UTC"),
         )
         .write_parquet(f"output/{SITE_NAME}/cohort_meta_by_id_imvday.parquet")
     )

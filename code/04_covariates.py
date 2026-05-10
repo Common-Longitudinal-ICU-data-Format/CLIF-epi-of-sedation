@@ -48,7 +48,7 @@ def _():
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
-    from _utils import remove_meds_duplicates, retag_to_local_tz
+    from _utils import remove_meds_duplicates, to_utc
 
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
@@ -63,7 +63,7 @@ def _():
         get_config_or_params,
         pd,
         remove_meds_duplicates,
-        retag_to_local_tz,
+        to_utc,
     )
 
 
@@ -602,7 +602,7 @@ def _():
 
 
 @app.cell
-def _(CONFIG_PATH, SITE_TZ, cohort_hosp_ids, duckdb):
+def _(CONFIG_PATH, SITE_TZ, cohort_hosp_ids, duckdb, to_utc):
     # Cell A — first ICU admit dttm per cohort hospitalization.
     # NOTE: For patients intubated in ED/OR then transferred to ICU,
     # this 24 h window starts AFTER intubation. Per user spec (first 24 h of ICU admit).
@@ -619,15 +619,12 @@ def _(CONFIG_PATH, SITE_TZ, cohort_hosp_ids, duckdb):
     adt_icu_df = _adt_icu.df
     # clifpy's `from_file` loaders return *_dttm columns NAIVE but with
     # wall-clock already in the config's site tz (per loader log line
-    # "Timezone: <site_tz>"). Attach the tz tag now via tz_localize —
-    # this is a metadata claim ("this naive wall-clock IS site-local"),
-    # NOT a tz_convert (which would relabel a UTC instant). The downstream
-    # DuckDB SQL then sees TIMESTAMPTZ and propagates the tz through
-    # MIN() into _first_icu_dttm / _first_icu_24h_end.
-    # localize_naive_to_site_tz handles DST fall-back ambiguity (UCMC has
-    # ICU admits at 01:00-02:00 on fall-back Sundays in 2019 / 2021).
-    from _utils import localize_naive_to_site_tz
-    adt_icu_df['in_dttm'] = localize_naive_to_site_tz(adt_icu_df['in_dttm'], SITE_TZ)
+    # "Timezone: <site_tz>"). to_utc with naive_means=SITE_TZ localizes
+    # the naive wall-clock as site-local then converts the metadata tag
+    # to UTC, so downstream DuckDB SQL sees a TIMESTAMPTZ tagged UTC.
+    # to_utc handles DST fall-back ambiguity (UCMC has ICU admits at
+    # 01:00-02:00 on fall-back Sundays in 2019 / 2021).
+    adt_icu_df = to_utc(adt_icu_df, 'in_dttm', naive_means=SITE_TZ)
 
     first_icu_admit = duckdb.sql("""
         FROM adt_icu_df
@@ -897,7 +894,7 @@ def _(SITE_NAME, pd):
 
 
 @app.cell
-def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
+def _(CONFIG_PATH, SITE_NAME, SITE_TZ, cohort_hosp_ids, duckdb, pd, to_utc):
     # Cell G — Sepsis CDC Adult Sepsis Event (ASE) via clifpy (cached).
     # compute_ase independently loads many CLIF tables (Hospitalization, MedAdmin-cont,
     # MedAdmin-intermittent, Labs, MicrobiologyCulture, Adt, RespiratorySupport) and can
@@ -914,6 +911,15 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
             include_lactate=False,  # CDC strict definition (matches function default)
             verbose=True,
         )
+        # clifpy emits *_dttm columns as a mix of naive site-local and tz-aware
+        # site-local depending on the upstream table; auto-detect and route both
+        # cases through to_utc for on-disk consistency.
+        _ase_dttm_cols = [
+            c for c in ase_full.columns
+            if c.endswith('_dttm') and pd.api.types.is_datetime64_any_dtype(ase_full[c])
+        ]
+        if _ase_dttm_cols:
+            ase_full = to_utc(ase_full, _ase_dttm_cols, naive_means=SITE_TZ)
         ase_full.to_parquet(_ase_path, index=False)
         logger.info(f"Computed + saved {_ase_path} ({len(ase_full)} rows)")
     else:
@@ -936,7 +942,6 @@ def _(CONFIG_PATH, SITE_NAME, cohort_hosp_ids, duckdb, pd):
 @app.cell
 def _(
     SITE_NAME,
-    SITE_TZ,
     ase_df,
     bmi_df,
     duckdb,
@@ -944,8 +949,8 @@ def _(
     first_icu_admit,
     imv_dur_df,
     pf_24h_df,
-    retag_to_local_tz,
     sofa_24h_pd,
+    to_utc,
 ):
     # Cell H — Combine all T1 covariates into one row-per-hospitalization dataframe
     # and save to output/{site}/covariates_t1.parquet for 05_analytical_dataset.py to join.
@@ -977,9 +982,9 @@ def _(
         ORDER BY f.hospitalization_id
     """).df()
     _t1_path = f"output/{SITE_NAME}/covariates_t1.parquet"
-    # Retag _first_icu_dttm to SITE_TZ so the on-disk tz tag is the site's
-    # configured tz, not the OS session tz that DuckDB stamped at .df() time.
-    covariates_t1 = retag_to_local_tz(covariates_t1, ["_first_icu_dttm"], SITE_TZ)
+    # Retag _first_icu_dttm to UTC so the on-disk tz tag is canonical, not
+    # the OS session tz that DuckDB stamped at .df() time.
+    covariates_t1 = to_utc(covariates_t1, "_first_icu_dttm")
     covariates_t1.to_parquet(_t1_path, index=False)
     logger.info(
         f"Saved: {_t1_path} "
@@ -1000,11 +1005,11 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, SITE_TZ, covs, covs_daily, retag_to_local_tz):
+def _(SITE_NAME, covs, covs_daily, to_utc):
     _covs_shift_df = covs.df()
     # covariates_shift has event_dttm (shift-grain). covariates_daily is a
     # pure aggregate (groups by hospitalization_id, _nth_day) so no retag.
-    _covs_shift_df = retag_to_local_tz(_covs_shift_df, ["event_dttm"], SITE_TZ)
+    _covs_shift_df = to_utc(_covs_shift_df, "event_dttm")
     _covs_shift_path = f"output/{SITE_NAME}/covariates_by_id_shift.parquet"
     _covs_shift_df.to_parquet(_covs_shift_path)
     logger.info(f"Saved: {_covs_shift_path} ({len(_covs_shift_df)} rows)")
@@ -1059,16 +1064,13 @@ def _(
     CONFIG_PATH,
     SITE_TZ,
     cohort_hosp_ids,
+    to_utc,
 ):
-    # Imports are `_`-prefixed to keep them cell-local — `localize_naive_to_site_tz`
-    # is also imported by an earlier cell, and marimo enforces single
-    # cross-cell binding.
     from clifpy import Hospitalization as _Hospitalization
-    from _utils import localize_naive_to_site_tz as _loc_tz
 
     # Load discharge metadata + age for the cohort. Naive *_dttm gets
-    # tz-localized to SITE_TZ (clifpy convention: from_file returns naive
-    # wall-clock that is already site-local; we just attach the tz tag).
+    # localized to SITE_TZ then converted to UTC (clifpy convention:
+    # from_file returns naive wall-clock that is already site-local).
     _hosp = _Hospitalization.from_file(
         config_path=CONFIG_PATH,
         columns=[
@@ -1078,9 +1080,7 @@ def _(
         filters={'hospitalization_id': cohort_hosp_ids},
     )
     hosp_meta_df = _hosp.df.copy()
-    hosp_meta_df['discharge_dttm'] = _loc_tz(
-        hosp_meta_df['discharge_dttm'], SITE_TZ,
-    )
+    hosp_meta_df = to_utc(hosp_meta_df, 'discharge_dttm', naive_means=SITE_TZ)
     return (hosp_meta_df,)
 
 
@@ -1191,17 +1191,16 @@ def _(SITE_NAME, hosp_meta_df):
 
 
 @app.cell
-def _(SITE_NAME, SITE_TZ, cohort_meta_by_id, retag_to_local_tz):
+def _(SITE_NAME, cohort_meta_by_id, to_utc):
     # Materialize the lazy registry to pandas at the parquet-write boundary
     # (per `pyCLIF/docs/duckdb_perf_guide.md §11.4`: tz-tagged outputs route
-    # through pandas/Polars to preserve the site-local tz tag on disk).
+    # through pandas/Polars to preserve the on-disk tz tag).
     # Up to this point the registry has stayed lazy through the upstream
     # mo.sql cell.
     _df = cohort_meta_by_id.df()
-    _df = retag_to_local_tz(
+    _df = to_utc(
         _df,
         ["imv_first_dttm", "imv_last_dttm", "discharge_dttm"],
-        SITE_TZ,
     )
     _path = f"output/{SITE_NAME}/cohort_meta_by_id.parquet"
     _df.to_parquet(_path, index=False)

@@ -48,7 +48,7 @@ def _():
 
 @app.cell
 def _():
-    from clifpy import load_data, setup_logging
+    from clifpy import setup_logging
     import duckdb
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
     from clifpy.utils.config import get_config_or_params
@@ -58,13 +58,13 @@ def _():
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
 
-    # All timestamps in this script are tz-aware: cohort_meta_by_id_imvhr.parquet
-    # arrives site-tz tagged (per 01_cohort.py's retag_to_local_tz boundary);
-    # clifpy-loaded admin/recorded times are UTC tz-aware. Local-hour
-    # extraction uses explicit `AT TIME ZONE '{SITE_TZ}'` per query (see
-    # cont_sed_wg / intm_sed_wg cells), so DuckDB's session timezone is
-    # never read — no `SET TimeZone` here. The pytest at
-    # tests/test_timezone.py asserts session-tz invariance.
+    # All timestamps in this script are UTC TIMESTAMPTZ throughout: clifpy
+    # parquet files store *_dttm as UTC tz-aware, and we read them via
+    # raw DuckDB (`FROM '<data_dir>/clif_<table>.parquet' SELECT ...`)
+    # rather than clifpy.load_data — which would silently convert to naive
+    # site-local. cohort_meta_by_id_imvhr.parquet event_dttm is also UTC.
+    # Local-hour extraction uses explicit `AT TIME ZONE '{SITE_TZ}'`
+    # downstream, so DuckDB's session timezone never affects the result.
 
     CONFIG_PATH = "config/config.json"
     return (
@@ -73,7 +73,6 @@ def _():
         convert_dose_units_by_med_category,
         duckdb,
         get_config_or_params,
-        load_data,
         remove_meds_duplicates,
         setup_logging,
     )
@@ -85,6 +84,7 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     SITE_TZ = cfg['timezone']
+    DATA_DIR = cfg['data_directory']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     # Per-site log separation: each site writes to output/{site}/logs/
     # clifpy_all.log + clifpy_errors.log. setup_logging is idempotent; we
@@ -92,35 +92,66 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # side effect) so the output_directory is site-scoped.
     setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
-    return SITE_NAME, SITE_TZ
+    return DATA_DIR, SITE_NAME, SITE_TZ
 
 
 @app.cell
 def _(SITE_NAME, duckdb):
-    # Lazy parquet read — DuckDB scans on demand. The grid is site-tz tagged
-    # at write time by 01_cohort's retag_to_local_tz boundary, so event_dttm
-    # carries the correct local tz on disk; downstream SQL still uses
-    # AT TIME ZONE for explicit local-hour extraction.
-    cohort_hrly_grids_f = duckdb.sql(
+    # Lazy parquet read — DuckDB scans on demand. The grid is UTC tagged
+    # at write time by 01_cohort's to_utc boundary, so event_dttm carries
+    # canonical UTC on disk; downstream SQL uses AT TIME ZONE for explicit
+    # local-hour extraction.
+    cohort_meta_by_id_imvhr = duckdb.sql(
         f"FROM 'output/{SITE_NAME}/cohort_meta_by_id_imvhr.parquet' SELECT *"
     )
     if logger.isEnabledFor(logging.DEBUG):
-        _n = cohort_hrly_grids_f.count("*").fetchone()[0]
+        _n = cohort_meta_by_id_imvhr.count("*").fetchone()[0]
         logger.debug(f"Hourly grid rows: {_n:,}")
     else:
         logger.info("Hourly grid loaded as lazy relation")
-    return (cohort_hrly_grids_f,)
+    return (cohort_meta_by_id_imvhr,)
 
 
 @app.cell
-def _(cohort_hrly_grids_f, duckdb):
+def _(cohort_meta_by_id_imvhr):
+    cohort_meta_by_id_imvhr.df()
+    return
+
+
+@app.cell
+def _(cohort_meta_by_id_imvhr, duckdb):
     cohort_hosp_ids = [
         r[0] for r in duckdb.sql(
-            "FROM cohort_hrly_grids_f SELECT DISTINCT hospitalization_id"
+            "FROM cohort_meta_by_id_imvhr SELECT DISTINCT hospitalization_id"
         ).fetchall()
     ]
     logger.info(f"Cohort hospitalizations: {len(cohort_hosp_ids):,}")
     return (cohort_hosp_ids,)
+
+
+@app.cell
+def _(cohort_meta_by_id_imvhr):
+    # Per-patient IMV-start timestamp — the hour-sharp boundary where the
+    # cohort's first IMV grid row sits. Used downstream by the ASOF starter
+    # cell to inject a "rate at intubation" event so the first IMV hour
+    # reflects any propofol/etc. carry-over from the pre-intubation period
+    # (ED, OR, floor) rather than starting from rate=0 until the next
+    # charted admin event.
+    #
+    # No daily-registry join needed — the hourly grid alone is the source
+    # of truth for IMV time. Verified: every `event_dttm` in the grid is
+    # hour-sharp at local-tz (minute=second=0), so injecting a synthetic
+    # admin row at this timestamp matches the grid row exactly through the
+    # FULL JOIN below.
+    imv_starts = mo.sql(
+        f"""
+        FROM cohort_meta_by_id_imvhr
+        SELECT hospitalization_id
+            , imv_start_dttm: MIN(event_dttm)
+        GROUP BY hospitalization_id
+        """
+    )
+    return (imv_starts,)
 
 
 @app.cell(hide_code=True)
@@ -135,50 +166,57 @@ def _():
 
 
 @app.cell
-def _(apply_outlier_handling_duckdb, cohort_hosp_ids, load_data):
-    # `load_data(return_rel=True)` returns a bare DuckDBPyRelation — lazy,
-    # session-tz-independent (per duckdb_perf_guide §11.1, the vendored
-    # DuckDB outlier handler replaces clifpy's Table-object-bound
-    # apply_outlier_handling so the whole chain stays unmaterialized).
-    vitals_rel = load_data(
-        'vitals',
-        config_path='config/config.json',
-        return_rel=True,
-        columns=['hospitalization_id', 'recorded_dttm', 'vital_category', 'vital_value'],
-        filters={
-            'vital_category': ['weight_kg'],
-            'hospitalization_id': cohort_hosp_ids,
-        },
-    )
+def _(
+    DATA_DIR,
+    apply_outlier_handling_duckdb,
+    cohort_hosp_ids,
+    duckdb,
+):
+    # Inline raw DuckDB read of clifpy's parquet — bypasses
+    # `clifpy.load_data` (which silently does UTC→naive-site-local via
+    # `timezone(site_tz, col)` and breaks the project's downstream
+    # `AT TIME ZONE site_tz + extract` pattern). Returns recorded_dttm as
+    # UTC TIMESTAMPTZ — same as what's actually on disk in the parquet.
+    # Predicate + projection pushdown engages via parquet zonemap.
+    # See docs/timezone_audit.md.
+    vitals_rel = duckdb.sql(f"""
+        FROM '{DATA_DIR}/clif_vitals.parquet'
+        SELECT
+            hospitalization_id
+            , recorded_dttm
+            , vital_category
+            , vital_value
+        WHERE vital_category = 'weight_kg'
+            AND hospitalization_id IN (SELECT unnest({cohort_hosp_ids}))
+    """)
     vitals_rel = apply_outlier_handling_duckdb(
         vitals_rel, 'vitals', 'config/outlier_config.yaml',
     )
-    logger.info("Vitals (weight_kg): lazy relation built")
+    logger.info("Vitals (weight_kg): lazy relation built (raw DuckDB read, UTC TIMESTAMPTZ)")
     return (vitals_rel,)
 
 
 @app.cell
-def _(cohort_hosp_ids, duckdb, load_data):
-    # Same pattern as vitals: lazy load with clifpy column/filter pushdown,
-    # then NULL-dose drop in SQL. clifpy's `from_file` filters dict only
-    # supports IN-list semantics, so the IS NOT NULL gate is applied here
-    # rather than at the load layer. The cohort + med_category pushdown
-    # above already narrows the parquet scan dramatically, so the remaining
-    # cost is a single-column predicate on the filtered subset.
-    cont_sed_rel = load_data(
-        'medication_admin_continuous',
-        config_path='config/config.json',
-        return_rel=True,
-        columns=[
-            'hospitalization_id', 'admin_dttm', 'med_name', 'med_category',
-            'med_dose', 'med_dose_unit', 'mar_action_name', 'mar_action_category',
-        ],
-        filters={
-            'med_category': ['hydromorphone', 'fentanyl', 'lorazepam', 'midazolam', 'propofol'],
-            'hospitalization_id': cohort_hosp_ids,
-        }
-    )
-    cont_sed_rel = duckdb.sql("FROM cont_sed_rel WHERE med_dose IS NOT NULL AND mar_action_category != 'not_given'")
+def _(DATA_DIR, cohort_hosp_ids, duckdb):
+    # Inline raw DuckDB read — bypasses clifpy.load_data (see vitals cell
+    # comment + docs/timezone_audit.md). admin_dttm flows downstream as
+    # UTC TIMESTAMPTZ. Predicate + projection pushdown engages.
+    cont_sed_rel = duckdb.sql(f"""
+        FROM '{DATA_DIR}/clif_medication_admin_continuous.parquet'
+        SELECT
+            hospitalization_id
+            , admin_dttm
+            , med_name
+            , med_category
+            , med_dose
+            , med_dose_unit
+            , mar_action_name
+            , mar_action_category
+        WHERE med_category IN ('propofol', 'fentanyl', 'midazolam', 'lorazepam', 'hydromorphone')
+            AND hospitalization_id IN (SELECT unnest({cohort_hosp_ids}))
+            AND med_dose IS NOT NULL
+            AND mar_action_category != 'not_given'
+    """)
     if logger.isEnabledFor(logging.DEBUG):
         _n = cont_sed_rel.count("*").fetchone()[0]
         logger.debug(f"Continuous sedation: {_n:,} non-null-dose rows")
@@ -189,7 +227,7 @@ def _(cohort_hosp_ids, duckdb, load_data):
 
 @app.cell
 def _(cont_sed_rel):
-    cont_sed_rel
+    cont_sed_rel.df()
     return
 
 
@@ -407,10 +445,102 @@ def _(cont_sed_outliered):
 
 
 @app.cell
-def _(cont_sed_outliered):
+def _(cohort_meta_by_id_imvhr):
+    cohort_meta_by_id_imvhr.df()
+    return
+
+
+@app.cell
+def _(SITE_TZ, cohort_meta_by_id_imvhr, cont_sed_outliered):
+    # Filter admin events to those whose hour bucket falls inside the IMV
+    # grid. SEMI JOIN against `_dh` (the grid's hour-truncated local-tz
+    # timestamp) — admins with `date_trunc('hour', admin_dttm@tz)` not in
+    # the grid get dropped. This eliminates the off-IMV admins that would
+    # otherwise let `LEAD(event_dttm)` in `cont_sed_filled` jump across an
+    # extubation gap and credit a giant `_duration` to a single in-IMV
+    # hour (the bug that the previous-round duration-cap was masking).
+    cont_sed_within_imv = mo.sql(
+        f"""
+        FROM cont_sed_outliered c
+        SEMI JOIN (
+            FROM cohort_meta_by_id_imvhr SELECT hospitalization_id, _dh
+        ) g
+            ON c.hospitalization_id = g.hospitalization_id
+            AND date_trunc('hour', c.admin_dttm AT TIME ZONE '{SITE_TZ}') = g._dh
+        SELECT *
+        """
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        # cont_sed_outliered is a DuckDBPyRelation (.count("*").fetchone());
+        # cont_sed_within_imv comes from mo.sql under sql_output="polars",
+        # so it's a Polars DataFrame and len() is the right call.
+        _n_before = cont_sed_outliered.count("*").fetchone()[0]
+        _n_after = len(cont_sed_within_imv)
+        logger.debug(
+            f"cont_sed within-IMV filter: {_n_before:,} → {_n_after:,} rows "
+            f"({(_n_before - _n_after) / _n_before * 100 if _n_before else 0.0:.2f}% off-IMV dropped)"
+        )
+    return (cont_sed_within_imv,)
+
+
+@app.cell
+def _(cont_sed_outliered, imv_starts):
+    # ASOF backward join: for each patient's IMV-start timestamp, look up
+    # the most recent (post-conversion, post-outlier-handling) admin row
+    # with admin_dttm <= imv_start_dttm. Inject as a synthetic admin event
+    # at the IMV-start hour boundary (e.g., 5:00:00) so the first IMV hour
+    # carries the carry-over rate from before intubation rather than
+    # starting at 0 until the next charted admin lands.
+    #
+    # Sources from `cont_sed_outliered` (NOT `cont_sed_within_imv`) — we
+    # specifically need the pre-IMV history that the within-IMV filter
+    # would otherwise discard.
+    #
+    # `mar_action_name` is overwritten to a synthetic provenance tag so a
+    # downstream consumer can identify these rows; `mar_action_category`
+    # is preserved verbatim so the cont_sed_long CASE still zeros out
+    # 'stop' carry-overs (patient was OFF the drug at IMV start).
+    cont_sed_starter_rates = mo.sql(
+        f"""
+        FROM imv_starts e
+        ASOF LEFT JOIN cont_sed_outliered c
+            ON c.hospitalization_id = e.hospitalization_id
+            AND c.admin_dttm <= e.imv_start_dttm
+        SELECT
+            e.hospitalization_id
+            , admin_dttm: e.imv_start_dttm
+            , c.med_name
+            , c.med_category
+            , c.med_dose
+            , c.med_dose_unit
+            , c.med_dose_original
+            , c.med_dose_unit_original
+            , mar_action_name: 'asof_starter'
+            , c.mar_action_category
+        WHERE c.med_dose IS NOT NULL
+        """
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        # Polars DataFrame from mo.sql — len() not .count("*").
+        logger.debug(f"cont_sed ASOF starter rates: {len(cont_sed_starter_rates):,} rows injected")
+    return (cont_sed_starter_rates,)
+
+
+@app.cell
+def _(cont_sed_starter_rates, cont_sed_within_imv):
+    # UNION ALL of the within-IMV admin events and the per-patient starter
+    # rates (one synthetic admin row per patient at their IMV-start
+    # timestamp). The `BY NAME` qualifier matches columns by name rather
+    # than position, so column order doesn't have to align between the
+    # two relations.
     cont_sed_long = mo.sql(
         f"""
-        FROM cont_sed_outliered
+        WITH unioned AS (
+            FROM cont_sed_within_imv
+            UNION ALL BY NAME
+            FROM cont_sed_starter_rates
+        )
+        FROM unioned
         SELECT hospitalization_id
             , admin_dttm AS event_dttm
             , med_category_unit:
@@ -451,13 +581,13 @@ def _():
 
 
 @app.cell
-def _(SITE_TZ, cohort_hrly_grids_f, cont_sed_w):
+def _(SITE_TZ, cohort_meta_by_id_imvhr, cont_sed_w):
     # FULL JOIN with hourly grid: the grid side anchors the timeline at hour
     # boundaries so forward-fill below can propagate dose rates across hours
     # with no admin event. We subset the grid to just the join keys —
     # downstream cells only need (hosp_id, event_dttm, _dh, _hr, *_cont).
-    # `_shift`/`_nth_day`/etc. on cohort_hrly_grids_f are re-joined later at
-    # the per-hour merge step (sed_dose_by_hr).
+    # `_shift`/`_nth_day`/etc. on cohort_meta_by_id_imvhr are re-joined later at
+    # the per-hour merge step (seddose_by_id_imvhr).
     #
     # `_dh`/`_hr` derived from `event_dttm AT TIME ZONE '{SITE_TZ}'` —
     # explicit local-tz extraction, session-tz-independent. `event_dttm` may
@@ -470,7 +600,7 @@ def _(SITE_TZ, cohort_hrly_grids_f, cont_sed_w):
         f"""
         -- after inserting the hourly grid
         WITH grid AS (
-            FROM cohort_hrly_grids_f
+            FROM cohort_meta_by_id_imvhr
             SELECT hospitalization_id, event_dttm
         )
         FROM grid g
@@ -508,12 +638,19 @@ def _(cont_sed_wg):
         -- Forward-fill continuous sedation rates and compute duration between events.
         -- `_duration` for the last event of a partition is 0 (LEAD's third arg
         -- falls back to event_dttm itself, yielding zero diff).
+        --
+        -- No `LEAST(_duration, 60)` cap is needed here: cont_sed_within_imv
+        -- restricts admin events to those whose hour bucket is in the IMV
+        -- grid, and cont_sed_wg's FULL JOIN with the grid puts a row at
+        -- every IMV hour boundary. So LEAD(event_dttm) is always ≤ 60 min
+        -- away within IMV time, and at the partition's last row LEAD's
+        -- third-arg fallback yields _duration = 0 — there are no off-IMV
+        -- trailing rows for the multiplication to blow up.
         FROM cont_sed_wg g
         SELECT hospitalization_id, event_dttm, _dh, _hr
             , LAST_VALUE(COLUMNS('_cont') IGNORE NULLS) OVER (
                 PARTITION BY hospitalization_id ORDER BY event_dttm
             )
-            -- in mins
             , _duration: EXTRACT(EPOCH FROM (LEAD(event_dttm, 1, event_dttm) OVER w - event_dttm)) / 60.0
         WINDOW w AS (PARTITION BY hospitalization_id ORDER BY event_dttm)
         ORDER BY hospitalization_id, event_dttm
@@ -586,22 +723,25 @@ def _():
 
 
 @app.cell
-def _(cohort_hosp_ids, duckdb, load_data):
-    intm_sed_rel = load_data(
-        'medication_admin_intermittent',
-        config_path='config/config.json',
-        return_rel=True,
-        columns=[
-            'hospitalization_id', 'admin_dttm', 'med_name', 'med_category',
-            'med_dose', 'med_dose_unit', 'mar_action_name', 'mar_action_category',
-        ],
-        filters={
-            'med_category': ['hydromorphone', 'fentanyl', 'lorazepam', 'midazolam', 'propofol'],
-            'hospitalization_id': cohort_hosp_ids,
-            # 'mar_action_category': ['given', 'bolus', 'other'],
-        }
-    )
-    intm_sed_rel = duckdb.sql("FROM intm_sed_rel WHERE med_dose IS NOT NULL AND mar_action_category != 'not_given'")
+def _(DATA_DIR, cohort_hosp_ids, duckdb):
+    # Inline raw DuckDB read — same pattern as cont_sed_rel above. admin_dttm
+    # flows downstream as UTC TIMESTAMPTZ. See docs/timezone_audit.md.
+    intm_sed_rel = duckdb.sql(f"""
+        FROM '{DATA_DIR}/clif_medication_admin_intermittent.parquet'
+        SELECT
+            hospitalization_id
+            , admin_dttm
+            , med_name
+            , med_category
+            , med_dose
+            , med_dose_unit
+            , mar_action_name
+            , mar_action_category
+        WHERE med_category IN ('propofol', 'fentanyl', 'midazolam', 'lorazepam', 'hydromorphone')
+            AND hospitalization_id IN (SELECT unnest({cohort_hosp_ids}))
+            AND med_dose IS NOT NULL
+            AND mar_action_category != 'not_given'
+    """)
     if logger.isEnabledFor(logging.DEBUG):
         _n = intm_sed_rel.count("*").fetchone()[0]
         logger.debug(f"Intermittent sedation: {_n:,} non-null-dose rows")
@@ -715,6 +855,28 @@ def _(apply_outlier_handling_duckdb, intm_sed_renamed):
         logger.debug(f"intm_sed post-outlier: {_n:,} rows")
     else:
         logger.info("intm_sed post-outlier: lazy relation built")
+    return (intm_sed_outliered,)
+
+
+@app.cell
+def _(SITE_TZ, cohort_meta_by_id_imvhr, intm_sed_outliered):
+    # Mirror of `cont_sed_within_imv` — filter intermittent admin events to
+    # those whose hour bucket falls inside the IMV grid. Intermittent
+    # doesn't have the `LEAD`-based duration leak (each bolus is its own
+    # row, no forward-fill, no rate × duration), so this filter is mainly
+    # for symmetry with the cont path. No ASOF starter for intm: boluses
+    # are point-in-time events, not rates that need to "carry forward".
+    intm_sed_within_imv = mo.sql(
+        f"""
+        FROM intm_sed_outliered c
+        SEMI JOIN (
+            FROM cohort_meta_by_id_imvhr SELECT hospitalization_id, _dh
+        ) g
+            ON c.hospitalization_id = g.hospitalization_id
+            AND date_trunc('hour', c.admin_dttm AT TIME ZONE '{SITE_TZ}') = g._dh
+        SELECT *
+        """
+    )
     return
 
 
@@ -728,7 +890,7 @@ def _():
     intm_sed_w = mo.sql(
         f"""
         WITH t1 AS (
-        FROM intm_sed_outliered
+        FROM intm_sed_within_imv
         SELECT hospitalization_id
             , admin_dttm AS event_dttm
             , med_category_unit:
@@ -747,14 +909,14 @@ def _():
 
 
 @app.cell
-def _(SITE_TZ, cohort_hrly_grids_f, intm_sed_w):
+def _(SITE_TZ, cohort_meta_by_id_imvhr, intm_sed_w):
     # FULL JOIN with hourly grid — same pattern as cont_sed_wg (subset grid
     # to join keys, derive `_dh`/`_hr` from `event_dttm AT TIME ZONE site_tz`
     # for explicit, session-tz-independent local-hour extraction).
     intm_sed_wg = mo.sql(
         f"""
         WITH grid AS (
-            FROM cohort_hrly_grids_f
+            FROM cohort_meta_by_id_imvhr
             SELECT hospitalization_id, event_dttm
         )
         FROM grid g
@@ -799,47 +961,64 @@ def _():
 
 
 @app.cell
-def _(cohort_hrly_grids_f, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
-    sed_dose_by_hr = mo.sql(
+def _(cohort_meta_by_id_imvhr, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
+    # Merge per-hour cont + intm onto the hourly grid; expose per-hour
+    # AVG RATES with explicit unit names (no cumulative-amount columns).
+    #
+    # Inputs from cont_sed_dose_by_hr are "amount delivered in this 60-min
+    # window" (rate × duration, summed). Dividing by 60 (for /min rates) or
+    # passing through (for /hr rates, since amount-in-an-hour numerically
+    # equals avg-rate-in-mcg/hr) yields the per-hour avg rate. intm inputs
+    # are amount-in-the-hour (sum of bolus mg/mcg), which equals the per-
+    # hour rate in mg/hr or mcg/hr by the same argument.
+    #
+    # Both `_cont` (continuous-only) and `_total` (cont + intm) variants
+    # are exposed so consumers can pick the analytical scope.
+    #
+    # Propofol exception: cont units are mcg/kg/min but intm units are mg
+    # per bolus (no /kg). They're not directly addable, so
+    # prop_mcg_kg_min_total == prop_mcg_kg_min_cont here. intm propofol is
+    # rare in ICU (procedural boluses) and excluded from the rate column;
+    # see Phase-2 comment in prior code revision.
+    # TODO: incorporate prop intm via per-bolus weight + duration assumptions.
+    seddose_by_id_imvhr = mo.sql(
         f"""
-        -- Join hourly grid with continuous and intermittent doses; compute equivalencies
-        WITH t1 AS (
-        FROM cohort_hrly_grids_f g
-        LEFT JOIN intm_sed_dose_by_hr i USING (hospitalization_id, _dh)
-        LEFT JOIN cont_sed_dose_by_hr c USING (hospitalization_id, _dh)
-        SELECT *
+        WITH joined AS (
+            FROM cohort_meta_by_id_imvhr g
+            LEFT JOIN intm_sed_dose_by_hr i USING (hospitalization_id, _dh)
+            LEFT JOIN cont_sed_dose_by_hr c USING (hospitalization_id, _dh)
+            -- intm_sed_dose_by_hr has no _hr column (it groups on _dh
+            -- only); cont_sed_dose_by_hr does. Drop cont's _hr to keep
+            -- the registry's canonical one — without this the parquet
+            -- ends up with a stray _hr_1 column.
+            SELECT g.* EXCLUDE (_hr)
+                , g._hr
+                , c.* EXCLUDE (hospitalization_id, _dh, _hr)
+                , i.* EXCLUDE (hospitalization_id, _dh)
         )
-        FROM t1
+        FROM joined
         SELECT *
-            , fentanyl_mcg_total: fentanyl_mcg_intm + fentanyl_mcg_cont
-            , hydromorphone_mg_total: hydromorphone_mg_intm + hydromorphone_mg_cont
-            , lorazepam_mg_total: lorazepam_mg_intm + lorazepam_mg_cont
-            , midazolam_mg_total: midazolam_mg_intm + midazolam_mg_cont
-            -- Phase 2: propofol is now in mcg/kg/hr (continuous-only). The
-            -- intermittent propofol path (`propofol_mg_hr_intm`) is bolus
-            -- mg/dose with no defined duration, so converting to mcg/kg/min
-            -- is ill-defined. ICU bolus propofol is rare (mostly procedural)
-            -- compared to continuous pump infusion, which dominates the
-            -- exposure signal. We track intm propofol separately (still as
-            -- mg/hr) but exclude it from the rate-based descriptive.
-            -- TODO: we need to add propofol_mcg_kg_intm soon
-            , prop_mcg_kg_total: propofol_mcg_kg_cont
-            , midazeq_mg_total: lorazepam_mg_total * 2 + midazolam_mg_total
-            , fenteq_mcg_total: hydromorphone_mg_total * 50 + fentanyl_mcg_total
-
-            -- convert back to rate including both cont and intm
-            , prop_mcg_kg_min_avg: prop_mcg_kg_total / 60
-            , fenteq_mcg_hr_avg: fenteq_mcg_total
-            , midazeq_mg_hr_avg: midazeq_mg_total
-
-            -- convert back to rate including only cont
-            , prop_mcg_kg_min_cont: propofol_mcg_kg_cont / 60
-            , fenteq_mcg_hr_cont: hydromorphone_mg_cont * 50 + fentanyl_mcg_cont
-            , midazeq_mg_hr_cont: lorazepam_mg_cont * 2 + midazolam_mg_cont
-        ORDER BY hospitalization_id, _dh
+            -- Continuous-only per-hour avg rates.
+            , prop_mcg_kg_min_cont:  COALESCE(propofol_mcg_kg_cont, 0) / 60.0
+            , fenteq_mcg_hr_cont:    COALESCE(hydromorphone_mg_cont, 0) * 50
+                                      + COALESCE(fentanyl_mcg_cont, 0)
+            , midazeq_mg_hr_cont:    COALESCE(lorazepam_mg_cont, 0) * 2
+                                      + COALESCE(midazolam_mg_cont, 0)
+            -- Total (cont + intm) per-hour avg rates. Propofol total ==
+            -- cont because intm prop has incompatible units (see header).
+            , prop_mcg_kg_min_total: COALESCE(propofol_mcg_kg_cont, 0) / 60.0
+            , fenteq_mcg_hr_total:   (COALESCE(hydromorphone_mg_cont, 0)
+                                       + COALESCE(hydromorphone_mg_intm, 0)) * 50
+                                      + COALESCE(fentanyl_mcg_cont, 0)
+                                      + COALESCE(fentanyl_mcg_intm, 0)
+            , midazeq_mg_hr_total:   (COALESCE(lorazepam_mg_cont, 0)
+                                       + COALESCE(lorazepam_mg_intm, 0)) * 2
+                                      + COALESCE(midazolam_mg_cont, 0)
+                                      + COALESCE(midazolam_mg_intm, 0)
+        ORDER BY hospitalization_id, event_dttm
         """
     )
-    return (sed_dose_by_hr,)
+    return (seddose_by_id_imvhr,)
 
 
 @app.cell(hide_code=True)
@@ -855,26 +1034,31 @@ def _():
 
 
 @app.cell
-def _(sed_dose_by_hr):
-    # Aggregate dose totals AND hour counts per hospitalization, day, shift.
-    # n_hours is used downstream to convert totals to per-hour dose rates,
-    # which avoids single-shift bias in the Dose by Shift descriptive table
-    # and makes model dose coefficients interpretable as rates (see
-    # 05_analytical_dataset.py for the ÷12 rate conversion).
-    # Column-name convention (2026-04-24): totals carry their unit as
-    # suffix (`_mg` for propofol+midaz totals, `_mcg` for fentanyl totals);
-    # per-hour rates downstream carry `_mg_hr` / `_mcg_hr`.
+def _(seddose_by_id_imvhr):
+    # Per-shift avg rate = AVG of hourly rates within the shift. Algebraic
+    # equivalence (each hour is the same 60-min length):
+    #   total drug = Σ(rate_h × 60); shift duration = n_hours × 60
+    #   shift avg rate = total / duration
+    #                  = (60 · Σ rate_h) / (n_hours · 60)
+    #                  = AVG(rate_h)
+    # so the SUM-then-divide-by-(n_hours · 60) pattern used previously
+    # collapses to plain AVG(). n_hours stays in the output as coverage
+    # metadata (single-shift days at intubation/extubation edges) but is
+    # no longer an arithmetic input downstream.
+    #
+    # Both `_cont` (continuous-only) and `_total` (cont + intm) variants
+    # propagate; consumers pick analytical scope at read time.
     sed_dose_agg = mo.sql(
         f"""
-        FROM sed_dose_by_hr
+        FROM seddose_by_id_imvhr
         SELECT hospitalization_id, _nth_day, _shift
-            -- Phase 2: propofol now sums to total mcg/kg over the shift
-            -- (continuous infusion only). Downstream 05 divides by hours
-            -- and minutes to produce the per-min rate `_prop_day_mcg_kg_min`.
-            , prop_mcg_kg: SUM(prop_mcg_kg_total)
-            , fenteq_mcg:  SUM(fenteq_mcg_total)
-            , midazeq_mg:  SUM(midazeq_mg_total)
-            , n_hours:     COUNT(*)
+            , prop_mcg_kg_min_cont:  AVG(prop_mcg_kg_min_cont)
+            , prop_mcg_kg_min_total: AVG(prop_mcg_kg_min_total)
+            , fenteq_mcg_hr_cont:    AVG(fenteq_mcg_hr_cont)
+            , fenteq_mcg_hr_total:   AVG(fenteq_mcg_hr_total)
+            , midazeq_mg_hr_cont:    AVG(midazeq_mg_hr_cont)
+            , midazeq_mg_hr_total:   AVG(midazeq_mg_hr_total)
+            , n_hours:               COUNT(*)
         GROUP BY hospitalization_id, _nth_day, _shift
         ORDER BY hospitalization_id, _nth_day, _shift
         """
@@ -884,32 +1068,41 @@ def _(sed_dose_by_hr):
 
 @app.cell
 def _(sed_dose_agg):
-    # Pivot _shift to wide day/night columns via conditional aggregation.
-    # FILTER (WHERE _shift = 'day' / 'night') replaces the pandas .pivot()
-    # +column-flatten dance so the entire daily roll-up stays in SQL.
+    # Pivot _shift to wide day/night columns. Each (hospitalization_id,
+    # _nth_day, _shift) group has exactly one row in sed_dose_agg, so
+    # MAX(...) FILTER (WHERE _shift = 'day') just picks that row's value
+    # for the day shift (and likewise night) — same idiom as before but
+    # on rate columns instead of cumulative ones, which is why the
+    # aggregation operator changes from SUM to MAX (you can't sum a single
+    # rate value, but the choice is moot since there's only one row to
+    # collapse).
     #
-    # n_hours_day/night flow through so downstream can compute per-hour dose
-    # rates that correctly handle single-shift days (intubation / extubation
-    # day edges). Unit-suffixed column names (e.g. prop_day_mcg_kg = total
-    # mcg/kg over 12h day shift) match the 2026-04-24 naming convention; see
-    # 05_analytical_dataset.py.
-    sed_dose_daily = mo.sql(
+    # n_hours_day / n_hours_night carry through as coverage metadata —
+    # downstream `05_modeling_dataset.py` no longer divides by them
+    # because the rate columns are already shift-avg rates.
+    seddose_by_id_imvday = mo.sql(
         f"""
         FROM sed_dose_agg
         SELECT hospitalization_id, _nth_day
-            , prop_day_mcg_kg:   SUM(prop_mcg_kg) FILTER (WHERE _shift = 'day')
-            , prop_night_mcg_kg: SUM(prop_mcg_kg) FILTER (WHERE _shift = 'night')
-            , fenteq_day_mcg:    SUM(fenteq_mcg)  FILTER (WHERE _shift = 'day')
-            , fenteq_night_mcg:  SUM(fenteq_mcg)  FILTER (WHERE _shift = 'night')
-            , midazeq_day_mg:    SUM(midazeq_mg)  FILTER (WHERE _shift = 'day')
-            , midazeq_night_mg:  SUM(midazeq_mg)  FILTER (WHERE _shift = 'night')
-            , n_hours_day:       SUM(n_hours)     FILTER (WHERE _shift = 'day')
-            , n_hours_night:     SUM(n_hours)     FILTER (WHERE _shift = 'night')
+            , prop_day_mcg_kg_min_cont:    MAX(prop_mcg_kg_min_cont)  FILTER (WHERE _shift = 'day')
+            , prop_night_mcg_kg_min_cont:  MAX(prop_mcg_kg_min_cont)  FILTER (WHERE _shift = 'night')
+            , prop_day_mcg_kg_min_total:   MAX(prop_mcg_kg_min_total) FILTER (WHERE _shift = 'day')
+            , prop_night_mcg_kg_min_total: MAX(prop_mcg_kg_min_total) FILTER (WHERE _shift = 'night')
+            , fenteq_day_mcg_hr_cont:      MAX(fenteq_mcg_hr_cont)    FILTER (WHERE _shift = 'day')
+            , fenteq_night_mcg_hr_cont:    MAX(fenteq_mcg_hr_cont)    FILTER (WHERE _shift = 'night')
+            , fenteq_day_mcg_hr_total:     MAX(fenteq_mcg_hr_total)   FILTER (WHERE _shift = 'day')
+            , fenteq_night_mcg_hr_total:   MAX(fenteq_mcg_hr_total)   FILTER (WHERE _shift = 'night')
+            , midazeq_day_mg_hr_cont:      MAX(midazeq_mg_hr_cont)    FILTER (WHERE _shift = 'day')
+            , midazeq_night_mg_hr_cont:    MAX(midazeq_mg_hr_cont)    FILTER (WHERE _shift = 'night')
+            , midazeq_day_mg_hr_total:     MAX(midazeq_mg_hr_total)   FILTER (WHERE _shift = 'day')
+            , midazeq_night_mg_hr_total:   MAX(midazeq_mg_hr_total)   FILTER (WHERE _shift = 'night')
+            , n_hours_day:                 SUM(n_hours) FILTER (WHERE _shift = 'day')
+            , n_hours_night:               SUM(n_hours) FILTER (WHERE _shift = 'night')
         GROUP BY hospitalization_id, _nth_day
         ORDER BY hospitalization_id, _nth_day
         """
     )
-    return (sed_dose_daily,)
+    return (seddose_by_id_imvday,)
 
 
 @app.cell(hide_code=True)
@@ -917,12 +1110,15 @@ def _():
     mo.md(r"""
     ## Save Outputs
 
-    Terminal materialization. `sed_dose_daily` writes via DuckDB native
-    `.to_parquet()` (no `*_dttm` columns). `sed_dose_by_hr` has `event_dttm`
-    from the cohort grid join — DuckDB's parquet writer normalizes
-    TIMESTAMPTZ to a UTC tag, which would lose our site-local tag on disk,
-    so it routes through Polars (preserves the tz tag via Arrow). See
-    `pyCLIF/docs/duckdb_perf_guide.md §11.4`.
+    Terminal materialization. UTC-everywhere on disk: every `*_dttm`
+    column is written as UTC TIMESTAMPTZ. `seddose_by_id_imvday` has no
+    `*_dttm` columns. `seddose_by_id_imvhr` has `event_dttm` (UTC from
+    the cohort grid join). Per the new convention, DuckDB's parquet
+    writer's UTC normalization is exactly what we want — but
+    `sql_output="polars"` makes both relations Polars DataFrames at this
+    point, so we go through Polars `write_parquet` uniformly with an
+    explicit `convert_time_zone("UTC")` to make the UTC-on-disk tag
+    intent obvious. See `docs/timezone_audit.md`.
 
     Phase 2 (2026-05-07): `sed_dose_agg.parquet` is no longer written.
     Its per-shift dose totals were already mirrored as separate day/night
@@ -933,19 +1129,18 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, SITE_TZ, sed_dose_by_hr, sed_dose_daily):
+def _(SITE_NAME, seddose_by_id_imvday, seddose_by_id_imvhr):
     import polars as pl  # cell-local — used only for the tz-bearing parquet write
 
-    sed_dose_daily.to_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
+    seddose_by_id_imvday.write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
     (
-        sed_dose_by_hr
-        .pl()
-        .with_columns(pl.col("event_dttm").dt.convert_time_zone(SITE_TZ))
+        seddose_by_id_imvhr
+        .with_columns(pl.col("event_dttm").dt.convert_time_zone("UTC"))
         .write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
     )
 
     logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvday.parquet")
-    logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
+    logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvhr.parquet (event_dttm in UTC)")
     return
 
 
