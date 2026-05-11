@@ -828,19 +828,17 @@ def _(
                     ],
                 )
 
-        # RCS marginal effect plots — 6 pages (3 manuscript outcomes × 2 specs).
-        # 2026-05-06: replaced the legacy `sofa_rcs` block with the two
-        # manuscript RCS specs (`daydose_wt_rcs`, `clinical_wt_rcs`). Same
-        # 6 exposures wrapped in patsy's cr(x, knots=…) — clinical absolute
-        # knots, no `_*_any` interactions (parallel to linear `daydose_wt`
-        # and `clinical_wt`).
+        # RCS marginal effect plots. 2026-05-11: spec rename — `daydose_wt_rcs`
+        # → `daydose_rcs_*`, `clinical_wt_rcs` → `daydose_physio_rcs_*`
+        # (weight_kg moved into BASELINE; clinical → daydose_physio). Now 8
+        # PNGs/outcome family with the diff/full suffixes.
         for _label, _outcome_short, _mt, _spec in [
-            ('SBT Eligible (GEE) — daydose+wt RCS',           'sbt_elig',          'gee', 'daydose_wt_rcs'),
-            ('SBT Eligible (GEE) — clinical+wt RCS',          'sbt_elig',          'gee', 'clinical_wt_rcs'),
-            ('SBT Delivered (multiday, GEE) — daydose+wt RCS',  'sbt_done_multiday', 'gee', 'daydose_wt_rcs'),
-            ('SBT Delivered (multiday, GEE) — clinical+wt RCS', 'sbt_done_multiday', 'gee', 'clinical_wt_rcs'),
-            ('Successful Extubation (GEE) — daydose+wt RCS',  'success_extub',     'gee', 'daydose_wt_rcs'),
-            ('Successful Extubation (GEE) — clinical+wt RCS', 'success_extub',     'gee', 'clinical_wt_rcs'),
+            ('SBT Delivered (multiday, GEE) — daydose RCS diff',         'sbt_done_multiday', 'gee', 'daydose_rcs_diff'),
+            ('SBT Delivered (multiday, GEE) — daydose RCS full',         'sbt_done_multiday', 'gee', 'daydose_rcs_full'),
+            ('SBT Delivered (multiday, GEE) — daydose+physio RCS diff',  'sbt_done_multiday', 'gee', 'daydose_physio_rcs_diff'),
+            ('SBT Delivered (multiday, GEE) — daydose+physio RCS full',  'sbt_done_multiday', 'gee', 'daydose_physio_rcs_full'),
+            ('Successful Extubation (Logit asym) — daydose RCS diff',    'success_extub',     'logit_asym', 'daydose_rcs_diff'),
+            ('Successful Extubation (Logit asym) — daydose+physio RCS diff', 'success_extub', 'logit_asym', 'daydose_physio_rcs_diff'),
         ]:
             _me_path = (
                 f"output_to_share/{SITE_NAME}/models/"
@@ -858,31 +856,24 @@ def _(
                     ],
                 )
 
-        # Forest plots (10→90 percentile-OR rescaling, all 5 specs on one axis).
-        # New in 2026-04-29 model-update round. Each PNG = one outcome × model_type;
-        # 6 predictor rows (3 night-day diffs + 3 daytime rates) × 5 spec dots
-        # color-coded baseline / daydose / sofa / clinical / sofa_rcs. Single OR
-        # per dot for "10th→90th percentile shift" of the predictor's
-        # production-cohort distribution (zeros included; signed diffs preserved).
+        # Forest plots (10→90 percentile-OR rescaling, all 8 specs on one axis).
+        # 2026-05-11 trim: 11 (outcome × model_type) configs after dropping
+        # sbt_elig and harmonizing outcome short names with the new
+        # OUTCOME_SHORT dict in 08_models.py.
         for _label, _outcome_short, _mt in [
-            # Working primaries
-            ('SBT Done Next Day (GEE)',                        'sbt',       'gee'),
-            ('Successful Extubation Next Day (GEE)',           'extub',     'gee'),
-            ('Successful Extubation Next Day (Logit)',         'extub',     'logit'),
-            # SBT sensitivity siblings (sbt_done_abc is the working baseline)
-            ('SBT Done — anyprior (GEE)',                      'sbt_anyprior', 'gee'),
-            ('SBT Done — imv6h (GEE)',                         'sbt_imv6h', 'gee'),
-            ('SBT Done — prefix (GEE)',                        'sbt_prefix','gee'),
-            ('SBT Done — 2min (GEE)',                          'sbt_2min',  'gee'),
-            ('SBT Done — Subira (GEE)',                        'sbt_subira','gee'),
-            ('SBT Done — ABC [working baseline] (GEE)',        'sbt_abc',   'gee'),
-            # v2 family (ABT-RISE-style alternatives)
-            ('SBT Eligible Next Day [v2] (GEE)',               'sbt_elig',  'gee'),
-            ('SBT Eligible Next Day [v2] (Logit)',             'sbt_elig',  'logit'),
-            ('SBT Done Next Day [v2] (GEE)',                   'sbt_v2',    'gee'),
-            ('SBT Done Next Day [v2] (Logit)',                 'sbt_v2',    'logit'),
-            ('Successful Extubation Next Day [v2] (GEE)',      'extub_v2',  'gee'),
-            ('Successful Extubation Next Day [v2] (Logit)',    'extub_v2',  'logit'),
+            # Manuscript primaries (extubation × 3 SE strategies)
+            ('Successful Extubation (GEE)',                    'success_extub',     'gee'),
+            ('Successful Extubation (Logit cluster-robust)',   'success_extub',     'logit'),
+            ('Successful Extubation (Logit asymptotic)',       'success_extub',     'logit_asym'),
+            ('Successful Extubation [v2] (GEE)',               'success_extub_v2',  'gee'),
+            ('Successful Extubation [v2] (Logit cluster)',     'success_extub_v2',  'logit'),
+            ('Successful Extubation [v2] (Logit asymptotic)',  'success_extub_v2',  'logit_asym'),
+            # SBT delivery variants (gee only)
+            ('SBT Delivered — multiday (GEE)',                 'sbt_done_multiday', 'gee'),
+            ('SBT Delivered — prefix (GEE)',                   'sbt_done_prefix',   'gee'),
+            ('SBT Delivered — Subira (GEE)',                   'sbt_done_subira',   'gee'),
+            ('SBT Delivered — ABC (GEE)',                      'sbt_done_abc',      'gee'),
+            ('SBT Delivered [v2] (GEE)',                       'sbt_done_v2',       'gee'),
         ]:
             _fp_path = (
                 f"output_to_share/{SITE_NAME}/models/"
