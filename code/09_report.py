@@ -378,11 +378,11 @@ def _(SITE_NAME, pd):
 @app.cell
 def _(SITE_NAME, pd):
     # Model comparison tables (from 08_models.py).
-    # Filename convention changed 2026-05-01 in 08_models.py — `extub` →
-    # `success_extub` to match the OUTCOME_SHORT mapping. SBT primary
-    # (`sbt_done_next_day`) was retired in the same commit, so we read
-    # the surviving Apr 29 file by its original short name.
-    sbt_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_gee.csv", index_col=0)
+    # Filename convention has shifted twice: 2026-05-01 `extub` → `success_extub`
+    # (OUTCOME_SHORT mapping), 2026-05-11 `sbt` → `sbt_done_multiday` (multiday
+    # operationalization promoted to manuscript primary; `sbt_done_next_day`
+    # retired). 09 reads the current canonical filenames.
+    sbt_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_done_multiday_gee.csv", index_col=0)
     extub_gee_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_success_extub_gee.csv", index_col=0)
     extub_logit_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/model_comparison_success_extub_logit.csv", index_col=0)
     logger.info(f"SBT GEE: {sbt_gee_df.shape}, Extub GEE: {extub_gee_df.shape}, Extub Logit: {extub_logit_df.shape}")
@@ -391,14 +391,15 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
-    # SBT-onset sensitivity-sibling model comparison tables (4 variants).
-    # Each carries the same structure as `sbt_gee_df` above; the variant
-    # differs only in how `sbt_done_<variant>_next_day` is operationalized
-    # upstream in `code/03_outcomes.py`.
-    _variants = ['anyprior', 'imv6h', 'prefix', '2min', 'subira', 'abc']
+    # SBT-onset sensitivity-sibling model comparison tables.
+    # Variants in sync with `08_models.py::OUTCOME_SHORT` (2026-05-11).
+    # `anyprior`, `imv6h`, `2min` were retired upstream; `v2` replaces them
+    # as the ABT-RISE-style alternative. Filename pattern is now
+    # `model_comparison_sbt_done_<variant>_gee.csv`.
+    _variants = ['prefix', 'subira', 'abc', 'v2']
     sbt_variant_dfs = {}
     for _v in _variants:
-        _path = f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_{_v}_gee.csv"
+        _path = f"output_to_share/{SITE_NAME}/models/model_comparison_sbt_done_{_v}_gee.csv"
         try:
             sbt_variant_dfs[_v] = pd.read_csv(_path, index_col=0)
         except FileNotFoundError:
@@ -746,7 +747,7 @@ def _(
             else:
                 add_text_page(
                     _pdf, _title_v,
-                    [f"[CSV not found: output_to_share/{SITE_NAME}/models/model_comparison_sbt_{_v}_gee.csv]",
+                    [f"[CSV not found: output_to_share/{SITE_NAME}/models/model_comparison_sbt_done_{_v}_gee.csv]",
                      "Run 08_models.py to generate."],
                 )
 

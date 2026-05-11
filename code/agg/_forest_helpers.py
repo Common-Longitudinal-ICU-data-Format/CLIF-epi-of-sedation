@@ -1,12 +1,15 @@
 """Shared utilities for the cross-site forest-plot scripts under code/agg/.
 
 Three scripts (forest_night_day_cross_site.py, forest_daytime_cross_site.py,
-forest_sbt_sensitivity_cross_site.py) all read each site's
-output_to_share/{site}/models/forest_data.csv and render forest plots of
-10→90 percentile-shift ORs. The site-stacking loader, the OR-axis formatter
-(log scale + sparse major ticks + minor gridlines every 0.05), and the
-auto-xlim helper are factored here so the per-figure scripts only own
-their own layout + filtering rules.
+forest_sbt_sensitivity_cross_site.py) read each site's
+output_to_share/{site}/models/models_coeffs.csv and render forest plots
+of 10→90 percentile-shift ORs (or_p10_p90 columns). The site-stacking
+loader, the OR-axis formatter, and the auto-xlim helper are factored here
+so per-figure scripts only own their own layout + filtering rules.
+
+`stack_per_site()` filters to `row_type == 'exposure'` since the forest
+figures only render exposure predictors. To consume adjustment / categorical
+rows, read models_coeffs.csv directly via `_shared.load_site_models_coeffs`.
 
 Leading underscore = NOT picked up by the `make agg` glob in the Makefile
 (`code/agg/*.py`, with the per-script `case _*) continue` filter); this
@@ -23,33 +26,43 @@ import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.forest_helpers")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
-from _shared import SHARE_ROOT, list_sites, load_site_forest_data  # noqa: E402
+from _shared import SHARE_ROOT, list_sites, load_site_models_coeffs  # noqa: E402
 
 
 # ── Loaders ───────────────────────────────────────────────────────────────
-def stack_per_site() -> pd.DataFrame:
-    """Concat each discovered site's forest_data.csv with a `site` column.
+def stack_per_site(*, row_type: str = "exposure") -> pd.DataFrame:
+    """Concat each discovered site's models_coeffs.csv (filtered to one row_type)
+    with a `site` column.
 
-    Skips sites whose `forest_data.csv` is missing rather than failing — a
+    Default filter: `row_type == 'exposure'` (the 6 exposure predictors per
+    fit). Pass `row_type=None` to keep ALL rows, or another row_type
+    ('adjustment_continuous' / 'adjustment_categorical' / 'intercept') to
+    filter to a different slice.
+
+    Skips sites whose `models_coeffs.csv` is missing rather than failing — a
     new site dropped under `output_to_share/` won't break a figure until
-    its per-site pipeline (08_models.py) has been run. The site-discovery
-    skip list (qc/, figures/, _*) lives in `_shared.list_sites()`.
+    its per-site pipeline (08_models.py) has been run.
     """
     sites = list_sites()
     if not sites:
-        print("No sites found under output_to_share/. Nothing to plot.")
+        logger.info("No sites found under output_to_share/. Nothing to plot.")
         return pd.DataFrame()
-    print(f"Discovered sites: {sites}")
+    logger.info(f"Discovered sites: {sites}")
 
     frames: list[pd.DataFrame] = []
     for s in sites:
-        path = SHARE_ROOT / s / "models" / "forest_data.csv"
+        path = SHARE_ROOT / s / "models" / "models_coeffs.csv"
         if not path.exists():
-            print(f"  SKIP {s}: {path} missing — re-run 08_models.py for this site.")
+            logger.info(f"  SKIP {s}: {path} missing — re-run 08_models.py for this site.")
             continue
-        df = load_site_forest_data(s)
+        df = load_site_models_coeffs(s)
+        if row_type is not None:
+            df = df[df["row_type"] == row_type].copy()
         df["site"] = s
         frames.append(df)
     if not frames:
@@ -75,14 +88,22 @@ _MAJOR_CANDIDATES = [
 _MIN_LOG_GAP = 0.115
 
 
-def or_xlim_from_data(df: pd.DataFrame, fallback: tuple[float, float] = (0.85, 1.05)) -> tuple[float, float]:
+def or_xlim_from_data(
+    df: pd.DataFrame,
+    *,
+    or_col: str = "or_p10_p90",
+    fallback: tuple[float, float] = (0.85, 1.05),
+) -> tuple[float, float]:
     """Auto-compute symmetric-ish OR x-range that hugs the CIs and includes 1.
 
-    Returns `fallback` if no finite CIs are available (e.g., script run
-    before per-site forest_data.csv has been regenerated).
+    `or_col` selects which OR family to use ('or_p10_p90' for percentile-shift
+    forests, 'or_per_unit' for fixed-unit forests). Reads `{or_col}_lo` and
+    `{or_col}_hi`. Returns `fallback` if no finite CIs are available.
     """
-    los = df["OR_lo"].to_numpy(dtype=float)
-    his = df["OR_hi"].to_numpy(dtype=float)
+    lo_col = f"{or_col}_lo"
+    hi_col = f"{or_col}_hi"
+    los = df[lo_col].to_numpy(dtype=float)
+    his = df[hi_col].to_numpy(dtype=float)
     los = los[np.isfinite(los)]
     his = his[np.isfinite(his)]
     if len(los) == 0 or len(his) == 0:
@@ -91,7 +112,10 @@ def or_xlim_from_data(df: pd.DataFrame, fallback: tuple[float, float] = (0.85, 1
     hi = float(max(his.max(), 1.0))
     span = hi - lo
     pad = max(span * 0.08, 0.005)
-    return (lo - pad, hi + pad)
+    # Clamp to safe positive range — apply_or_xaxis runs on a log-scale
+    # axis and a non-positive xlim hangs the minor-tick generator on a
+    # `range()` call with millions of steps.
+    return (max(lo - pad, 0.05), min(hi + pad, 20.0))
 
 
 def apply_or_xaxis(

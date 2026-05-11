@@ -17,17 +17,22 @@ with app.setup:
     import marimo as mo
     import os
     import sys
+    import json
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
 
     from clifpy.utils.logging_config import get_logger
     logger = get_logger("epi_sedation.covariates")
 
-    # Cache-bypass flags for expensive Table 1 covariate recomputes.
-    # Env-var-driven so sites can re-invalidate caches without editing
-    # source (e.g. `RERUN_SOFA_24H=1 make run SITE=mimic`). Default off.
-    RERUN_SOFA_24H = os.getenv("RERUN_SOFA_24H", "0") == "1"
-    RERUN_ASE = os.getenv("RERUN_ASE", "0") == "1"
+    # Cache-bypass flags for expensive Table 1 covariate recomputes — now
+    # config-driven (per-site config keys `rerun_sofa_24h` / `rerun_ase`).
+    # Default = reuse cached parquet if present. To force a one-shot
+    # recompute without editing config, delete the cache parquet.
+    _CONFIG_PATH_SETUP = "config/config.json"
+    with open(_CONFIG_PATH_SETUP) as _cfg_f:
+        _cfg_setup = json.load(_cfg_f)
+    RERUN_SOFA_24H = bool(_cfg_setup.get("rerun_sofa_24h", False))
+    RERUN_ASE = bool(_cfg_setup.get("rerun_ase", False))
 
 
 @app.cell(hide_code=True)
@@ -50,7 +55,7 @@ def _():
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
-    from _utils import remove_meds_duplicates, to_utc
+    from _utils import normalize_categories, remove_meds_duplicates, to_utc
 
     import warnings
     warnings.filterwarnings('ignore', category=FutureWarning)
@@ -63,6 +68,7 @@ def _():
         convert_dose_units_by_med_category,
         duckdb,
         get_config_or_params,
+        normalize_categories,
         pd,
         remove_meds_duplicates,
         setup_logging,
@@ -142,12 +148,18 @@ def _(apply_outlier_handling, cohort_hosp_ids, duckdb):
     )
     apply_outlier_handling(labs, outlier_config_path='config/outlier_config.yaml')
     labs_df = labs.df
-    _q = """
-    PIVOT_WIDER labs_df
-    ON lab_category
-    USING MAX(lab_value_numeric)
-    """
-    labs_w = duckdb.sql(_q).df()
+    # Materialize the pivot result as a DuckDB TEMP TABLE (perf-guide §2a/§2b).
+    # The previous `.df()` round-trip handed labs_w to downstream SQL via
+    # pandas replacement scan, which has no zonemap/statistics; the ASOF
+    # JOIN at the next cell then falls back to nested-loop semantics on the
+    # temporal predicate. TEMP TABLE gives DuckDB native stats.
+    duckdb.execute("""
+        CREATE OR REPLACE TEMP TABLE _labs_w AS
+        PIVOT_WIDER labs_df
+        ON lab_category
+        USING MAX(lab_value_numeric)
+    """)
+    labs_w = duckdb.table('_labs_w')
     return Labs, labs_w
 
 
@@ -212,12 +224,17 @@ def _(Labs, apply_outlier_handling, cohort_hosp_ids, duckdb):
     )
     apply_outlier_handling(po2, outlier_config_path='config/outlier_config.yaml')
     po2_df = po2.df
-    _q = """
-    PIVOT_WIDER po2_df
-    ON lab_category
-    USING MAX(lab_value_numeric)
-    """
-    po2_w = duckdb.sql(_q).df()
+    # po2_w is referenced from two downstream cells (the shift-grid ASOF join
+    # AND the 24h Table 1 PaO2 cell). TEMP TABLE materialization (perf-guide
+    # §2b) lets both consumers join against a stat-enriched table instead of
+    # re-importing pandas via replacement scan twice.
+    duckdb.execute("""
+        CREATE OR REPLACE TEMP TABLE _po2_w AS
+        PIVOT_WIDER po2_df
+        ON lab_category
+        USING MAX(lab_value_numeric)
+    """)
+    po2_w = duckdb.table('_po2_w')
     return (po2_w,)
 
 
@@ -510,6 +527,16 @@ def _(SITE_NAME, sofa_raw):
     # via Arrow on write, same as pandas).
     sofa_daily.write_parquet(_sofa_path)
     logger.info(f"Saved: {_sofa_path} ({sofa_daily.height} patient-days)")
+    # Force GC after the largest Polars materialization in the script.
+    # sofa_daily isn't returned downstream, so the local dies at cell end —
+    # gc.collect() nudges CPython to release the backing memory before the
+    # next cell starts allocating. Matches the pattern at _sofa.py:1394,
+    # 1563-1566.
+    # Underscore-prefixed alias keeps the `gc` binding cell-private (marimo
+    # otherwise flags duplicate top-level definitions across cells).
+    import gc as _gc
+    del sofa_daily
+    _gc.collect()
     return
 
 
@@ -965,6 +992,12 @@ def _(CONFIG_PATH, SITE_NAME, SITE_TZ, cohort_hosp_ids, duckdb, pd, to_utc):
     """).df()
     _n_sepsis = int(ase_df['sepsis_ase'].sum())
     logger.info(f"ase_df: {len(ase_df)} rows, {_n_sepsis} with sepsis_ase=1")
+    # ase_full is the big pandas frame; ase_df (small aggregate) is what
+    # propagates downstream. Free the big one before the next cell.
+    # Underscore-prefixed alias keeps `gc` cell-private (marimo's rule).
+    import gc as _gc
+    del ase_full
+    _gc.collect()
     return (ase_df,)
 
 
@@ -1093,6 +1126,7 @@ def _(
     CONFIG_PATH,
     SITE_TZ,
     cohort_hosp_ids,
+    normalize_categories,
     to_utc,
 ):
     from clifpy import Hospitalization as _Hospitalization
@@ -1110,6 +1144,11 @@ def _(
     )
     hosp_meta_df = _hosp.df.copy()
     hosp_meta_df = to_utc(hosp_meta_df, 'discharge_dttm', naive_means=SITE_TZ)
+    # Normalize discharge_category casing (cross-site safety). The
+    # `TRIM(LOWER(h.discharge_category)) = 'expired'` at line ~1215 of
+    # this script is now redundant for surviving rows but kept as
+    # defensive belt-and-suspenders.
+    hosp_meta_df = normalize_categories(hosp_meta_df, ['discharge_category'])
     return (hosp_meta_df,)
 
 

@@ -37,6 +37,9 @@ import plotly.graph_objects as go
 from dash import ALL, ctx, Input, Output, State, dash_table, dcc, html, no_update
 from plotly.subplots import make_subplots
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.qc.trajectory_viewer")
+
 # Local helpers.
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent))
@@ -81,11 +84,23 @@ PANEL_BY_ID = {p["id"]: p for p in PANELS}
 # ── Cohort pool discovery ───────────────────────────────────────────────
 
 def cohort_ids_for_site(site: str) -> list[str]:
-    path = OUTPUT_DIR / site / "analytical_dataset.parquet"
+    # Phase 4 cutover (2026-05-08): cohort discovery from the consolidated
+    # parquet. Apply outcome-modeling filter so the patient picker reflects
+    # the same cohort the production models see.
+    path = OUTPUT_DIR / site / "model_input_by_id_imvday.parquet"
     if not path.exists():
         return []
-    hids = pd.read_parquet(path, columns=["hospitalization_id"])["hospitalization_id"]
-    return sorted(hids.unique().tolist())
+    df = pd.read_parquet(
+        path,
+        columns=["hospitalization_id", "_nth_day",
+                 "sbt_done_next_day", "success_extub_next_day"],
+    )
+    df = df.loc[
+        (df["_nth_day"] > 0)
+        & df["sbt_done_next_day"].notna()
+        & df["success_extub_next_day"].notna()
+    ]
+    return sorted(df["hospitalization_id"].unique().tolist())
 
 
 # ── Dash app scaffold ──────────────────────────────────────────────────
@@ -188,6 +203,8 @@ app.layout = dbc.Container([
 | `imv6h` | `sbt_done_imv6h` | ≥30 min sustained on PS-with-low, plus ≥6 *continuous* hours on IMV before the flip (pySBT-style) |
 | `prefix` | `sbt_done_prefix` | ≥30 min on PS-with-low — **NO prior-mode check at all** (pre-fix every-row baseline; this is the over-counting definition) |
 | `2min` | `sbt_done_2min` | ≥2 min on PS-with-low, controlled-mode prior (relaxed sustained-duration variant of primary) |
+| `Subira` | `sbt_done_subira` | **Subira et al. spec**: ≥30 min on T-piece OR CPAP ≤8 OR (PS ≤8 AND PEEP ≤8). Broader than primary because it catches pure-CPAP rows the primary's non-coalesced AND misses |
+| `ABC` | `sbt_done_abc` | **Girard et al. (Lancet 2008) spec**: ≥30 min on T-piece OR CPAP=5 OR PS<7. The published "no change in PEEP/FiO2 during SBT" clause is dropped (operationally hard in row-level SQL — see `docs/outcomes_specs.md`) |
 
 **How to read divergences on this plot**
 
@@ -205,9 +222,9 @@ app.layout = dbc.Container([
 | `prior_ctrl` | Whether the immediately prior row's mode was a controlled mode (AC-VC / PC / PRVC / SIMV). `sbt-prim` and `sbt_2m` require `prior_ctrl = 1`. |
 | `imv_h`, `lag_imv_h` | Hours the patient has been continuously on IMV at this row, and at the prior row. `sbt_imv6h` requires `lag_imv_h ≥ 6`. |
 | `ps_bf`, `mode_bf`, `device_bf` | Backfilled (post-`resp_processed_bf`) PS-set / mode / device — these are what `03_outcomes.py` actually evaluates against. Compare with raw `mode` / `device` from `wide_df` to spot waterfall-fill differences. |
-| `sbt`, `sbt_any`, `sbt_imv6h`, `sbt_pre`, `sbt_2m` | The 5 flag outputs themselves, sourced row-by-row. |
+| `sbt`, `sbt_any`, `sbt_imv6h`, `sbt_pre`, `sbt_2m`, `sbt_sub`, `sbt_abc` | The 7 SBT-variant flag outputs sourced row-by-row. |
 
-See `docs/intub_extub_specs.md` § "Sensitivity siblings" for the full operationalizations.
+See `docs/outcomes_specs.md` § "Sensitivity siblings" for the full operationalizations.
             """,
             style={"fontSize": "11px", "marginTop": "4px",
                    "fontFamily": "system-ui, sans-serif"},
@@ -755,10 +772,11 @@ def build_timeline(
     _draw_event_vlines(fig, events, n_rows=len(ordered))
 
     # _nth_day labels along top edge. Pushed above the staggered SBT-variant
-    # annotation band (1.005..1.130) so they never collide with event labels.
+    # annotation band (now 1.005..1.180 with subira/abc additions) so they
+    # never collide with event labels.
     for ts_center, nth_day in day_labels_for_cohort(cohort_start, cohort_end):
         fig.add_annotation(
-            x=ts_center, y=1.160, xref="x", yref="paper",
+            x=ts_center, y=1.210, xref="x", yref="paper",
             text=f"d{nth_day}", showarrow=False,
             font={"size": 9, "color": "dimgray"},
         )
@@ -805,9 +823,9 @@ def build_timeline(
             font={"size": 11},
         )
 
-    # Rangeselector on the TOP rendered panel. Placed at y=1.20 to clear
-    # the staggered SBT-variant annotation band (1.005..1.130) and the
-    # day labels (1.160) below it.
+    # Rangeselector on the TOP rendered panel. Placed at y=1.26 to clear
+    # the staggered SBT-variant annotation band (now 1.005..1.180 with
+    # subira/abc) and the day labels (1.210) below it.
     rangeselector_cfg = {
         "buttons": [
             {"count": 6, "label": "6h", "step": "hour", "stepmode": "backward"},
@@ -818,7 +836,7 @@ def build_timeline(
             {"label": "All stay", "step": "all"},
         ],
         "font": {"size": 10},
-        "x": 0, "y": 1.20, "xanchor": "left", "yanchor": "bottom",
+        "x": 0, "y": 1.26, "xanchor": "left", "yanchor": "bottom",
         "bgcolor": "#f5f5f5",
     }
     fig.update_xaxes(rangeselector=rangeselector_cfg, row=1, col=1)
@@ -834,9 +852,10 @@ def build_timeline(
 
     fig.update_layout(
         hovermode="x unified",
-        # margin.t bumped from 80 → 140 to accommodate the staggered SBT
-        # variant annotation band + the day labels above it.
-        margin={"t": 140, "b": 40, "l": 130, "r": 20},
+        # margin.t bumped from 140 → 175 to accommodate the staggered
+        # 7-variant SBT annotation band (1.030..1.180) + day labels (1.210)
+        # + rangeselector (1.26).
+        margin={"t": 175, "b": 40, "l": 130, "r": 20},
         legend={
             "orientation": "v", "x": 1.01, "y": 1.0,
             "groupclick": "toggleitem", "font": {"size": 10},
@@ -997,7 +1016,11 @@ _PRESSOR_UNITS = {
     "vasopressin": "units/min",
     "nee": "mcg/kg/min",
 }
-_RESP_UNITS = {"fio2_set": "(fraction)", "peep_set": "cmH₂O"}
+_RESP_UNITS = {
+    "fio2_set":             "(fraction)",
+    "peep_set":             "cmH₂O",
+    "pressure_support_set": "cmH₂O",
+}
 _VITAL_UNITS = {"heart_rate": "bpm", "map": "mmHg", "spo2": "%", "respiratory_rate": "/min"}
 _ASSESS_UNITS = {"rass": "(score)", "gcs_total": "(score)"}
 
@@ -1207,13 +1230,15 @@ EVENT_LABEL_Y = {
     "discharge_other":    1.005,
     "discharge_hospice":  1.005,
     "discharge_death":    1.005,
-    # SBT primary + 4 sensitivity-sibling variants — staggered up. See the
+    # SBT primary + 6 sensitivity-sibling variants — staggered up. See the
     # in-app SBT legend (above the plot) for what each variant flags.
     "sbt":          1.030,
     "sbt_anyprior": 1.055,
     "sbt_imv6h":    1.080,
     "sbt_prefix":   1.105,
     "sbt_2min":     1.130,
+    "sbt_subira":   1.155,
+    "sbt_abc":      1.180,
 }
 
 # Short on-plot text for SBT variants — the full kind names ("sbt_anyprior")
@@ -1225,6 +1250,8 @@ SBT_KIND_DISPLAY = {
     "sbt_imv6h":    "imv6h",
     "sbt_prefix":   "prefix",
     "sbt_2min":     "2min",
+    "sbt_subira":   "Subira",
+    "sbt_abc":      "ABC",
 }
 
 
@@ -1315,8 +1342,9 @@ def build_summary_strip(enr: PatientEnrichment, wide_df: pd.DataFrame) -> dbc.Al
     if not enr.sbt_daily.empty:
         _sd = enr.sbt_daily
         _cols = ['sbt_done', 'sbt_done_anyprior', 'sbt_done_imv6h',
-                 'sbt_done_prefix', 'sbt_done_2min']
-        _shorts = ['prim', 'anyprior', 'imv6h', 'prefix', '2min']
+                 'sbt_done_prefix', 'sbt_done_2min',
+                 'sbt_done_subira', 'sbt_done_abc']
+        _shorts = ['prim', 'any', 'imv6h', 'pre', '2m', 'sub', 'abc']
         _vals = [
             int(_sd[c].fillna(0).sum()) if c in _sd.columns else 0
             for c in _cols
@@ -1356,10 +1384,11 @@ _TABLE_COLUMN_LABELS = {
     "lorazepam_intm":      "loraz_mg",
     "hydromorphone":       "hydromorph_mg_min",
     "hydromorphone_intm":  "hydromorph_mg",
-    "fio2_set":            "fio2",
-    "peep_set":            "peep",
-    "mode_category":       "mode",
-    "device_category":     "device",
+    "fio2_set":             "fio2",
+    "peep_set":             "peep",
+    "pressure_support_set": "ps_set",
+    "mode_category":        "mode",
+    "device_category":      "device",
     "norepinephrine":      "norepi_mcg_kg_min",
     "epinephrine":         "epi_mcg_kg_min",
     "vasopressin":         "vaso_units_min",
@@ -1388,12 +1417,14 @@ _TABLE_COLUMN_LABELS = {
     "_mode_name_bf":           "mode_name_bf",
     "_device_bf":              "device_bf",
     "_device_name_bf":         "device_name_bf",
-    # 5 SBT variant flags
+    # 7 SBT variant flags (5 prior-mode + 2 trial-based: subira, abc)
     "sbt_done":                "sbt",
     "sbt_done_anyprior":       "sbt_any",
     "sbt_done_imv6h":          "sbt_imv6h",
     "sbt_done_prefix":         "sbt_pre",
     "sbt_done_2min":           "sbt_2m",
+    "sbt_done_subira":         "sbt_sub",
+    "sbt_done_abc":            "sbt_abc",
     # Extub outcome flags (drives extub GEE/logit in 08_models.py)
     "_intub":                  "intub_evt",
     "_extub_1st":              "extub_1st",
@@ -1408,8 +1439,8 @@ _TABLE_COLUMN_LABELS = {
 _TABLE_COLUMN_ORDER = [
     "event_time",
     # ── Outcome flags first (most navigated for both SBT and extub audit) ──
-    # 5 SBT variant flags
-    "sbt", "sbt_any", "sbt_imv6h", "sbt_pre", "sbt_2m",
+    # 7 SBT variant flags (5 prior-mode + 2 trial-based: subira, abc)
+    "sbt", "sbt_any", "sbt_imv6h", "sbt_pre", "sbt_2m", "sbt_sub", "sbt_abc",
     # Extub outcome flags (intubation / extubation / fail / success / trach)
     "intub_evt", "extub_1st", "fail_extub", "succ_extub", "trach_1st",
     # ── Why-did-it-fire context ───────────────────────────────────
@@ -1424,7 +1455,7 @@ _TABLE_COLUMN_ORDER = [
     "mode_bf", "mode_name_bf",
     "device_bf", "device_name_bf",
     # ── Raw resp settings (from wide_df; compare with the _bf versions) ──
-    "fio2", "peep", "mode", "device",
+    "fio2", "peep", "ps_set", "mode", "device",
     # ── Sedatives (cont/intm pairs per drug) ──────────────────────
     "prop_mg_min", "prop_mg",
     "fent_mcg_min", "fent_mcg",
@@ -1454,7 +1485,8 @@ def _linked_table_source(wide_df: pd.DataFrame, enr: PatientEnrichment) -> pd.Da
     keep_from_wide = [
         "event_time",
         "propofol", "fentanyl", "midazolam", "lorazepam", "hydromorphone",
-        "fio2_set", "peep_set", "mode_category", "device_category",
+        "fio2_set", "peep_set", "pressure_support_set",
+        "mode_category", "device_category",
         "norepinephrine", "epinephrine", "vasopressin",
         "heart_rate", "map", "spo2", "respiratory_rate",
     ]
@@ -1519,9 +1551,10 @@ def _linked_table_source(wide_df: pd.DataFrame, enr: PatientEnrichment) -> pd.Da
             "fio2_set", "peep_set", "pressure_support_set",
             "mode_category", "mode_name",
             "device_category", "device_name",
-            # 5 SBT variant flags
+            # 7 SBT variant flags (5 prior-mode + 2 trial-based)
             "sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
             "sbt_done_prefix", "sbt_done_2min",
+            "sbt_done_subira", "sbt_done_abc",
             # Extub outcome flags
             "_intub", "_extub_1st", "_fail_extub", "_success_extub",
             "_trach_1st",
@@ -1615,7 +1648,7 @@ def _table_spec(df: pd.DataFrame) -> tuple[list[dict], list[dict]]:
 
 if __name__ == "__main__":
     if not _SITES:
-        print("WARNING: no site directories found under output/. Did you run `make run SITE=...`?")
+        logger.info("WARNING: no site directories found under output/. Did you run `make run SITE=...`?")
     else:
-        print(f"Sites discovered: {_SITES}")
+        logger.info(f"Sites discovered: {_SITES}")
     app.run(debug=False, host="127.0.0.1", port=8050)

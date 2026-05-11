@@ -1,12 +1,25 @@
-"""Weight QC audit + drop-list generation for sedative dose-conversion.
+"""Weight QC DIAGNOSTIC — federated audit CSVs + figure.
 
-Federated-safe: every site that runs the pipeline produces a sharable summary
-documenting (a) how severe the missing-weight issue is and (b) which
-hospitalizations were excluded and why. Off-site reviewers compare summaries
+B3 refactor (2026-05): the same three drop criteria (zero-weight / jump /
+range) are now computed inline in `01_cohort.py` via
+`_utils.compute_weight_qc_exclusions`. This script is no longer required
+by `make run` and no longer produces the load-bearing drop list — it
+remains as a DIAGNOSTIC tool for federated cross-site QA:
+
+  - `weight_qc_summary.csv` — section-by-section metrics (raw availability,
+    clamp impact, jump/range CDFs, per-criterion drop counts).
+  - `weight_qc_exclusions.csv` — per-criterion drop counts + thresholds.
+  - `weight_impact_comparison.csv` — section (h) impact analysis on
+    prop_dif_mcg_kg_min across 4 weight-attachment strategies.
+  - `weight_audit.png` — multi-panel figure.
+
+The legacy `weight_qc_drop_list.parquet` and `weight_audit_examples.csv`
+outputs are still written for backward compatibility but are NOT consumed
+by the pipeline anymore.
+
+Federated-safe: outputs document drop-rule SEVERITY at each site without
+exposing hospitalization-level rows. Off-site reviewers compare summaries
 cross-site without ever needing patient-level access.
-
-This is Phase 1 (audit-only) — produces the drop list but does NOT apply it.
-Phase 2 wires the drop into 01_cohort.py with CONSORT updates.
 
 Sections (each → one panel of weight_audit.png + rows in the summary CSV):
   (a) Raw availability & outlier-clamp impact
@@ -16,10 +29,12 @@ Sections (each → one panel of weight_audit.png + rows in the summary CSV):
   (d) Stage B: per-day ASOF + admission-fallback characterization
   (e) Cross-stage consistency (Stage A weight vs Stage B weight)
   (f) Within-patient stability + cutoff-defensibility CDFs
-  (g) Drop-list generation (incremental criterion application)
+  (g) Drop-list characterization (no longer feeds the pipeline)
   (h) Impact analysis on prop_dif_mcg_kg_min (4 weight strategies)
 
 Usage:
+  make weight-diagnostic SITE=mimic
+  # or directly:
   uv run python code/qc/weight_audit.py
   SITE=ucmc uv run python code/qc/weight_audit.py
   WEIGHT_QC_MAX_JUMP_KG=15 uv run python code/qc/weight_audit.py
@@ -37,6 +52,10 @@ import duckdb
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from clifpy import setup_logging
+from clifpy.utils.logging_config import get_logger
+
+logger = get_logger("epi_sedation.weight_audit")
 
 # ── Site / paths ─────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -55,7 +74,16 @@ SITE = os.getenv("SITE", _load_site_name())
 SITE_OUT = PROJECT_ROOT / "output" / SITE
 SITE_QC = SITE_OUT / "qc"
 SHARE_QC = PROJECT_ROOT / "output_to_share" / SITE / "qc"
-SHARE_FIG = PROJECT_ROOT / "output_to_share" / SITE / "figures"
+# Path B++ refactor: the legacy `figures/` subdir was retired. Weight-audit
+# is itself a QC artifact, so its PNG belongs in the existing `qc/` flat dir
+# alongside the weight_qc_* CSVs.
+SHARE_FIG = SHARE_QC
+
+# Per-site dual log files at output/{site}/logs/clifpy_all.log +
+# clifpy_errors.log (pyCLIF integration guide rule 1). weight_audit is
+# its own entry-point subprocess so it must call setup_logging itself.
+SITE_OUT.mkdir(parents=True, exist_ok=True)
+setup_logging(output_directory=str(SITE_OUT))
 
 # ── Drop-policy thresholds (env-var configurable) ────────────────────────
 WEIGHT_QC_MAX_JUMP_KG = float(os.getenv("WEIGHT_QC_MAX_JUMP_KG", "20"))
@@ -112,11 +140,19 @@ def _clifpy_commit() -> str:
 
 
 def load_cohort_hosp_ids() -> list[str]:
-    """Cohort = hospitalizations in the analytical dataset."""
+    """Cohort = hospitalizations in the modeling dataset."""
+    # Phase 4 cutover (2026-05-08): read consolidated parquet + apply
+    # outcome-modeling filter inline to recover the modeling-cohort hosp set.
     df = pd.read_parquet(
-        SITE_OUT / "analytical_dataset.parquet",
-        columns=["hospitalization_id"],
+        SITE_OUT / "model_input_by_id_imvday.parquet",
+        columns=["hospitalization_id", "_nth_day",
+                 "sbt_done_next_day", "success_extub_next_day"],
     )
+    df = df.loc[
+        (df["_nth_day"] > 0)
+        & df["sbt_done_next_day"].notna()
+        & df["success_extub_next_day"].notna()
+    ]
     return df["hospitalization_id"].drop_duplicates().tolist()
 
 
@@ -162,12 +198,18 @@ def load_med_admins(hosp_ids: list[str]) -> pd.DataFrame:
 
 def load_weight_daily() -> pd.DataFrame:
     """Per-day weight built by 04_covariates.py (Stage B's weight)."""
-    return pd.read_parquet(SITE_OUT / "weight_daily.parquet")
+    return pd.read_parquet(SITE_OUT / "weight_by_id_imvday.parquet")
 
 
 def load_analytical() -> pd.DataFrame:
     """For impact analysis (section h) — needs prop_dif_mg_hr + weight cols."""
-    return pd.read_parquet(SITE_OUT / "analytical_dataset.parquet")
+    # Phase 4 cutover (2026-05-08): consolidated parquet + outcome filter.
+    df = pd.read_parquet(SITE_OUT / "model_input_by_id_imvday.parquet")
+    return df.loc[
+        (df["_nth_day"] > 0)
+        & df["sbt_done_next_day"].notna()
+        & df["success_extub_next_day"].notna()
+    ].reset_index(drop=True)
 
 
 def _to_utc(s: pd.Series) -> pd.Series:
@@ -514,7 +556,7 @@ def section_d_stage_b(weight_daily: pd.DataFrame, raw_w_clamped: pd.DataFrame,
     # weight_daily has hospitalization_id + _nth_day. We need event_dttm.
     # 04_covariates.py's day_starts is filtered from cohort_shift_change_grids;
     # the simplest faithful reconstruction is to load that parquet.
-    grid_path = SITE_OUT / "cohort_hrly_grids.parquet"
+    grid_path = SITE_OUT / "cohort_meta_by_id_imvhr.parquet"
     if grid_path.exists():
         grids = pd.read_parquet(
             grid_path, columns=["hospitalization_id", "_nth_day", "_hr", "event_dttm"]
@@ -556,7 +598,7 @@ def section_d_stage_b(weight_daily: pd.DataFrame, raw_w_clamped: pd.DataFrame,
             smry.add("d", f"stage_b_staleness_{k}", v)
         return {"joined": joined, "staleness_bins": bins}
     else:
-        smry.add("d", "ERROR", "cohort_hrly_grids.parquet not found",
+        smry.add("d", "ERROR", "cohort_meta_by_id_imvhr.parquet not found",
                  note="cannot re-derive Stage B ASOF without grid")
         return {"joined": pd.DataFrame(), "staleness_bins": {}}
 
@@ -770,10 +812,42 @@ def section_g_drop_list(
 # ── Section (h) ──────────────────────────────────────────────────────────
 def section_h_impact(weight_daily: pd.DataFrame, raw_w_clamped: pd.DataFrame,
                      joined_b: pd.DataFrame, smry: AuditSummary) -> dict:
-    """Recompute prop_dif_mcg_kg_min four ways and compare."""
+    """Recompute prop_dif_mcg_kg_min four ways and compare.
+
+    Phase-2 detection: if the analytical dataset already carries
+    `prop_dif_mcg_kg_min` directly (post-Phase-2 schema), the
+    multi-strategy comparison is moot — Stage A's pre-attached weight is
+    the only weight in play. We emit a single `phase_2_pipeline` row with
+    the descriptive's actual stats and skip the strategies. Pre-Phase-2
+    datasets fall through to the original 4-strategy logic.
+    """
     df = load_analytical()
+
+    # Phase 2 schema: prop_dif_mcg_kg_min is produced upstream.
+    if "prop_dif_mcg_kg_min" in df.columns and "prop_dif_mg_hr" not in df.columns:
+        s = df["prop_dif_mcg_kg_min"].dropna()
+        ab = s.abs()
+        row = {
+            "strategy": "phase_2_pipeline",
+            "n": int(len(ab)),
+            "mean_abs": float(ab.mean()) if len(ab) else 0.0,
+            "p50_abs": float(np.percentile(ab, 50)) if len(ab) else 0.0,
+            "p95_abs": float(np.percentile(ab, 95)) if len(ab) else 0.0,
+        }
+        smry.add("h", "phase_2_n_pd", row["n"])
+        smry.add("h", "phase_2_mean_abs", round(row["mean_abs"], 4),
+                 unit="mcg/kg/min",
+                 note="Phase-2 pipeline produces prop_dif_mcg_kg_min directly; "
+                      "multi-strategy comparison skipped")
+        smry.add("h", "phase_2_p95_abs", round(row["p95_abs"], 4),
+                 unit="mcg/kg/min")
+        return {"compare_df": pd.DataFrame([row])}
+
+    # Pre-Phase-2: original 4-strategy comparison.
     if "prop_dif_mg_hr" not in df.columns:
-        smry.add("h", "ERROR", "prop_dif_mg_hr not in analytical_dataset", note="skipping impact")
+        smry.add("h", "ERROR",
+                 "neither prop_dif_mg_hr nor prop_dif_mcg_kg_min in modeling_dataset",
+                 note="skipping impact")
         return {"compare_df": pd.DataFrame()}
 
     # Strategy 1: status quo
@@ -1009,23 +1083,23 @@ def write_outputs(smry: AuditSummary, sec_c: dict, sec_g: dict, sec_h: dict) -> 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────
 def main() -> None:
-    print(f"\n=== Weight QC audit — site={SITE} ===")
-    print(f"clifpy commit: {_clifpy_commit()}")
-    print(f"jump threshold: {WEIGHT_QC_MAX_JUMP_KG} kg / {WEIGHT_QC_MAX_JUMP_HOURS} h")
-    print(f"range rule: {'ON ' + str(WEIGHT_QC_MAX_RANGE_KG) + ' kg' if WEIGHT_QC_RANGE_RULE_ON else 'OFF'}\n")
+    logger.info(f"\n=== Weight QC audit — site={SITE} ===")
+    logger.info(f"clifpy commit: {_clifpy_commit()}")
+    logger.info(f"jump threshold: {WEIGHT_QC_MAX_JUMP_KG} kg / {WEIGHT_QC_MAX_JUMP_HOURS} h")
+    logger.info(f"range rule: {'ON ' + str(WEIGHT_QC_MAX_RANGE_KG) + ' kg' if WEIGHT_QC_RANGE_RULE_ON else 'OFF'}\n")
 
     smry = AuditSummary()
     hosp_ids = load_cohort_hosp_ids()
-    print(f"cohort hospitalizations: {len(hosp_ids)}")
+    logger.info(f"cohort hospitalizations: {len(hosp_ids)}")
     raw_w = load_raw_weight_events(hosp_ids)
-    print(f"raw weight rows (>0): {len(raw_w)}")
+    logger.info(f"raw weight rows (>0): {len(raw_w)}")
 
     sec_a = section_a_raw_availability(raw_w, hosp_ids, smry)
     raw_w_clamped = _clamp_vitals(raw_w)
-    print(f"clamped weight rows: {len(raw_w_clamped)}")
+    logger.info(f"clamped weight rows: {len(raw_w_clamped)}")
 
     med = load_med_admins(hosp_ids)
-    print(f"sedative admin rows: {len(med)}")
+    logger.info(f"sedative admin rows: {len(med)}")
 
     sec_b = section_b_stage_a_asof(med, raw_w_clamped, smry)
     sec_c = section_c_conversion_outcome(med, raw_w_clamped, smry)
@@ -1038,21 +1112,21 @@ def main() -> None:
     sec_h = section_h_impact(weight_daily, raw_w_clamped,
                               sec_d.get("joined", pd.DataFrame()), smry)
 
-    print("\n--- Summary preview ---")
-    print(smry.to_df().to_string(index=False, max_colwidth=80))
+    logger.info("\n--- Summary preview ---")
+    logger.info(smry.to_df().to_string(index=False, max_colwidth=80))
 
     render_panel_png(sec_a, sec_b, sec_d, sec_e, sec_f, sec_h,
                      SHARE_FIG / "weight_audit.png")
     write_outputs(smry, sec_c, sec_g, sec_h)
 
-    print(f"\nWrote:")
-    print(f"  {SHARE_QC}/weight_qc_summary.csv")
-    print(f"  {SHARE_QC}/weight_qc_exclusions.csv")
-    print(f"  {SHARE_QC}/weight_impact_comparison.csv")
-    print(f"  {SHARE_QC}/weight_qc_unit_failure_breakdown.csv")
-    print(f"  {SHARE_FIG}/weight_audit.png")
-    print(f"  {SITE_QC}/weight_qc_drop_list.parquet")
-    print(f"  {SITE_QC}/weight_audit_examples.csv")
+    logger.info(f"\nWrote:")
+    logger.info(f"  {SHARE_QC}/weight_qc_summary.csv")
+    logger.info(f"  {SHARE_QC}/weight_qc_exclusions.csv")
+    logger.info(f"  {SHARE_QC}/weight_impact_comparison.csv")
+    logger.info(f"  {SHARE_QC}/weight_qc_unit_failure_breakdown.csv")
+    logger.info(f"  {SHARE_FIG}/weight_audit.png")
+    logger.info(f"  {SITE_QC}/weight_qc_drop_list.parquet")
+    logger.info(f"  {SITE_QC}/weight_audit_examples.csv")
 
 
 if __name__ == "__main__":

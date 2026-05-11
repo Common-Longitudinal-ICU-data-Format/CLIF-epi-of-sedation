@@ -48,11 +48,14 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 # ── Style constants ─────────────────────────────────────────────────────
 
 # Column keys match the 2026-04-24 unit-suffix convention in
-# output/{site}/sed_dose_by_hr.parquet: after SUM-per-hour, values are total
+# output/{site}/seddose_by_id_imvhr.parquet: after SUM-per-hour, values are total
 # mg (or mcg) delivered in that hour, so the suffix reads `_mg_hr_cont` /
 # `_mcg_hr_cont`. Update 02_exposure.py's rename maps if renaming further.
 SEDATIVE_COLORS = {
-    "propofol_mg_hr_cont": DRUG_COLORS["prop"],
+    # Phase 2 (2026-04-27): propofol cont column is now mcg/kg/hr
+    # (preferred unit changed in 02_exposure.py; weight pre-attached so
+    # /kg conversion is lossless).
+    "propofol_mcg_kg_hr_cont": DRUG_COLORS["prop"],
     "fentanyl_mcg_hr_cont": DRUG_COLORS["fenteq"],
     "midazolam_mg_hr_cont": DRUG_COLORS["midazeq"],
     "hydromorphone_mg_hr_cont": "#bcbddc",
@@ -72,8 +75,9 @@ ASSESSMENT_COLORS = {
 }
 
 RESP_COLORS = {
-    "fio2_set": "#e377c2",
-    "peep_set": "#17becf",
+    "fio2_set":             "#e377c2",
+    "peep_set":              "#17becf",
+    "pressure_support_set":  "#bcbd22",
 }
 
 VITAL_COLORS = {
@@ -121,7 +125,7 @@ EVENT_COLORS = {
     "extubation": "#2166ac",
     # Primary SBT (spec-literal) and its 4 sensitivity siblings. Variants are
     # rendered as distinct shades of the same purple family so they read as
-    # related-but-different markers; see docs/intub_extub_specs.md "Sensitivity
+    # related-but-different markers; see docs/outcomes_specs.md "Sensitivity
     # siblings" for what each variant operationalizes. The contrast between
     # `sbt` (primary) and `sbt_prefix` (pre-fix every-row reproduction) is
     # the most informative side-by-side: anywhere `sbt_prefix` fires but
@@ -132,6 +136,8 @@ EVENT_COLORS = {
     "sbt_imv6h":    "#5d3d7a",   # ≥6h continuous IMV before flip
     "sbt_prefix":   "#c4a8e0",   # pre-fix every-row baseline reproduction
     "sbt_2min":     "#9b6cb8",   # 2-min sustained-duration variant
+    "sbt_subira":   "#3f7a8c",   # Subira et al. — teal family to differentiate
+    "sbt_abc":      "#1f4e60",   # ABC trial (Girard et al.) — darker teal
     "tracheostomy": "#d97706",
     "withdrawal": "#525252",
     # Discharge event color-coded by outcome bucket
@@ -161,7 +167,7 @@ HOVER_WINDOW_MIN = 240
 # ── Site discovery / config ─────────────────────────────────────────────
 
 def list_sites() -> list[str]:
-    """Return lowercase site names that have an analytical_dataset.parquet."""
+    """Return lowercase site names that have a model_input_by_id_imvday.parquet."""
     if not OUTPUT_DIR.exists():
         return []
     sites: list[str] = []
@@ -170,7 +176,9 @@ def list_sites() -> list[str]:
             continue
         if child.name.startswith("_"):
             continue
-        if (child / "analytical_dataset.parquet").exists():
+        # Phase 4 cutover (2026-05-08): consolidated parquet replaces
+        # modeling_dataset.parquet as the canonical "site has data" probe.
+        if (child / "model_input_by_id_imvday.parquet").exists():
             sites.append(child.name)
     return sites
 
@@ -289,8 +297,8 @@ def _read_filtered_parquet(path: Path, hosp_id: str) -> pd.DataFrame:
 def _read_sbt_onset_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
     """Load row-level SBT onset events for one hospitalization.
 
-    Reads the per-row `sbt_outcomes.parquet` (NOT the daily aggregate
-    `sbt_outcomes_daily.parquet`) so the dashboard can place SBT vlines at
+    Reads the per-row `outcomes_by_event.parquet` (NOT the daily aggregate
+    `outcomes_by_id_imvday.parquet`) so the dashboard can place SBT vlines at
     the *actual* `event_dttm` of each onset row. The daily aggregate has
     no timestamp column and forces an admit-time-anchored guess that can
     be off by up to 24 h.
@@ -310,13 +318,14 @@ def _read_sbt_onset_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
     verify *why* each variant fired (e.g., `_prior_mode_controlled = 1`
     for the primary `sbt_done`).
     """
-    path = site_dir / "sbt_outcomes.parquet"
+    path = site_dir / "outcomes_by_event.parquet"
     if not path.exists():
         return pd.DataFrame()
     cols = [
         "hospitalization_id", "event_dttm", "_block_id",
         "sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
         "sbt_done_prefix", "sbt_done_2min",
+        "sbt_done_subira", "sbt_done_abc",
         # Supporting columns for "why did this fire" audit.
         "_block_duration_mins", "_lag_sbt_state",
         "_prior_mode_controlled", "_lag_imv_streak_minutes",
@@ -329,18 +338,11 @@ def _read_sbt_onset_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
     )
     if df.empty:
         return df
-    # NOTE: `event_dttm` in `sbt_outcomes.parquet` is tagged `America/Chicago`
-    # (DuckDB stamps `TIMESTAMPTZ` columns with the session tz at write time,
-    # and 03_outcomes.py runs in the user's local tz). Re-tag to the config's
-    # `US/Eastern` so the wall-clock matches `wide_df.event_time` in the
-    # dashboard's linked table. Same UTC instant, just the display label.
-    cfg = load_site_config(site_dir.name)
-    target_tz = cfg.get("timezone")
-    if target_tz and pd.api.types.is_datetime64_any_dtype(df["event_dttm"]):
-        if df["event_dttm"].dt.tz is not None:
-            df["event_dttm"] = df["event_dttm"].dt.tz_convert(target_tz)
+    # event_dttm is already UTC tz-tagged on disk (03_outcomes.py applies
+    # to_utc before writing). No read-time conversion needed.
     flag_cols = ["sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
-                 "sbt_done_prefix", "sbt_done_2min"]
+                 "sbt_done_prefix", "sbt_done_2min",
+                 "sbt_done_subira", "sbt_done_abc"]
     onset_mask = (df[flag_cols].fillna(0).astype(int) == 1).any(axis=1)
     return df.loc[onset_mask].sort_values("event_dttm").reset_index(drop=True)
 
@@ -361,11 +363,11 @@ def _read_sbt_audit_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
     only the onset moment via the vline but has no view into WHY each
     variant agreed or disagreed at that moment.
 
-    `event_dttm` is tz-converted to the site's configured timezone so
-    timestamps align with `wide_df.event_time` for the merge in
-    `_linked_table_source`.
+    `event_dttm` arrives already UTC tz-tagged from `outcomes_by_event.parquet`
+    (03_outcomes.py applies `to_utc` at the write boundary), so no read-time
+    conversion is needed for the `_linked_table_source` merge.
     """
-    path = site_dir / "sbt_outcomes.parquet"
+    path = site_dir / "outcomes_by_event.parquet"
     if not path.exists():
         return pd.DataFrame()
     cols = [
@@ -381,9 +383,10 @@ def _read_sbt_audit_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
         "fio2_set", "peep_set", "pressure_support_set",
         "mode_category", "mode_name",
         "device_category", "device_name",
-        # All 5 SBT variant flags
+        # All 7 SBT variant flags (5 prior + 2 trial-based: subira, abc)
         "sbt_done", "sbt_done_anyprior", "sbt_done_imv6h",
         "sbt_done_prefix", "sbt_done_2min",
+        "sbt_done_subira", "sbt_done_abc",
         # Extubation outcome flags (row-level, drives the extub GEE/logit
         # outcomes in 08_models.py)
         "_intub", "_extub_1st", "_fail_extub", "_success_extub",
@@ -396,21 +399,23 @@ def _read_sbt_audit_rows(site_dir: Path, hosp_id: str) -> pd.DataFrame:
     )
     if df.empty:
         return df
-    cfg = load_site_config(site_dir.name)
-    target_tz = cfg.get("timezone")
-    if target_tz and pd.api.types.is_datetime64_any_dtype(df["event_dttm"]):
-        if df["event_dttm"].dt.tz is not None:
-            df["event_dttm"] = df["event_dttm"].dt.tz_convert(target_tz)
+    # event_dttm is already site-tz tagged on disk (03_outcomes.py retags).
     return df.sort_values("event_dttm").reset_index(drop=True)
 
 
 @lru_cache(maxsize=32)
 def get_enrichment(site: str, hosp_id: str) -> PatientEnrichment:
     site_dir = OUTPUT_DIR / site
-    analytical = _read_filtered_parquet(site_dir / "analytical_dataset.parquet", hosp_id)
-    sed_hourly = _read_filtered_parquet(site_dir / "sed_dose_by_hr.parquet", hosp_id)
-    covariates = _read_filtered_parquet(site_dir / "covariates_daily.parquet", hosp_id)
-    sbt_daily = _read_filtered_parquet(site_dir / "sbt_outcomes_daily.parquet", hosp_id)
+    # Phase 4 cutover (2026-05-08): per-patient enrichment now reads from
+    # the consolidated parquet. For a single-patient view we pull every
+    # registry row (no outcome filter) so the trajectory viewer sees the
+    # patient's full IMV trajectory (including partial first/last days).
+    # Downstream analyses that need the modeling-cohort filter apply it
+    # themselves — single-patient QC is a different need.
+    analytical = _read_filtered_parquet(site_dir / "model_input_by_id_imvday.parquet", hosp_id)
+    sed_hourly = _read_filtered_parquet(site_dir / "seddose_by_id_imvhr.parquet", hosp_id)
+    covariates = _read_filtered_parquet(site_dir / "covariates_by_id_imvday.parquet", hosp_id)
+    sbt_daily = _read_filtered_parquet(site_dir / "outcomes_by_id_imvday.parquet", hosp_id)
     sbt_rows = _read_sbt_onset_rows(site_dir, hosp_id)
     sbt_audit = _read_sbt_audit_rows(site_dir, hosp_id)
     imv_streaks = _read_filtered_parquet(site_dir / "cohort_imv_streaks.parquet", hosp_id)
@@ -490,7 +495,7 @@ def get_all_imv_streaks(site: str, hosp_id: str) -> pd.DataFrame:
 
     Lifts the gap-island SQL from code/01_cohort.py:190-265, dropping the
     `_streak_id == 1` filter so re-intubations post-cohort are retained.
-    Runs on `output/{site}/resp_processed_bf.parquet` filtered to a single
+    Runs on `output/{site}/cohort_resp_processed_bf.parquet` filtered to a single
     hospitalization — small enough that per-patient on-the-fly is faster
     than materializing a separate parquet (and it stays in-sync with
     upstream edits automatically).
@@ -501,7 +506,7 @@ def get_all_imv_streaks(site: str, hosp_id: str) -> pd.DataFrame:
     """
     import duckdb  # lazy import — avoids paying cost at module load
 
-    path = OUTPUT_DIR / site / "resp_processed_bf.parquet"
+    path = OUTPUT_DIR / site / "cohort_resp_processed_bf.parquet"
     if not path.exists():
         return pd.DataFrame()
     resp_p = pd.read_parquet(path, filters=[("hospitalization_id", "=", hosp_id)])
@@ -597,28 +602,50 @@ def categorize_discharge(category: object) -> str:
 
 # ── Shift / cohort-zone geometry helpers ───────────────────────────────
 
+def _local_boundary(ts: pd.Timestamp, hour: int) -> pd.Timestamp:
+    """Return tz-aware timestamp at `hour` local-time on the same calendar
+    date as `ts`. DST-safe: ambiguous fall-back hour → earlier (non-DST)
+    occurrence; non-existent spring-forward hour → shifts forward to next
+    valid minute. Falls back to naive arithmetic if `ts` itself is naive.
+
+    NOTE: `tz_localize` on a single `Timestamp` takes `ambiguous` as a
+    bool / 'NaT' / 'raise' (not 'earliest'/'latest' like `Series.dt`).
+    `ambiguous=False` means "treat as non-DST / standard time", which is
+    the earlier of the two fall-back occurrences.
+    """
+    if ts.tz is None:
+        return ts.normalize().replace(hour=hour)
+    site_tz = ts.tz
+    naive = ts.tz_localize(None).normalize().replace(hour=hour)
+    return naive.tz_localize(site_tz, ambiguous=False, nonexistent="shift_forward")
+
+
 def night_windows_in_range(
     start: pd.Timestamp | None, end: pd.Timestamp | None,
 ) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
     """Return (night_start, night_end) pairs covering [start, end].
 
-    Each night = 19:00 on day N through 07:00 on day N+1. Edge windows are
-    clipped to the range so the shading never extends beyond the plot.
+    Each night = 19:00 local on day N through 07:00 local on day N+1.
+    Edge windows are clipped to the range so the shading never extends
+    beyond the plot. Boundary construction goes through `_local_boundary`
+    and `pd.tseries.offsets.Day` so DST transitions land at the correct
+    wall-clock — `pd.Timedelta(days=1)` is absolute (24h) and would drift
+    by ±1h on spring-forward / fall-back days.
     """
     if start is None or end is None or pd.isna(start) or pd.isna(end) or end <= start:
         return []
     windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
-    # Begin one day before `start` to catch a night window that started
-    # before the cohort but still intersects the range.
-    day = start.normalize() - pd.Timedelta(days=1)
+    # Begin one calendar day before `start` to catch a night window that
+    # started before the cohort but still intersects the range.
+    day = start.normalize() - pd.tseries.offsets.Day(1)
     while day <= end:
-        n_start = day + pd.Timedelta(hours=NIGHT_START_HOUR)
-        n_end = day + pd.Timedelta(days=1, hours=DAY_START_HOUR)
+        n_start = _local_boundary(day, NIGHT_START_HOUR)
+        n_end = _local_boundary(day + pd.tseries.offsets.Day(1), DAY_START_HOUR)
         clipped_start = max(n_start, start)
         clipped_end = min(n_end, end)
         if clipped_end > clipped_start:
             windows.append((clipped_start, clipped_end))
-        day = day + pd.Timedelta(days=1)
+        day = day + pd.tseries.offsets.Day(1)
     return windows
 
 
@@ -627,26 +654,26 @@ def cohort_excluded_zones(
 ) -> list[tuple[pd.Timestamp, pd.Timestamp, str]]:
     """Return [(start, end, label), ...] for day-0 and last-day zones.
 
-    These are the patient-day types that analytical_dataset.parquet drops
+    These are the patient-day types that modeling_dataset.parquet drops
     via its `_nth_day > 0 AND next_day_outcome IS NOT NULL` filter (see
     §4 of the plan / docs/uptitration_paradox_investigation.md §0). Making
     them visible is the whole point of the paradox-investigation viewer.
     """
     if cohort_start is None or cohort_end is None:
         return []
-    # Day-0 zone: cohort_start → first 7 AM after cohort_start
-    first_7am = cohort_start.normalize() + pd.Timedelta(hours=DAY_START_HOUR)
+    # Day-0 zone: cohort_start → first local 7 AM after cohort_start
+    first_7am = _local_boundary(cohort_start, DAY_START_HOUR)
     if first_7am <= cohort_start:
-        first_7am = first_7am + pd.Timedelta(days=1)
+        first_7am = _local_boundary(cohort_start + pd.tseries.offsets.Day(1), DAY_START_HOUR)
 
     zones: list[tuple[pd.Timestamp, pd.Timestamp, str]] = []
     if first_7am > cohort_start:
         zones.append((cohort_start, min(first_7am, cohort_end), "day 0"))
 
-    # Last-day zone: last 7 AM on or before cohort_end → cohort_end
-    last_7am = cohort_end.normalize() + pd.Timedelta(hours=DAY_START_HOUR)
+    # Last-day zone: last local 7 AM on or before cohort_end → cohort_end
+    last_7am = _local_boundary(cohort_end, DAY_START_HOUR)
     if last_7am >= cohort_end:
-        last_7am = last_7am - pd.Timedelta(days=1)
+        last_7am = _local_boundary(cohort_end - pd.tseries.offsets.Day(1), DAY_START_HOUR)
     if last_7am > cohort_start and last_7am < cohort_end:
         zones.append((last_7am, cohort_end, "last day"))
     return zones
@@ -657,29 +684,33 @@ def day_labels_for_cohort(
 ) -> list[tuple[pd.Timestamp, int]]:
     """Return [(center_timestamp, nth_day), ...] for labeling each day in cohort.
 
-    Day 0 is partial (cohort_start → first 7 AM). Days 1..N-1 are full
-    12h-day + 12h-night windows (7 AM → 7 AM). Last day is partial again.
-    Labels are placed at the time-midpoint of each day window so they
-    don't collide with 7 AM boundary markers.
+    Day 0 is partial (cohort_start → first local 7 AM). Days 1..N-1 are
+    full 7 AM → 7 AM windows (24 calendar hours, so 23 or 25 absolute
+    hours on DST boundary days). Last day is partial again. Labels are
+    placed at the time-midpoint of each window so they don't collide with
+    7 AM boundary markers.
     """
     if cohort_start is None or cohort_end is None or cohort_end <= cohort_start:
         return []
-    first_7am = cohort_start.normalize() + pd.Timedelta(hours=DAY_START_HOUR)
+    first_7am = _local_boundary(cohort_start, DAY_START_HOUR)
     if first_7am <= cohort_start:
-        first_7am = first_7am + pd.Timedelta(days=1)
+        first_7am = _local_boundary(cohort_start + pd.tseries.offsets.Day(1), DAY_START_HOUR)
 
     labels: list[tuple[pd.Timestamp, int]] = []
     # Day 0 (partial)
     day0_end = min(first_7am, cohort_end)
     labels.append((cohort_start + (day0_end - cohort_start) / 2, 0))
 
-    # Full days
+    # Full days — calendar-day stepping so DST boundaries don't drift the label
     t = first_7am
     idx = 1
-    while t + pd.Timedelta(days=1) <= cohort_end:
-        labels.append((t + pd.Timedelta(hours=12), idx))
+    while True:
+        next_t = t + pd.tseries.offsets.Day(1)
+        if next_t > cohort_end:
+            break
+        labels.append((t + (next_t - t) / 2, idx))
         idx += 1
-        t = t + pd.Timedelta(days=1)
+        t = next_t
 
     # Last partial day (if there's any slice after the last full-day 7 AM)
     if t < cohort_end:
@@ -702,28 +733,33 @@ def extract_events(enr: PatientEnrichment) -> pd.DataFrame:
     """
     rows: list[dict[str, Any]] = []
 
-    # Intubation / extubation — every streak, not just the cohort-qualifying one.
-    # Label downgrades to `re-intub #N` / `re-extub #N` for streak_id > 1 so the
-    # viewer can spot reintubation patterns at a glance.
-    streaks = enr.all_imv_streaks if not enr.all_imv_streaks.empty else enr.imv_streaks
-    for _, s in streaks.iterrows():
-        sid = int(s.get("_streak_id", 0) or 0)
-        prefix_in = "Intubation" if sid <= 1 else f"Re-intub #{sid}"
-        prefix_out = "Extubation" if sid <= 1 else f"Re-extub #{sid}"
-        if pd.notna(s.get("_start_dttm")):
-            rows.append({
-                "time": pd.Timestamp(s["_start_dttm"]),
-                "kind": "intubation",
-                "label": f"{prefix_in} (streak {sid})",
-            })
-        if pd.notna(s.get("_end_dttm")):
-            rows.append({
-                "time": pd.Timestamp(s["_end_dttm"]),
-                "kind": "extubation",
-                "label": f"{prefix_out} (streak {sid})",
-            })
+    # Intubation / extubation events — sourced from per-row sbt_outcomes
+    # (via `enr.sbt_audit`) so vlines anchor to the actual `event_dttm` of
+    # the row where each flag = 1. Pre-2026-04-26 these came from
+    # `enr.all_imv_streaks` (`_start_dttm` / `_end_dttm` of each IMV
+    # streak), but those streak boundaries are computed from a different
+    # gap-island over `device_category='imv'` and don't always sync with
+    # the row-level `_intub` / `_extub_1st` flags that drive the
+    # extubation outcome models. Using sbt_outcomes for both makes the
+    # dashboard markers consistent with the model-driven outcome flags.
+    if not enr.sbt_audit.empty:
+        for col, kind, label_base in [
+            ("_intub",       "intubation",  "Intubation"),
+            ("_extub_1st",   "extubation",  "Extubation"),
+        ]:
+            if col not in enr.sbt_audit.columns:
+                continue
+            flagged = enr.sbt_audit[
+                enr.sbt_audit[col].fillna(0).astype(int) == 1
+            ]
+            for _, r in flagged.iterrows():
+                rows.append({
+                    "time": pd.Timestamp(r["event_dttm"]),
+                    "kind": kind,
+                    "label": label_base,
+                })
 
-    # SBT events — read from the per-row `sbt_outcomes.parquet` (via
+    # SBT events — read from the per-row `outcomes_by_event.parquet` (via
     # `enr.sbt_rows`) so the vline x-position is the *actual* onset
     # `event_dttm`, not an admit-time-anchored guess derived from the
     # daily aggregate's `_nth_day`. Pre-2026-04-26 the dashboard used the
@@ -743,6 +779,8 @@ def extract_events(enr: PatientEnrichment) -> pd.DataFrame:
         "sbt_done_imv6h":    ("sbt_imv6h",    "SBT (imv6h)"),
         "sbt_done_prefix":   ("sbt_prefix",   "SBT (prefix)"),
         "sbt_done_2min":     ("sbt_2min",     "SBT (2min)"),
+        "sbt_done_subira":   ("sbt_subira",   "SBT (Subira)"),
+        "sbt_done_abc":      ("sbt_abc",      "SBT (ABC)"),
     }
     if not enr.sbt_rows.empty:
         sorted_rows = enr.sbt_rows.sort_values("event_dttm")
@@ -760,24 +798,33 @@ def extract_events(enr: PatientEnrichment) -> pd.DataFrame:
                     "label": label,
                 })
 
-    # Trach / withdrawal — patient-level flags from the daily aggregate.
-    # These don't have a precise row-level onset moment in the same way
-    # SBT events do, so the daily anchor is appropriate. (The same admit-
-    # time anchoring caveat applies but is far less visually distracting
-    # since these fire at most once per patient.)
+    # Tracheostomy — sourced from sbt_outcomes per-row for the same
+    # anchoring-correctness reason as intub / extub above. Withdrawal
+    # of care still uses the daily aggregate since `_withdrawl_lst` is
+    # patient-level (single flag per hospitalization, no precise onset).
+    if not enr.sbt_audit.empty and "_trach_1st" in enr.sbt_audit.columns:
+        flagged = enr.sbt_audit[
+            enr.sbt_audit["_trach_1st"].fillna(0).astype(int) == 1
+        ]
+        for _, r in flagged.iterrows():
+            rows.append({
+                "time": pd.Timestamp(r["event_dttm"]),
+                "kind": "tracheostomy",
+                "label": "Tracheostomy",
+            })
+
     if not enr.sbt_daily.empty and enr.first_icu_dttm is not None:
-        daily_flag_map = {
-            "_trach_1st":     ("tracheostomy", "Tracheostomy"),
-            "_withdrawl_lst": ("withdrawal",   "Withdrawal of care"),
-        }
         for _, d in enr.sbt_daily.iterrows():
             day_idx = d.get("_nth_day")
             if pd.isna(day_idx):
                 continue
             t = enr.first_icu_dttm + pd.Timedelta(days=int(day_idx))
-            for col, (kind, label) in daily_flag_map.items():
-                if int(d.get(col, 0) or 0) == 1:
-                    rows.append({"time": t, "kind": kind, "label": f"{label} (day {int(day_idx)})"})
+            if int(d.get("_withdrawl_lst", 0) or 0) == 1:
+                rows.append({
+                    "time": t,
+                    "kind": "withdrawal",
+                    "label": f"Withdrawal of care (day {int(day_idx)})",
+                })
 
     # Discharge event (one per patient), color-coded by outcome bucket.
     if enr.discharge is not None:

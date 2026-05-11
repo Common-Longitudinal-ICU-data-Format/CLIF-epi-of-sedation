@@ -2,10 +2,11 @@
 
 Federated companion to
 `code/descriptive/dose_pattern_6group_count_by_icu_day.py`. Reads each site's
-PHI-tier `output/{site}/exposure_dataset.parquet` (matches the precedent at
-`code/agg/night_day_diff_mean_cross_site.py:38`), classifies every patient-day
-into one of seven categories (six dose-pattern colors + a hatched
-"single-shift" cap), and renders TWO PNGs sharing one long-format CSV:
+pre-aggregated `output_to_share/{site}/descriptive/dose_pattern_6group_count_by_icu_day.csv`
+(no raw-parquet access — see `.dev/CLAUDE.md` "Federation contract"). Each
+per-site CSV is a long-format `(drug, nth_day, pattern_label, count)`
+table already filtered to full-24h ICU days 1..7; this script just stacks
+sites, pools, and renders TWO PNGs sharing one long-format CSV:
 
   - `*_pooled.png` — single 1×3 row: `Master cohort (all sites)`.
     Patient-day counts pooled across sites at the (drug, x_bin, pattern)
@@ -41,22 +42,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.agg.dose_pattern_6group_count_by_icu_day")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
     COUNT_BAR_STACK_ORDER,
-    DAY_COLS,
-    DIFF_COLS,
     DOSE_PATTERN_COLORS,
     DOSE_PATTERN_LABELS,
     DRUG_LABELS,
     DRUGS,
-    NIGHT_COLS,
     THRESHOLDS,
     apply_style,
-    categorize_diff_6way,
     list_sites,
-    load_site_exposure,
+    load_site_descriptive_csv,
     save_agg_csv,
     save_agg_fig,
     site_label,
@@ -64,18 +64,11 @@ from _shared import (  # noqa: E402
 
 
 # ── Constants (match the per-site script's conventions) ─────────────────
-MAX_MID_DAY = 7
-MID_DAY_BINS = [str(i) for i in range(1, MAX_MID_DAY + 1)] + [f"{MAX_MID_DAY + 1}+"]
-ALL_BIN_LABELS = ["0\n(intub)"] + MID_DAY_BINS + ["last\n(exit)"]
+MIN_DAY = 1
+MAX_DAY = 7
+DAY_BINS = [str(i) for i in range(MIN_DAY, MAX_DAY + 1)]
 SEGMENT_LABEL_THRESHOLD_FRAC = 0.04
 SEGMENT_LABEL_MIN_COUNT = 30  # absolute count floor for "X%" annotations
-
-SINGLE_SHIFT_LABEL = "Single-shift (no diff)"
-SINGLE_SHIFT_FACE = "white"
-SINGLE_SHIFT_HATCH = "///"
-SINGLE_SHIFT_EDGE = "#888888"
-EXTENDED_LABELS = tuple(DOSE_PATTERN_LABELS) + (SINGLE_SHIFT_LABEL,)
-EXTENDED_STACK_ORDER = tuple(COUNT_BAR_STACK_ORDER) + (SINGLE_SHIFT_LABEL,)
 
 # Sentinel value used for pooled rows in the long-format CSV. Distinct
 # from any real site name (alphabetic site dirs only) so a join/groupby
@@ -83,69 +76,47 @@ EXTENDED_STACK_ORDER = tuple(COUNT_BAR_STACK_ORDER) + (SINGLE_SHIFT_LABEL,)
 POOLED_KEY = "ALL"
 POOLED_DISPLAY = "Master cohort\n(all sites)"
 
-REQUIRED_FLAG_COLS = ("_is_first_day", "_is_last_day",
-                      "_single_shift_day", "_rel_day")
+def _load_site_long(site: str) -> pd.DataFrame | None:
+    """Read a site's pre-aggregated 6-group count CSV.
 
+    Federation-clean: pulls from
+    `output_to_share/{site}/descriptive/dose_pattern_6group_count_by_icu_day.csv`
+    (no PHI, no IDs, no raw rows). Adapts the per-site column names
+    (`nth_day`, `pattern_label`) to the cross-site script's downstream
+    names (`x_bin`, `pattern`) and reindexes to the canonical 7 × 6 grid
+    so every cell is present (zero-filled if missing).
 
-# ── Per-row x-bin classification (mirrors per-site script) ──────────────
-def _classify_bin(row: pd.Series) -> str:
-    if bool(row["_is_first_day"]):
-        return "0\n(intub)"
-    if bool(row["_is_last_day"]):
-        return "last\n(exit)"
-    d = int(row["_rel_day"])
-    if d > MAX_MID_DAY:
-        return f"{MAX_MID_DAY + 1}+"
-    return str(d)
-
-
-def _validate_columns(df: pd.DataFrame, site: str) -> bool:
-    """Return True if all required flag columns and per-drug dose columns exist."""
-    missing = [c for c in REQUIRED_FLAG_COLS if c not in df.columns]
-    for drug in DRUGS:
-        for col in (DAY_COLS[drug], NIGHT_COLS[drug], DIFF_COLS[drug]):
-            if col not in df.columns:
-                missing.append(col)
-    if missing:
-        print(f"  SKIP {site}: missing columns {missing} — re-run code/05_modeling_dataset.py.")
-        return False
-    return True
-
-
-# ── Per-site aggregation: long-format counts ────────────────────────────
-def _aggregate_one_site(df: pd.DataFrame, site: str) -> pd.DataFrame:
-    """Return long-format `[site, drug, x_bin, pattern, count]` for one site.
-
-    Reindexed to the canonical 10 × 7 grid so every (x_bin, pattern) cell
-    is present (zero-filled where needed). Single-shift rows are routed
-    to the 7th `Single-shift (no diff)` bucket BEFORE the pivot so the
-    rate-diff = NaN issue can't pollute the 6 measurable categories.
+    Returns None if the per-site CSV is absent — the caller logs + skips.
     """
-    df = df.copy()
-    df["_x_bin"] = df.apply(_classify_bin, axis=1)
-    df["_x_bin"] = pd.Categorical(df["_x_bin"], categories=ALL_BIN_LABELS, ordered=True)
-    is_single = df["_single_shift_day"].astype(bool)
+    try:
+        df = load_site_descriptive_csv(site, "dose_pattern_6group_count_by_icu_day")
+    except FileNotFoundError:
+        logger.info(
+            f"  SKIP {site}: output_to_share/{site}/descriptive/"
+            f"dose_pattern_6group_count_by_icu_day.csv not found — "
+            f"re-run code/descriptive/dose_pattern_6group_count_by_icu_day.py."
+        )
+        return None
 
     out_frames: list[pd.DataFrame] = []
     for drug in DRUGS:
-        d = df.copy()
-        d["_pattern"] = categorize_diff_6way(
-            d[DIFF_COLS[drug]], d[DAY_COLS[drug]], d[NIGHT_COLS[drug]],
-            THRESHOLDS[drug],
-        ).astype(object)
-        d.loc[is_single, "_pattern"] = SINGLE_SHIFT_LABEL
-        d["_pattern"] = pd.Categorical(
-            d["_pattern"], categories=list(EXTENDED_LABELS), ordered=True,
+        d = df.loc[df["drug"] == drug].copy()
+        d["x_bin"] = pd.Categorical(
+            d["nth_day"].astype(int).astype(str),
+            categories=DAY_BINS, ordered=True,
         )
-
-        counts = (
-            d.groupby(["_x_bin", "_pattern"], observed=False)
-            .size()
+        d["pattern"] = pd.Categorical(
+            d["pattern_label"], categories=list(DOSE_PATTERN_LABELS), ordered=True,
+        )
+        # Reindex to the canonical (x_bin × pattern) grid; per-site CSV
+        # already covers this range but the reindex is cheap insurance.
+        grid = (
+            d.set_index(["x_bin", "pattern"])["count"]
             .unstack(fill_value=0)
-            .reindex(columns=list(EXTENDED_LABELS), fill_value=0)
-            .reindex(index=ALL_BIN_LABELS, fill_value=0)
+            .reindex(columns=list(DOSE_PATTERN_LABELS), fill_value=0)
+            .reindex(index=DAY_BINS, fill_value=0)
         )
-        long = counts.stack().reset_index()
+        long = grid.stack().reset_index()
         long.columns = ["x_bin", "pattern", "count"]
         long.insert(0, "drug", drug)
         long.insert(0, "site", site)
@@ -195,7 +166,7 @@ def _render(
     )
     axes = np.atleast_2d(axes)
 
-    x_positions = np.arange(len(ALL_BIN_LABELS))
+    x_positions = np.arange(len(DAY_BINS))
 
     for ri, row_key in enumerate(row_keys):
         is_pooled = row_key == POOLED_KEY
@@ -206,55 +177,46 @@ def _render(
         for ci, drug in enumerate(DRUGS):
             ax = axes[ri, ci]
 
-            # Pivot (long → 10×7) for this (row, drug) panel.
+            # Pivot (long → 7×6) for this (row, drug) panel.
             cell = long_df[
                 (long_df["site"] == row_key) & (long_df["drug"] == drug)
             ]
             counts = (
                 cell.pivot(index="x_bin", columns="pattern", values="count")
-                .reindex(index=ALL_BIN_LABELS, columns=list(EXTENDED_LABELS), fill_value=0)
+                .reindex(index=DAY_BINS, columns=list(DOSE_PATTERN_LABELS), fill_value=0)
                 .astype(float)
             )
             bar_totals = counts.sum(axis=1)
 
-            # Stack 7 categories: 5 colored measurable-diff bands, then the
-            # gray drug-holiday cap, then the hatched single-shift cap on top.
-            cum = np.zeros(len(ALL_BIN_LABELS))
-            for label in EXTENDED_STACK_ORDER:
+            # Stack 6 categories: 5 colored measurable-diff bands, then the
+            # gray drug-holiday cap on top.
+            cum = np.zeros(len(DAY_BINS))
+            for label in COUNT_BAR_STACK_ORDER:
                 seg = counts[label].to_numpy()
-                if label == SINGLE_SHIFT_LABEL:
-                    ax.bar(
-                        x_positions, seg, bottom=cum,
-                        color=SINGLE_SHIFT_FACE, edgecolor=SINGLE_SHIFT_EDGE,
-                        linewidth=0.5, hatch=SINGLE_SHIFT_HATCH, label=label,
-                    )
-                else:
-                    color = DOSE_PATTERN_COLORS[label]
-                    ax.bar(
-                        x_positions, seg, bottom=cum,
-                        color=color, edgecolor="white",
-                        linewidth=0.4, label=label,
-                    )
-                    # "X%" annotations on segments large enough to read
-                    # (matches per-site script `s >= 30` floor).
-                    for x, c, total, s in zip(x_positions, cum, bar_totals.to_numpy(), seg):
-                        if total <= 0:
-                            continue
-                        frac = s / total
-                        if frac >= SEGMENT_LABEL_THRESHOLD_FRAC and s >= SEGMENT_LABEL_MIN_COUNT:
-                            ax.text(
-                                x, c + s / 2, f"{frac * 100:.0f}%",
-                                ha="center", va="center", fontsize=6.5,
-                                color="white" if color in ("#2166ac", "#b2182b") else "black",
-                            )
+                color = DOSE_PATTERN_COLORS[label]
+                ax.bar(
+                    x_positions, seg, bottom=cum,
+                    color=color, edgecolor="white",
+                    linewidth=0.4, label=label,
+                )
+                # "X%" annotations on segments large enough to read
+                # (matches per-site script `s >= 30` floor).
+                for x, c, total, s in zip(x_positions, cum, bar_totals.to_numpy(), seg):
+                    if total <= 0:
+                        continue
+                    frac = s / total
+                    if frac >= SEGMENT_LABEL_THRESHOLD_FRAC and s >= SEGMENT_LABEL_MIN_COUNT:
+                        ax.text(
+                            x, c + s / 2, f"{frac * 100:.0f}%",
+                            ha="center", va="center", fontsize=6.5,
+                            color="white" if color in ("#2166ac", "#b2182b") else "black",
+                        )
                 cum += seg
 
             # Horizontal ruler line at the boundary between the 5 measurable
-            # bands and the 2 not-measurable caps. Same as per-site figure.
+            # bands and the gray drug-holiday cap.
             on_drug_top = (
-                bar_totals
-                - counts["Not receiving that day"]
-                - counts[SINGLE_SHIFT_LABEL]
+                bar_totals - counts["Not receiving that day"]
             ).to_numpy()
             ax.hlines(
                 on_drug_top, x_positions - 0.45, x_positions + 0.45,
@@ -270,8 +232,8 @@ def _render(
             # X labels on bottom row only.
             if ri == n_rows - 1:
                 ax.set_xticks(x_positions)
-                ax.set_xticklabels(ALL_BIN_LABELS)
-                ax.set_xlabel("ICU day")
+                ax.set_xticklabels(DAY_BINS)
+                ax.set_xlabel("ICU day (full-24h coverage only)")
             # Row label + y-axis label on leftmost column. Pooled row gets
             # a bold label so it reads as the "headline" view.
             if ci == 0:
@@ -286,13 +248,6 @@ def _render(
         plt.Rectangle((0, 0), 1, 1, color=DOSE_PATTERN_COLORS[label], ec="white")
         for label in DOSE_PATTERN_LABELS
     ]
-    handles.append(
-        plt.Rectangle(
-            (0, 0), 1, 1,
-            facecolor=SINGLE_SHIFT_FACE, edgecolor=SINGLE_SHIFT_EDGE,
-            hatch=SINGLE_SHIFT_HATCH,
-        )
-    )
     # Suptitle BEFORE tight_layout so the layout reserves space for it
     # (otherwise it overlaps the panel column titles in short figures).
     fig.suptitle(suptitle, fontsize=11)
@@ -306,8 +261,8 @@ def _render(
     bottom_frac = bottom_reserve_in / fig_height
     fig.subplots_adjust(bottom=bottom_frac)
     fig.legend(
-        handles, list(DOSE_PATTERN_LABELS) + [SINGLE_SHIFT_LABEL],
-        loc="lower center", ncol=4, frameon=False, fontsize=9,
+        handles, list(DOSE_PATTERN_LABELS),
+        loc="lower center", ncol=3, frameon=False, fontsize=9,
         bbox_to_anchor=(0.5, 0.01),
     )
     return fig
@@ -319,25 +274,21 @@ def main() -> None:
 
     sites = list_sites()
     if not sites:
-        print("No sites found under output_to_share/. Nothing to plot.")
+        logger.info("No sites found under output_to_share/. Nothing to plot.")
         return
-    print(f"Discovered sites: {sites}")
+    logger.info(f"Discovered sites: {sites}")
 
     per_site_frames: list[pd.DataFrame] = []
     valid_sites: list[str] = []
     for s in sites:
-        try:
-            df = load_site_exposure(s)
-        except FileNotFoundError:
-            print(f"  SKIP {s}: output/{s}/exposure_dataset.parquet not found.")
+        long = _load_site_long(s)
+        if long is None:
             continue
-        if not _validate_columns(df, s):
-            continue
-        per_site_frames.append(_aggregate_one_site(df, s))
+        per_site_frames.append(long)
         valid_sites.append(s)
 
     if not per_site_frames:
-        print("No usable per-site data; nothing to render.")
+        logger.info("No usable per-site data; nothing to render.")
         return
 
     per_site_long = pd.concat(per_site_frames, ignore_index=True)

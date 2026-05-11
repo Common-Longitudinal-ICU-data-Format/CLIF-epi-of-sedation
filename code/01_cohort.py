@@ -17,13 +17,22 @@ with app.setup:
     import marimo as mo
     import os
     import sys
+    import json
     import logging
     import polars as pl
     from pathlib import Path
     # sys.path.insert(0, str(Path(__file__).parent))
-    # Env-var-driven so sites can re-invalidate the (expensive) waterfall
-    # cache without editing source (e.g. `RERUN_WATERFALL=1 make run`).
-    RERUN_WATERFALL = os.getenv("RERUN_WATERFALL", "0") == "1"
+    # Cache-bypass + external-path flags now live in the per-site config
+    # (`config/<site>_config.json`). Default = reuse cache if present. To
+    # force a one-shot recompute without editing config, delete the cache
+    # parquet (`rm output/{site}/cohort_resp_processed_bf.parquet`) and run.
+    _CONFIG_PATH_SETUP = "config/config.json"
+    with open(_CONFIG_PATH_SETUP) as _cfg_f:
+        _cfg_setup = json.load(_cfg_f)
+    RERUN_WATERFALL = bool(_cfg_setup.get("rerun_waterfall", False))
+    PATH_TO_WATERFALL_PROCESSED_RESP_TABLE = (
+        _cfg_setup.get("path_to_waterfall_processed_resp_table")
+    )
     # Hoisted into setup so any cell can call them without re-importing
     # (marimo flags duplicate top-level imports across cells as
     # cross-cell shadowing). to_utc is the canonical tz-normalization helper
@@ -33,6 +42,8 @@ with app.setup:
     from _utils import (
         to_utc,
         add_day_shift_id,
+        compute_weight_qc_exclusions,
+        normalize_categories,
         plot_consort,
         consort_to_markdown,
     )
@@ -125,19 +136,31 @@ def _(duckdb, load_data):
     # hospital_id is included so the same relation can feed both ICU filtering
     # and clifpy's stitch_encounters (which requires it in adt) without a
     # second parquet scan.
+    # Load WITHOUT the location_category filter so we can normalize first,
+    # then filter ourselves — a site that delivers 'ICU' uppercase would
+    # otherwise silently get zero ICU hospitalizations from the parquet
+    # pushdown filter (which is exact-match). The CLIF spec requires
+    # lowercase but a fresh site loader may not honor it.
     adt_rel = load_data(
         'adt',
         config_path='config/config.json',
         return_rel=True,
         columns=['hospitalization_id', 'hospital_id', 'in_dttm', 'out_dttm', 'location_category', 'location_type'],
-        filters={'location_category': ['icu']},
     )
+    adt_rel = normalize_categories(adt_rel, ['location_category', 'location_type'])
+    adt_rel = duckdb.sql("FROM adt_rel WHERE location_category = 'icu'")
     hosp_ids_w_icu_stays = [
         r[0] for r in duckdb.sql(
             "FROM adt_rel SELECT DISTINCT hospitalization_id"
         ).fetchall()
     ]
     logger.info(f"Hospitalizations with ICU stays: {len(hosp_ids_w_icu_stays):,}")
+    if len(hosp_ids_w_icu_stays) == 0:
+        logger.error(
+            "Zero hospitalizations with ICU stays — check that adt.location_category "
+            "contains the lowercase 'icu' literal expected by the CLIF spec. "
+            "normalize_categories has already TRIM(LOWER)'d the column."
+        )
     return adt_rel, hosp_ids_w_icu_stays
 
 
@@ -440,8 +463,87 @@ def _(
 
     resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
 
-    if not os.path.exists(resp_processed_path) or RERUN_WATERFALL:
-        # Load via clifpy.utils.io.load_data with site_tz="" to skip the
+    # Three-mode load precedence:
+    #   Mode A — `path_to_waterfall_processed_resp_table` config key is set
+    #            and the file exists → load from external, filter to cohort
+    #            via Polars predicate pushdown (handles whole-CLIF-system
+    #            tables efficiently). No internal cache write.
+    #   Mode B — internal cache exists and `rerun_waterfall=false` → cached
+    #            Polars read (preserves tz tag).
+    #   Mode C — fresh waterfall recompute + internal cache write.
+    _external_path = PATH_TO_WATERFALL_PROCESSED_RESP_TABLE
+    _use_external = bool(_external_path) and os.path.exists(_external_path)
+
+    if _use_external:
+        # Mode A — external waterfall-processed table. Trusted to be already
+        # waterfall'd + outlier-handled by the producer; we just filter to
+        # our cohort and apply defensive dtype/casing/tz normalizations.
+        logger.info(
+            f"Loading external waterfall-processed resp from {_external_path}"
+        )
+        _expected_cols = [
+            "hospitalization_id", "recorded_dttm", "device_name",
+            "device_category", "mode_name", "mode_category", "fio2_set",
+            "peep_set", "pressure_support_set", "resp_rate_set",
+            "tidal_volume_set", "peak_inspiratory_pressure_set",
+            "tracheostomy",
+        ]
+        # Column-set guard. Read schema lazily; fail fast with a clear
+        # message if the external table is missing a required column.
+        _schema_cols = set(pl.scan_parquet(_external_path).collect_schema().names())
+        _missing = [c for c in _expected_cols if c not in _schema_cols]
+        if _missing:
+            raise RuntimeError(
+                f"External waterfall table at {_external_path} is missing "
+                f"required columns: {_missing}. Required columns: "
+                f"{_expected_cols}. Check the source pipeline or set "
+                f"`path_to_waterfall_processed_resp_table` to null in config."
+            )
+        # Polars predicate pushdown: select cols + filter by cohort hosp ids
+        # all push into the parquet scan. On a whole-CLIF table, row-group
+        # statistics on hospitalization_id skip non-overlapping groups.
+        _resp_df = (
+            pl.scan_parquet(_external_path)
+              .select(_expected_cols)
+              .filter(
+                  pl.col("hospitalization_id").is_in(cohort_hosp_ids_post_stitch)
+              )
+              .collect()
+        )
+        # Coverage check — warn if external table predates the cohort refresh.
+        _n_actual = _resp_df["hospitalization_id"].n_unique()
+        _n_target = len(set(cohort_hosp_ids_post_stitch))
+        _coverage = _n_actual / max(_n_target, 1)
+        logger.info(
+            f"External resp filter: {_resp_df.height:,} rows for "
+            f"{_n_actual:,} hospitalizations "
+            f"(target cohort: {_n_target:,}; coverage: {_coverage:.1%})"
+        )
+        if _coverage < 0.99:
+            logger.warning(
+                f"External resp table coverage is {_coverage:.1%} "
+                f"(<99%) — table may predate cohort refresh; missing "
+                f"{_n_target - _n_actual:,} hospitalizations."
+            )
+        resp_p = _resp_df.to_pandas()
+        # Tracheostomy dtype normalization (Bug C) — incoming may be BOOL,
+        # INT, or VARCHAR-of-bool depending on how the external table was
+        # produced. Coerce all to int8 for downstream SQL compatibility.
+        _trach_str = resp_p['tracheostomy'].astype(str).str.lower()
+        resp_p['tracheostomy'] = (
+            _trach_str.isin({'true', '1', 't'}).astype('int8')
+        )
+        # Category casing (B4) — defensive against external sources that
+        # haven't applied the lowercase convention.
+        resp_p = normalize_categories(
+            resp_p, ['device_category', 'mode_category']
+        )
+        # UTC display tag (project convention — see docs/timezone_audit.md).
+        resp_p = to_utc(resp_p, ['recorded_dttm'])
+        logger.info(f"resp_p: {len(resp_p):,} rows (Mode A — external)")
+    elif not os.path.exists(resp_processed_path) or RERUN_WATERFALL:
+        # Mode C — fresh waterfall. Load via clifpy.utils.io.load_data with
+        # site_tz="" to skip the
         # default UTC→site_tz conversion. clifpy's standard `from_file` path
         # would convert to site_tz via DuckDB's `timezone(site_tz, col)`,
         # which RETURNS A NAIVE TIMESTAMP (no tz metadata) — leaving us with
@@ -479,6 +581,15 @@ def _(
             filters={"hospitalization_id": cohort_hosp_ids_post_stitch},
             site_tz="",  # skip auto-conversion; values stay UTC tz-aware
         )
+        # Normalize category casing at load (cross-site safety). UCMC and
+        # MIMIC deliver these lowercase; a new CLIF site whose loader
+        # leaves 'IMV' / 'Pressure Support/CPAP' mixed-case would
+        # otherwise silently return zero IMV streaks because downstream
+        # SQL hardcodes lowercase literals. See pattern in
+        # CLIF-eligibility-for-mobilization/code/01_cohort_identification.py:340-341.
+        _resp_rel = normalize_categories(
+            _resp_rel, ['device_category', 'mode_category']
+        )
         _resp_rel = apply_outlier_handling_duckdb(
             _resp_rel, 'respiratory_support', 'config/outlier_config.yaml',
         )
@@ -492,6 +603,16 @@ def _(
             data=_resp_rel.df(),
         )
         cohort_resp_p = cohort_resp.waterfall(bfill=True)
+        # Normalize tracheostomy at the parquet-write boundary: the cold
+        # waterfall returns it as object-dtype with Python's `str(False)` =
+        # 'False'/'True'. Downstream SQL compares `tracheostomy = 1` which
+        # forces a VARCHAR→INT implicit cast that chokes on 'False'. Coerce
+        # to int{0,1} here so the parquet has a single canonical INT type
+        # regardless of warm/cold path (also fixes 03_outcomes.py).
+        _trach_str = cohort_resp_p.df['tracheostomy'].astype(str).str.lower()
+        cohort_resp_p.df['tracheostomy'] = (
+            _trach_str.isin({'true', '1', 't'}).astype('int8')
+        )
         # Re-tag recorded_dttm to UTC display tag at the parquet-write
         # boundary (project convention: every *_dttm column on disk is
         # UTC tz-aware — see docs/timezone_audit.md). Same UTC instants;
@@ -517,8 +638,8 @@ def _():
 
     Inlined from `cohort_id.sql`. Each CTE is a separate cell for interactive
     inspection (per the "one CTE per cell" pattern in the global CLAUDE.md).
-    The `tracheostomy` NaN→0 coercion is folded into cohort_t1's SELECT via
-    `COALESCE(...)::INT` rather than mutating `resp_p` in pandas first.
+    The `tracheostomy` dtype normalization is folded into cohort_t1's SELECT
+    rather than mutating `resp_p` in pandas first.
     """)
     return
 
@@ -527,12 +648,19 @@ def _():
 def _(resp_p):
     cohort_t1 = mo.sql(
         f"""
-        -- Detect IMV transitions: intubation and extubation events
+        -- Detect IMV transitions: intubation and extubation events.
+        -- NOTE: `tracheostomy` arrives with three possible dtypes depending
+        -- on whether resp_p is warm-cached (BOOL), schema-strict (INT), or
+        -- fresh from a cold waterfall recompute (VARCHAR with Python's
+        -- str(False) = 'False'). A naive CAST AS INTEGER chokes on 'False'.
+        -- Normalize via lowercase-string match so all three paths work.
         FROM resp_p
         SELECT hospitalization_id
             , event_dttm: recorded_dttm
             , device_category
-            , tracheostomy: COALESCE(tracheostomy, 0)::INT
+            , tracheostomy: CASE
+                WHEN LOWER(CAST(tracheostomy AS VARCHAR)) IN ('true', '1', 't') THEN 1
+                ELSE 0 END
             , _on_imv: CASE WHEN device_category = 'imv' THEN 1 ELSE 0 END
             , _chg_imv: CASE
                 -- getting off imv (extub)
@@ -684,14 +812,16 @@ def _(cohort_hosp_ids_pre_weight, duckdb, load_data):
     # Cell B — weight-presence exclusion (upfront, runtime).
     # Drop hospitalizations with ZERO non-null weight_kg rows in vitals so the
     # first-pass cohort already excludes hosps that can never produce weight-
-    # dependent dose conversions. The audit's value-quality checks (jump,
-    # range) live separately in qc/weight_audit.py and feed back via
-    # weight_qc_drop_list.parquet on pass 2 (next cell).
+    # dependent dose conversions. Value-quality checks (clamp / jump / range)
+    # follow in the next cell via the in-memory helper.
+    #
+    # recorded_dttm is included so the next cell's jump check has the
+    # timestamps it needs (avoids a second vitals load).
     weight_presence_rel = load_data(
         'vitals',
         config_path='config/config.json',
         return_rel=True,
-        columns=['hospitalization_id', 'vital_category', 'vital_value'],
+        columns=['hospitalization_id', 'recorded_dttm', 'vital_category', 'vital_value'],
         filters={
             'vital_category': ['weight_kg'],
             'hospitalization_id': cohort_hosp_ids_pre_weight,
@@ -716,89 +846,78 @@ def _(cohort_hosp_ids_pre_weight, duckdb, load_data):
 
 @app.cell
 def _(
-    SITE_NAME,
     cohort_hosp_ids_w_weight,
     cohort_pre_weight_counts,
+    compute_weight_qc_exclusions,
+    duckdb,
     n_dropped_no_weight,
+    weight_presence_rel,
 ):
-    # Cell C — weight-QC drop list re-entry split per criterion.
-    # Phase 2 of weight-audit: reads `weight_qc_drop_list.parquet` produced
-    # by `make weight-audit SITE=<site>`, splits the drops by `_drop_reason`
-    # prefix (zero_weight* / jump_* / range_*), and applies them
-    # incrementally. Each criterion's marginal exclusion count flows into
-    # CONSORT as its own step (steps 5-7), giving per-rule visibility.
-    # If the file isn't present yet (first-pass run), counts are zero and
-    # the existing cohort_hosp_ids_w_weight passes through unchanged.
-    _drop_path = Path(f"output/{SITE_NAME}/qc/weight_qc_drop_list.parquet")
-    if _drop_path.exists():
-        _drop_df = pl.read_parquet(_drop_path)
-        # Group drop ids by reason prefix (handles parameterized reason
-        # strings like 'jump_gt_20kg_within_24h' / 'range_gt_30kg').
-        _drop_by_kind = {'zero': set(), 'jump': set(), 'range': set()}
-        for _row in _drop_df.iter_rows(named=True):
-            _hid = str(_row['hospitalization_id'])
-            _reason = _row['_drop_reason']
-            if _reason.startswith('zero_weight'):
-                _drop_by_kind['zero'].add(_hid)
-            elif _reason.startswith('jump_'):
-                _drop_by_kind['jump'].add(_hid)
-            elif _reason.startswith('range_'):
-                _drop_by_kind['range'].add(_hid)
-            else:
-                logger.warning(f"Unrecognized weight-QC drop reason: {_reason}")
+    # Cell C — weight-QC value-quality exclusions (computed in-memory).
+    # B3 refactor (2026-05): the prior 2-pass `make run` → `make weight-audit`
+    # → `make run` dance is gone. Drop sets are now computed inline via
+    # `compute_weight_qc_exclusions`, eliminating ~half the pipeline runtime.
+    # `code/qc/weight_audit.py` remains as a diagnostic-only tool that emits
+    # the federated audit CSVs/PNG for sharing across sites.
+    #
+    # Env-var-tunable thresholds (matched to weight_audit.py defaults).
+    import os as _os
+    _wqc_max_jump_kg = float(_os.getenv("WEIGHT_QC_MAX_JUMP_KG", "20"))
+    _wqc_max_jump_hours = float(_os.getenv("WEIGHT_QC_MAX_JUMP_HOURS", "24"))
+    _wqc_max_range_kg = float(_os.getenv("WEIGHT_QC_MAX_RANGE_KG", "30"))
+    _wqc_range_rule_on = _os.getenv("WEIGHT_QC_RANGE_RULE_ON", "0") == "1"
 
-        # Apply incrementally; each step's count is the marginal exclusion.
-        _post_c1_resid = [
-            h for h in cohort_hosp_ids_w_weight
-            if str(h) not in _drop_by_kind['zero']
-        ]
-        _post_jump = [
-            h for h in _post_c1_resid
-            if str(h) not in _drop_by_kind['jump']
-        ]
-        _post_range = [
-            h for h in _post_jump
-            if str(h) not in _drop_by_kind['range']
-        ]
-        # Pre-NMB cohort: post-weight-QC but BEFORE the hospitalization-level
-        # NMB exclusion (applied downstream once nmb_excluded_patient_days
-        # is computed). The final `cohort_hosp_ids` is built in a later cell
-        # by subtracting the NMB-flagged hospitalization set.
-        cohort_hosp_ids_pre_nmb = _post_range
+    # Reshape weight_presence_rel into the (hospitalization_id, recorded_dttm,
+    # weight_kg_raw) contract expected by the helper. weight_presence_rel was
+    # loaded at Cell B with columns (hospitalization_id, vital_category, vital_value)
+    # filtered to weight_kg only — but it lacks recorded_dttm. Re-load with the
+    # timestamp column included for the jump check.
+    _weight_for_qc = duckdb.sql("""
+        FROM weight_presence_rel
+        SELECT hospitalization_id
+            , recorded_dttm
+            , weight_kg_raw: vital_value
+        WHERE vital_value IS NOT NULL
+    """)
+    _excl = compute_weight_qc_exclusions(
+        _weight_for_qc,
+        cohort_hosp_ids_w_weight,
+        max_jump_kg=_wqc_max_jump_kg,
+        max_jump_hours=_wqc_max_jump_hours,
+        max_range_kg=_wqc_max_range_kg,
+        range_rule_on=_wqc_range_rule_on,
+    )
+    # Apply incrementally; each step's count is the marginal exclusion.
+    # zero_weight here = hosps with rows in vitals but ALL clamped out
+    # (Cell B already dropped hosps with NO rows at all, so zero_weight is
+    # the C1-residual count).
+    _zero = {str(h) for h in _excl['zero_weight']}
+    _jump = {str(h) for h in _excl['jump']}
+    _range = {str(h) for h in _excl['range']}
+    _post_c1_resid = [
+        h for h in cohort_hosp_ids_w_weight if str(h) not in _zero
+    ]
+    _post_jump = [
+        h for h in _post_c1_resid if str(h) not in _jump
+    ]
+    _post_range = [
+        h for h in _post_jump if str(h) not in _range
+    ]
+    # Pre-NMB cohort: post-weight-QC but BEFORE the hospitalization-level
+    # NMB exclusion (applied downstream once nmb_excluded_patient_days
+    # is computed). The final `cohort_hosp_ids` is built in a later cell
+    # by subtracting the NMB-flagged hospitalization set.
+    cohort_hosp_ids_pre_nmb = _post_range
+    n_excl_c1_residual = len(_excl['zero_weight'])
+    n_excl_jump = len(_excl['jump'])
+    n_excl_range = len(_excl['range'])
+    jump_threshold_str = _excl['jump_threshold_str']
+    range_threshold_str = _excl['range_threshold_str']
 
-        n_excl_c1_residual = len(cohort_hosp_ids_w_weight) - len(_post_c1_resid)
-        n_excl_jump = len(_post_c1_resid) - len(_post_jump)
-        n_excl_range = len(_post_jump) - len(_post_range)
-
-        # Surface the parameterized threshold strings so the CONSORT
-        # exclusion_reason text shows the active threshold.
-        _all_reasons = _drop_df['_drop_reason'].unique().to_list()
-        jump_threshold_str = next(
-            (r for r in _all_reasons if r.startswith('jump_')), None
-        )
-        range_threshold_str = next(
-            (r for r in _all_reasons if r.startswith('range_')), None
-        )
-
-        logger.info(
-            f"Weight-QC value checks: C1-residual={n_excl_c1_residual:,}, "
-            f"jump={n_excl_jump:,}, range={n_excl_range:,}"
-        )
-    else:
-        cohort_hosp_ids_pre_nmb = list(cohort_hosp_ids_w_weight)
-        n_excl_c1_residual = 0
-        n_excl_jump = 0
-        n_excl_range = 0
-        jump_threshold_str = None
-        range_threshold_str = None
-        logger.warning(
-            f"No weight-QC drop list at {_drop_path} — "
-            "skipping C1-residual/jump/range"
-        )
-        logger.warning(
-            f"  (run `make weight-audit SITE={SITE_NAME}` "
-            "then re-run 01_cohort.py to apply)"
-        )
+    logger.info(
+        f"Weight-QC value checks: C1-residual={n_excl_c1_residual:,}, "
+        f"jump={n_excl_jump:,}, range={n_excl_range:,}"
+    )
 
     consort_pre_nmb_counts = {
         **cohort_pre_weight_counts,
@@ -1278,8 +1397,6 @@ def _(
     icu_type_df,
     nmb_excluded_patient_days,
 ):
-    import json
-
     # NMB exclusion summary — scalar SQL on the lazy relation.
     _n_nmb_patient_days = duckdb.sql(
         "FROM nmb_excluded_patient_days SELECT COUNT(*)"

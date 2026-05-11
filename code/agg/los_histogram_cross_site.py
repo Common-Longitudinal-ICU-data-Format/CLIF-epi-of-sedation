@@ -32,6 +32,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.agg.los_histogram")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
@@ -66,14 +69,14 @@ def _stack_per_site() -> pd.DataFrame:
     """Stack each site's bins.csv with a `site` column attached."""
     sites = list_sites()
     if not sites:
-        print("No site dirs under output_to_share/. Run per-site first.")
+        logger.info("No site dirs under output_to_share/. Run per-site first.")
         return pd.DataFrame()
 
     parts = []
     for site in sites:
         path = SHARE_ROOT / site / "descriptive" / "los_histogram_bins.csv"
         if not path.exists():
-            print(f"  WARN: {path} missing — skipping {site}")
+            logger.info(f"  WARN: {path} missing — skipping {site}")
             continue
         df = pd.read_csv(path)
         df["site"] = site

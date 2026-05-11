@@ -19,6 +19,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.agg.cross_site_cohort_stats")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
@@ -32,9 +35,9 @@ from _shared import (  # noqa: E402
 def main() -> None:
     sites = list_sites()
     if not sites:
-        print("No sites found under output_to_share/. Nothing to combine.")
+        logger.info("No sites found under output_to_share/. Nothing to combine.")
         return
-    print(f"Discovered sites: {sites}")
+    logger.info(f"Discovered sites: {sites}")
 
     frames: list[pd.DataFrame] = []
     for s in sites:
@@ -58,7 +61,7 @@ def main() -> None:
     combined = pd.concat([combined, pd.DataFrame([total_row])], ignore_index=True)
 
     save_agg_csv(combined, "cohort_stats_cross_site")
-    print(combined.to_string(index=False))
+    logger.info(combined.to_string(index=False))
 
 
 if __name__ == "__main__":

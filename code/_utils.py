@@ -93,6 +93,237 @@ def to_utc(
     return df
 
 
+def compute_weight_qc_exclusions(
+    weight_rel,
+    hosp_ids,
+    *,
+    clamp_lo: float = 30.0,
+    clamp_hi: float = 300.0,
+    max_jump_kg: float = 20.0,
+    max_jump_hours: float = 24.0,
+    max_range_kg: float = 30.0,
+    range_rule_on: bool = False,
+) -> dict:
+    """Compute weight-QC exclusion sets in-memory (no parquet round-trip).
+
+    Replaces the 2-pass `make run`-`make weight-audit`-`make run` dance with
+    a single-pass in-cohort computation. Same three criteria as the original
+    `code/qc/weight_audit.py` `section_g_drop_list`:
+
+    1. **zero_weight** — cohort hosps with no weight rows surviving the
+       [clamp_lo, clamp_hi] clamp. Catches both "no weight ever charted"
+       AND "all weights are clearly garbage" (e.g., lb-vs-kg unit errors).
+    2. **jump** — hosps with any consecutive pair of weight readings
+       differing by > ``max_jump_kg`` within ``max_jump_hours``. Raw jump
+       (not normalized rate) — normalizing inflates short-gap recordings
+       and misclassifies them as outliers.
+    3. **range** (opt-in via ``range_rule_on``) — hosps whose min-max
+       weight spread within the stay exceeds ``max_range_kg``.
+
+    Criteria are incremental: ``jump`` excludes hosps already in
+    ``zero_weight``; ``range`` excludes hosps in either prior set.
+
+    Implementation is DuckDB-native (avoids materializing the full
+    cohort-wide weight frame to pandas). Defaults match the env-var
+    defaults in ``code/qc/weight_audit.py``.
+
+    Parameters
+    ----------
+    weight_rel : duckdb.DuckDBPyRelation
+        Raw weight events with columns ``hospitalization_id``,
+        ``recorded_dttm``, ``weight_kg_raw``. Caller is responsible for
+        the source filter (e.g., ``vital_category = 'weight_kg'``).
+    hosp_ids : iterable of str
+        Cohort hospitalization IDs. ``zero_weight`` is computed against
+        this set.
+
+    Returns
+    -------
+    dict with keys:
+        ``zero_weight``, ``jump``, ``range`` — sets of hospitalization_id;
+        ``jump_threshold_str``, ``range_threshold_str`` — reason strings
+        suitable for CONSORT label / parquet ``_drop_reason`` columns
+        (range_threshold_str is None when ``range_rule_on=False``).
+    """
+    duckdb.execute(f"""
+        CREATE OR REPLACE TEMP TABLE _wqc_clamped AS
+        FROM weight_rel
+        SELECT hospitalization_id, recorded_dttm, weight_kg_raw
+        WHERE weight_kg_raw BETWEEN {clamp_lo} AND {clamp_hi}
+    """)
+    _has_weight_ids = {
+        r[0]
+        for r in duckdb.sql(
+            "FROM _wqc_clamped SELECT DISTINCT hospitalization_id"
+        ).fetchall()
+    }
+    zero_weight = set(hosp_ids) - _has_weight_ids
+
+    _jump_rows = duckdb.sql(f"""
+        WITH ordered AS (
+            FROM _wqc_clamped
+            SELECT hospitalization_id, recorded_dttm, weight_kg_raw
+                , prev_w: LAG(weight_kg_raw) OVER (
+                    PARTITION BY hospitalization_id ORDER BY recorded_dttm)
+                , prev_t: LAG(recorded_dttm) OVER (
+                    PARTITION BY hospitalization_id ORDER BY recorded_dttm)
+        )
+        , pairs AS (
+            FROM ordered
+            SELECT hospitalization_id
+                , jump_kg: abs(weight_kg_raw - prev_w)
+                , dt_hr: epoch(recorded_dttm - prev_t) / 3600.0
+            WHERE prev_w IS NOT NULL
+        )
+        , per_hosp AS (
+            FROM pairs
+            SELECT hospitalization_id, max_jump: MAX(jump_kg)
+            WHERE dt_hr < {max_jump_hours}
+            GROUP BY hospitalization_id
+        )
+        FROM per_hosp
+        SELECT hospitalization_id
+        WHERE max_jump > {max_jump_kg}
+    """).fetchall()
+    jump = {r[0] for r in _jump_rows} - zero_weight
+
+    range_set: set = set()
+    if range_rule_on:
+        _range_rows = duckdb.sql(f"""
+            FROM _wqc_clamped
+            SELECT hospitalization_id
+            GROUP BY hospitalization_id
+            HAVING MAX(weight_kg_raw) - MIN(weight_kg_raw) > {max_range_kg}
+        """).fetchall()
+        range_set = {r[0] for r in _range_rows} - zero_weight - jump
+
+    duckdb.execute("DROP TABLE IF EXISTS _wqc_clamped")
+
+    return {
+        'zero_weight': zero_weight,
+        'jump': jump,
+        'range': range_set,
+        'jump_threshold_str': (
+            f"jump_gt_{int(max_jump_kg)}kg_within_{int(max_jump_hours)}h"
+        ),
+        'range_threshold_str': (
+            f"range_gt_{int(max_range_kg)}kg" if range_rule_on else None
+        ),
+    }
+
+
+def mar_action_zero_dose_sql(has_category: bool) -> str:
+    """Return the SQL fragment that zeros out doses for stop/not_given MAR actions.
+
+    Used in pivot CASE expressions like::
+
+        , med_dose: CASE WHEN {mar_action_zero_dose_sql(...)} THEN 0 ELSE med_dose END
+
+    Asymmetric contract — see B5 in the audit plan:
+    - `medication_admin_continuous` MAY lack ``mar_action_category``; this
+      helper provides a ``mar_action_name`` regex fallback. FFILL semantics
+      are forgiving so a missed stop event over-FFILLs by minutes at worst.
+    - `medication_admin_intermittent` MUST have ``mar_action_category`` —
+      bolus dose accounting is too sensitive to the ``not_given`` zeroing
+      for the regex fallback to be safe. Callers should assert presence at
+      load time rather than using this helper for intermittent data.
+
+    Parameters
+    ----------
+    has_category : bool
+        True if ``mar_action_category`` exists on the source table.
+    """
+    if has_category:
+        return "mar_action_category IN ('stop', 'not_given')"
+    # Regex fallback over mar_action_name. Matches the dedup priority in
+    # remove_meds_duplicates() (regex on mar_action_name when category is
+    # missing). `[\s_-]*` allows variants like 'not_given', 'not given',
+    # 'not-given'. COALESCE ensures NULL mar_action_name doesn't blow the
+    # regex up.
+    return (
+        "regexp_matches(COALESCE(mar_action_name, ''), "
+        "'(stopped)|(held)|(paused)|(not[\\s_-]*given)', 'i')"
+    )
+
+
+def mar_action_not_given_filter_sql(has_category: bool) -> str:
+    """Return the WHERE fragment that EXCLUDES not_given rows from a load.
+
+    Used in inline WHERE clauses like::
+
+        WHERE ... AND {mar_action_not_given_filter_sql(...)}
+
+    Same asymmetric contract as ``mar_action_zero_dose_sql``: regex fallback
+    for continuous when ``mar_action_category`` is absent; intermittent
+    callers should assert column presence rather than relying on this.
+    """
+    if has_category:
+        return "mar_action_category != 'not_given'"
+    return (
+        "NOT regexp_matches(COALESCE(mar_action_name, ''), "
+        "'not[\\s_-]*given', 'i')"
+    )
+
+
+def normalize_categories(data, columns):
+    """Lowercase + strip-whitespace the named CLIF ``_category`` columns.
+
+    Single canonical helper for category normalization at every CLIF load
+    boundary. UCMC and MIMIC happen to deliver categories already
+    lowercased today, but a new CLIF site whose loader leaves
+    ``device_category = 'IMV'`` or ``mode_category = 'Pressure
+    Support/CPAP'`` would silently return zero IMV streaks / zero SBTs
+    from every downstream SQL that hardcodes lowercase literals (e.g.,
+    ``device_category = 'imv'``). Calling this at load makes the
+    downstream SQL deterministic across sites.
+
+    Polymorphic: pandas DataFrame in → pandas DataFrame out;
+    ``DuckDBPyRelation`` in → ``DuckDBPyRelation`` out (lazy). Missing
+    columns are silently skipped so the same call works across sites
+    with slightly different schemas (e.g., ``mar_action_category`` is
+    optional on ``medication_admin_continuous``).
+
+    Mirrors the canonical pattern at
+    ``CLIF-eligibility-for-mobilization/code/01_cohort_identification.py:340-341``
+    and ``sofa_score.py:365-366``.
+
+    Parameters
+    ----------
+    data : pd.DataFrame or duckdb.DuckDBPyRelation
+        Input table. Returned frame/relation is the same type.
+    columns : str or list[str]
+        Column name(s) to normalize. Missing columns are silently
+        skipped (no error). Each named column is lowercased AND has
+        leading/trailing whitespace stripped — both fixes for real-world
+        CLIF data quirks.
+    """
+    if isinstance(columns, str):
+        columns = [columns]
+    is_relation = isinstance(data, duckdb.DuckDBPyRelation)
+    if is_relation:
+        present = [c for c in columns if c in data.columns]
+        if not present:
+            return data
+        replace_sql = ", ".join(
+            f"TRIM(LOWER({c})) AS {c}" for c in present
+        )
+        return duckdb.sql(f"FROM data SELECT * REPLACE ({replace_sql})")
+    # pandas path. NB: don't promote to nullable StringDtype here — that
+    # turns NaN into pd.NA, which propagates through downstream
+    # `.eq(...).to_numpy()` chains as an object array, breaking any
+    # subsequent `.any()` / `np.argmax` etc. with "boolean value of NA is
+    # ambiguous." See 03_outcomes.py:433 (count_intubations_v2). Operate
+    # on the existing dtype so NaN stays NaN.
+    df = data.copy()
+    for col in columns:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        if s.dtype == "object" or pd.api.types.is_string_dtype(s):
+            df[col] = s.str.strip().str.lower()
+    return df
+
+
 def add_dh_hr(
     data,
     timestamp_col: str = "event_dttm",

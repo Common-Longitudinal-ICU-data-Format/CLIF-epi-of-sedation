@@ -62,6 +62,16 @@ def _compute() -> pd.DataFrame:
         )
         return pd.DataFrame()
 
+    # Per-hour-of-stay aggregation (168 hour bins). The `_nth_day BETWEEN 1
+    # AND 7` cap already excludes first_partial (`_nth_day=0` per the
+    # registry's 7am-crossing convention in `code/_utils.py:425`); the M2
+    # `_is_full_24h_day` filter is intentionally NOT applied here because
+    # dropping last_partial rows causes patients to drop out in 24h-boundary
+    # batches instead of trickling out at their actual extubation hour,
+    # producing bumpy trajectories. Per-DAY scripts (e.g.
+    # `dose_pattern_6group_count_by_icu_day.py`) correctly use
+    # `_is_full_24h_day` because each patient contributes one row per
+    # day-N bin there.
     sql = f"""
         WITH hours AS (
             FROM read_parquet('{seddose_path}') seddose_by_id_imvhr
@@ -80,7 +90,7 @@ def _compute() -> pd.DataFrame:
                     (seddose_by_id_imvhr._nth_day - 1) * 24
                     + ((seddose_by_id_imvhr._hr - 7 + 24) % 24)
                 )::INT
-            WHERE seddose_by_id_imvhr._nth_day >= 1
+            WHERE seddose_by_id_imvhr._nth_day BETWEEN 1 AND 7
         )
         FROM hours
         SELECT

@@ -60,6 +60,9 @@ import pandas as pd
 # distinction.
 import importlib.util as _iu  # noqa: E402
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.agg_shared")
+
 _DESCRIPTIVE_SHARED_PATH = (
     Path(__file__).resolve().parent.parent / "descriptive" / "_shared.py"
 )
@@ -89,9 +92,23 @@ apply_style = _descriptive_shared.apply_style
 COUNT_BAR_STACK_ORDER = _descriptive_shared.COUNT_BAR_STACK_ORDER
 DAY_COLS = _descriptive_shared.DAY_COLS
 NIGHT_COLS = _descriptive_shared.NIGHT_COLS
+ON_DRUG_FLAGS = _descriptive_shared.ON_DRUG_FLAGS
 DOSE_PATTERN_COLORS = _descriptive_shared.DOSE_PATTERN_COLORS
 DOSE_PATTERN_LABELS = _descriptive_shared.DOSE_PATTERN_LABELS
 categorize_diff_6way = _descriptive_shared.categorize_diff_6way
+
+# CI helpers — federation-clean (consume summary stats, not raw vectors).
+from _binom_helpers import (  # noqa: E402
+    student_t_ci_from_summary,
+    wilson_ci,
+)
+
+# Table 1 pooling primitives — federation-clean (consume summary stats only).
+from _table1_helpers import (  # noqa: E402
+    pooled_categorical_counts,
+    pooled_mean_sd_from_summary,
+    pooled_quantile_from_histograms,
+)
 
 # ── Site color palette ────────────────────────────────────────────────────
 # Qualitative palette with good contrast for ≤6 sites; loops with a warning
@@ -186,24 +203,72 @@ def site_label(site: str) -> str:
 
 # ── Loaders ───────────────────────────────────────────────────────────────
 def load_site_analytical(site: str) -> pd.DataFrame:
-    """Load the per-site modeling dataset parquet.
+    """Load the per-site modeling-cohort rows (filtered consolidated parquet).
 
-    Reads `output/{site}/modeling_dataset.parquet` — same path convention
-    the per-site descriptive scripts use via code/descriptive/_shared.py.
+    Phase 4 cutover (2026-05-08): reads
+    `output/{site}/model_input_by_id_imvday.parquet` and applies the
+    outcome-modeling filter inline. Byte-equivalent to the legacy
+    `modeling_dataset.parquet` row set; verified at both sites.
+
+      `_nth_day > 0 AND sbt_done_next_day IS NOT NULL
+       AND success_extub_next_day IS NOT NULL`
+
     Phase-2 aggregation *reads* these PHI-tier parquets but only emits
     aggregate outputs under output_to_agg/ (never row-level).
     """
-    return pd.read_parquet(f"output/{site}/modeling_dataset.parquet")
+    df = pd.read_parquet(f"output/{site}/model_input_by_id_imvday.parquet")
+    return df.loc[
+        (df["_nth_day"] > 0)
+        & df["sbt_done_next_day"].notna()
+        & df["success_extub_next_day"].notna()
+    ].reset_index(drop=True)
 
 
-def load_site_table1(site: str) -> pd.DataFrame:
-    """Load a per-site Table 1 CSV (string-formatted cells).
+def load_site_descriptive_csv(site: str, name: str) -> pd.DataFrame:
+    """Load a per-site aggregated CSV from `output_to_share/{site}/descriptive/`.
 
-    Returned frame preserves the output_to_share/{site}/models/table1.csv
-    layout: columns [Unnamed: 0, Unnamed: 1, Missing, Overall]. Values like
-    "64.2 (16.2)" or "5309 (43.0)" are strings — pool_table1.py parses them.
+    This is the federation-clean entry point for cross-site scripts —
+    consumes pre-aggregated counts/sums/means (no IDs, no row-level data)
+    written by `code/descriptive/*.py`. Use this in preference to any
+    `load_site_*` loader that reads PHI-tier parquets under `output/`.
+
+    `name` is the CSV stem (no `.csv` extension), e.g.
+    `dose_pattern_6group_count_by_icu_day`.
     """
-    return pd.read_csv(SHARE_ROOT / site / "models" / "table1.csv")
+    return pd.read_csv(SHARE_ROOT / site / "descriptive" / f"{name}.csv")
+
+
+def load_site_table1_continuous(site: str) -> pd.DataFrame:
+    """Load `output_to_share/{site}/models/table1_continuous.csv`.
+
+    One row per continuous Table 1 variable carrying
+    `(variable, n, n_missing, mean, sd, sum, sum_sq, median, q1, q3, min, max)`.
+    `sum` and `sum_sq` are the lossless primitives for cross-site
+    master-cohort mean/SD pooling via `pooled_mean_sd_from_summary`.
+    """
+    return pd.read_csv(SHARE_ROOT / site / "models" / "table1_continuous.csv")
+
+
+def load_site_table1_categorical(site: str) -> pd.DataFrame:
+    """Load `output_to_share/{site}/models/table1_categorical.csv`.
+
+    Long-format rows per (variable, category) with
+    `(n, n_missing, total_n, pct, denominator_unit)`. Per-stay and
+    per-patient-day denominators coexist via the `denominator_unit`
+    flag (e.g., `sbt_done_multiday_per_full24h_day` uses patient-days).
+    """
+    return pd.read_csv(SHARE_ROOT / site / "models" / "table1_categorical.csv")
+
+
+def load_site_table1_histograms(site: str) -> pd.DataFrame:
+    """Load `output_to_share/{site}/models/table1_histograms.csv`.
+
+    Long-format bin counts per continuous variable on hardcoded shared
+    bin edges (see `code/_table1_schema.py::BIN_EDGES`). Lets the
+    cross-site pooler compute master-cohort median/Q1/Q3 by summing
+    bin counts across sites and inverse-CDF interpolating.
+    """
+    return pd.read_csv(SHARE_ROOT / site / "models" / "table1_histograms.csv")
 
 
 def load_site_cohort_stats(site: str) -> pd.DataFrame:
@@ -211,16 +276,30 @@ def load_site_cohort_stats(site: str) -> pd.DataFrame:
     return pd.read_csv(SHARE_ROOT / site / "models" / "cohort_stats.csv")
 
 
-def load_site_forest_data(site: str) -> pd.DataFrame:
-    """Load per-site forest plot data (10→90 percentile ORs).
+def load_site_models_coeffs(site: str) -> pd.DataFrame:
+    """Load per-site model coefficients (federated meta-analysis payload).
 
     Returns the long-format CSV produced by the forest-plot cell in
-    `code/08_models.py`. Columns: outcome, model_type, spec, predictor,
-    OR, OR_lo, OR_hi. ORs are already rescaled to a 10th→90th percentile
-    shift in the predictor's production-cohort distribution, so cross-site
-    overlay is just a stack-and-plot job (no refit needed).
+    `code/08_models.py`. One row per (outcome, model_type, spec, logical
+    predictor) covering EVERY coefficient in EVERY fit. Schema:
+
+      outcome, model_type, spec, spec_family ('linear'|'rcs'), predictor,
+      row_type ('exposure'|'adjustment_continuous'|
+                'adjustment_categorical'|'intercept'),
+      log_or, se_log_or,                       # raw / headline
+      unit_size, unit_label, x_ref_raw,        # per-unit definitions
+      log_or_per_unit, se_per_unit,
+      or_per_unit, or_per_unit_lo, or_per_unit_hi,
+      x10_raw, x90_raw,                        # cohort percentiles
+      log_or_p10_p90, se_p10_p90,
+      or_p10_p90, or_p10_p90_lo, or_p10_p90_hi,
+      n_obs, n_events, n_clusters
+
+    Both per-unit (uniform across sites by design) and per-percentile
+    (site-specific cohort distribution) presentations are emitted, so the
+    cross-site agg layer can choose either without per-site re-runs.
     """
-    return pd.read_csv(SHARE_ROOT / site / "models" / "forest_data.csv")
+    return pd.read_csv(SHARE_ROOT / site / "models" / "models_coeffs.csv")
 
 
 def load_site_marginal_effects(site: str) -> pd.DataFrame:
@@ -238,14 +317,31 @@ def load_site_marginal_effects(site: str) -> pd.DataFrame:
 def load_site_exposure(site: str) -> pd.DataFrame:
     """Load PHI-tier exposure dataset for one site (full hospital-stay coverage).
 
-    Site-parameterized counterpart to `code/descriptive/_shared.py:load_exposure`,
-    which is locked to a module-level SITE_NAME captured at import time.
-    Carries the four flag columns the cross-site stacked-bar figure needs
-    (`_is_first_day`, `_is_last_day`, `_single_shift_day`, `_rel_day`),
-    plus the per-drug day/night/diff dose columns produced by
-    `code/05_modeling_dataset.py`.
+    Legacy loader kept during Phase 4 cutover. Reads the wide-semantic
+    `exposure_dataset.parquet` whose `_is_last_day` flag fires on
+    max-`_nth_day` per hospitalization (= partial extubation day OR last
+    full day, whichever exists). New consumers should prefer
+    `load_site_model_input` and filter on the registry's narrower
+    `_is_last_partial_day` / `_is_last_full_day` columns plus
+    `_is_full_24h_day` for explicit 12+12 hr coverage filtering.
+
+    Carries `_is_first_day`, `_is_last_day`, `_single_shift_day` flags
+    (legacy wide semantics) plus per-drug day/night/diff dose columns
+    produced by `code/05_modeling_dataset.py`.
     """
     return pd.read_parquet(f"output/{site}/exposure_dataset.parquet")
+
+
+def load_site_model_input(site: str) -> pd.DataFrame:
+    """Load PHI-tier consolidated per-day modeling input for one site.
+
+    Phase 4 superset of `exposure_dataset.parquet` keyed off the
+    canonical registry. Use when a cross-site figure wants explicit
+    full-vs-partial coverage filtering — `_is_full_24h_day = True`
+    drops intubation- and extubation-day partial rows in one filter.
+    Cross-site equivalent of `code/descriptive/_shared.py:load_model_input`.
+    """
+    return pd.read_parquet(f"output/{site}/model_input_by_id_imvday.parquet")
 
 
 # ── Save helpers ──────────────────────────────────────────────────────────
@@ -259,7 +355,7 @@ def save_agg_csv(df: pd.DataFrame, name: str, index: bool = False) -> str:
     ensure_agg_dirs()
     path = AGG_ROOT / f"{name}.csv"
     df.to_csv(path, index=index)
-    print(f"Saved {path}")
+    logger.info(f"Saved {path}")
     return str(path)
 
 
@@ -268,8 +364,70 @@ def save_agg_fig(fig, name: str) -> str:
     ensure_agg_dirs()
     path = AGG_FIGURES_DIR / f"{name}.png"
     fig.savefig(path, bbox_inches="tight")
-    print(f"Saved {path}")
+    logger.info(f"Saved {path}")
     return str(path)
+
+
+# ── Salient three-tier headline ──────────────────────────────────────────
+def add_salient_headline(
+    fig,
+    title: str,
+    subtitle: str,
+    *,
+    units_line: str | None = None,
+    title_color: str = "#1f1f1f",
+    y_title: float = 1.075,
+) -> None:
+    """Three-tier headline mirroring `sed_dose_by_hr_of_day_cross_site`.
+
+    Bold large title + muted provenance subtitle + (optional) italic
+    units / scope line. Replaces plain `fig.suptitle(...)` so cross-site
+    figures share one consistent salient header.
+
+    The subtitle should literally cite the disambiguating columns from
+    the underlying CSV (e.g. `outcome=...`, `spec=...`, `model_type=...`,
+    `k=N sites`) so each figure self-documents and sibling figures (per_unit
+    vs p10_p90; primary vs audit) are easy to tell apart at a glance.
+    """
+    fig.text(0.5, y_title, title,
+             transform=fig.transFigure, ha="center", va="bottom",
+             fontsize=20, fontweight="bold", color=title_color)
+    fig.text(0.5, y_title - 0.025, subtitle,
+             transform=fig.transFigure, ha="center", va="bottom",
+             fontsize=11, color="0.30")
+    if units_line:
+        fig.text(0.5, y_title - 0.046, units_line,
+                 transform=fig.transFigure, ha="center", va="bottom",
+                 fontsize=10, color="0.40", style="italic")
+
+
+# ── Visual marker for internal/QAQC figures ──────────────────────────────
+def add_audit_badge(fig, *, x: float | None = None, y: float = 0.985,
+                    ha: str = "right", byline: str | None = None) -> None:
+    """Draw an 'AUDIT VIEW' pill in the top-{ha} corner of `fig`.
+
+    Companion to the `*_audit_cross_site.png` filename suffix that
+    distinguishes internal/QAQC figures from `_primary_*` versions —
+    the suffix is invisible once a PNG is dropped into a slide deck,
+    so the badge surfaces the distinction visually.
+
+    `ha` defaults to "right" for back-compat. Pass `ha="left"` to relocate
+    when a column-title or other right-edge artifact collides with the
+    badge.
+    """
+    if x is None:
+        x = 0.985 if ha == "right" else 0.015
+    fig.text(x, y, "AUDIT VIEW",
+             transform=fig.transFigure,
+             ha=ha, va="top",
+             fontsize=10, fontweight="bold", color="white",
+             bbox=dict(boxstyle="round,pad=0.5",
+                       facecolor="#d97706", edgecolor="none"))
+    if byline:
+        fig.text(x, y - 0.025, byline,
+                 transform=fig.transFigure,
+                 ha=ha, va="top",
+                 fontsize=8, color="#d97706", style="italic")
 
 
 # ── Re-exports (stable public surface for agg scripts) ────────────────────
@@ -283,15 +441,21 @@ __all__ = [
     "site_label",
     # loaders
     "load_site_analytical",
-    "load_site_table1",
+    "load_site_descriptive_csv",
+    "load_site_table1_continuous",
+    "load_site_table1_categorical",
+    "load_site_table1_histograms",
     "load_site_cohort_stats",
-    "load_site_forest_data",
+    "load_site_models_coeffs",
     "load_site_marginal_effects",
     "load_site_exposure",
+    "load_site_model_input",
     # save helpers
     "ensure_agg_dirs",
     "save_agg_csv",
     "save_agg_fig",
+    "add_audit_badge",
+    "add_salient_headline",
     # re-exports from code/descriptive/_shared
     "DRUGS",
     "DIFF_COLS",
@@ -305,8 +469,16 @@ __all__ = [
     "DOSE_PATTERN_COLORS",
     "DOSE_PATTERN_LABELS",
     "COUNT_BAR_STACK_ORDER",
+    "ON_DRUG_FLAGS",
     "cap_day",
     "prepare_diffs",
     "apply_style",
     "categorize_diff_6way",
+    # CI helpers
+    "wilson_ci",
+    "student_t_ci_from_summary",
+    # Table 1 pooling primitives
+    "pooled_mean_sd_from_summary",
+    "pooled_quantile_from_histograms",
+    "pooled_categorical_counts",
 ]

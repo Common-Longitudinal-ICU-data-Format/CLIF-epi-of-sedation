@@ -52,7 +52,13 @@ def _():
     import duckdb
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
     from clifpy.utils.config import get_config_or_params
-    from _utils import remove_meds_duplicates, add_dh_hr
+    from _utils import (
+        add_dh_hr,
+        mar_action_not_given_filter_sql,
+        mar_action_zero_dose_sql,
+        normalize_categories,
+        remove_meds_duplicates,
+    )
     from _outlier_handler import apply_outlier_handling_duckdb
 
     import warnings
@@ -75,6 +81,9 @@ def _():
         convert_dose_units_by_med_category,
         duckdb,
         get_config_or_params,
+        mar_action_not_given_filter_sql,
+        mar_action_zero_dose_sql,
+        normalize_categories,
         remove_meds_duplicates,
         setup_logging,
     )
@@ -191,10 +200,61 @@ def _(DATA_DIR, apply_outlier_handling_duckdb, cohort_hosp_ids_rel, duckdb):
 
 
 @app.cell
-def _(DATA_DIR, cohort_hosp_ids_rel, duckdb):
+def _(DATA_DIR, duckdb):
+    # B5: detect mar_action_category presence on each medication table.
+    # Asymmetric contract:
+    #   - continuous: column is OPTIONAL — fall back to mar_action_name regex.
+    #     FFILL semantics are forgiving (a missed stop event over-FFILLs by
+    #     minutes, not hours).
+    #   - intermittent: column is REQUIRED — bolus dose accounting depends on
+    #     the structured 'not_given' zeroing, and free-text mar_action_name
+    #     varies too widely across sites to regex reliably.
+    _cont_path = f"{DATA_DIR}/clif_medication_admin_continuous.parquet"
+    _intm_path = f"{DATA_DIR}/clif_medication_admin_intermittent.parquet"
+    _cont_cols = {r[0] for r in duckdb.sql(f"DESCRIBE FROM '{_cont_path}'").fetchall()}
+    _intm_cols = {r[0] for r in duckdb.sql(f"DESCRIBE FROM '{_intm_path}'").fetchall()}
+    HAS_MAR_CAT_CONT = 'mar_action_category' in _cont_cols
+    HAS_MAR_CAT_INTM = 'mar_action_category' in _intm_cols
+    if not HAS_MAR_CAT_INTM:
+        logger.error(
+            "medication_admin_intermittent is missing required column "
+            "'mar_action_category'. This column is required for accurate "
+            "bolus dose accounting (zeroing of charted-but-not-administered "
+            "doses). Refer to the CLIF medication table specification."
+        )
+        raise RuntimeError(
+            "medication_admin_intermittent missing 'mar_action_category' — "
+            "see CLIF spec; mar_action_name regex fallback is not safe for "
+            "intermittent dose totals."
+        )
+    if HAS_MAR_CAT_CONT:
+        logger.info("medication_admin_continuous: mar_action_category present (preferred path)")
+    else:
+        logger.warning(
+            "medication_admin_continuous: mar_action_category missing — "
+            "falling back to mar_action_name regex for stop/not_given detection. "
+            "Acceptable for continuous FFILL semantics."
+        )
+    return (HAS_MAR_CAT_CONT,)
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    HAS_MAR_CAT_CONT,
+    duckdb,
+    mar_action_not_given_filter_sql,
+    normalize_categories,
+):
     # Inline raw DuckDB read — bypasses clifpy.load_data (see vitals cell
     # comment + docs/timezone_audit.md). admin_dttm flows downstream as
     # UTC TIMESTAMPTZ. Predicate + projection pushdown engages.
+    # B5: mar_action_category SELECT and WHERE both branch on column presence.
+    _mar_cat_select = (
+        ", c.mar_action_category" if HAS_MAR_CAT_CONT
+        else ", CAST(NULL AS VARCHAR) AS mar_action_category"
+    )
+    _not_given_filter = mar_action_not_given_filter_sql(HAS_MAR_CAT_CONT)
     cont_sed_rel = duckdb.sql(f"""
         FROM '{DATA_DIR}/clif_medication_admin_continuous.parquet' c
         JOIN cohort_hosp_ids_rel USING (hospitalization_id)
@@ -206,11 +266,16 @@ def _(DATA_DIR, cohort_hosp_ids_rel, duckdb):
             , c.med_dose
             , c.med_dose_unit
             , c.mar_action_name
-            , c.mar_action_category
+            {_mar_cat_select}
         WHERE c.med_category IN ('propofol', 'fentanyl', 'midazolam', 'lorazepam', 'hydromorphone')
             AND c.med_dose IS NOT NULL
-            AND c.mar_action_category != 'not_given'
+            AND {_not_given_filter}
     """)
+    # Normalize category casing (cross-site safety). If mar_action_category
+    # is the synthetic NULL column, normalize is a no-op for it.
+    cont_sed_rel = normalize_categories(
+        cont_sed_rel, ['med_category', 'mar_action_category']
+    )
     if logger.isEnabledFor(logging.DEBUG):
         _n = cont_sed_rel.count("*").fetchone()[0]
         logger.debug(f"Continuous sedation: {_n:,} non-null-dose rows")
@@ -525,12 +590,20 @@ def _(cont_sed_outliered, imv_starts):
 
 
 @app.cell
-def _(cont_sed_starter_rates, cont_sed_within_imv):
+def _(
+    HAS_MAR_CAT_CONT,
+    cont_sed_starter_rates,
+    cont_sed_within_imv,
+    mar_action_zero_dose_sql,
+):
     # UNION ALL of the within-IMV admin events and the per-patient starter
     # rates (one synthetic admin row per patient at their IMV-start
     # timestamp). The `BY NAME` qualifier matches columns by name rather
     # than position, so column order doesn't have to align between the
     # two relations.
+    # B5: zero-dose CASE uses helper so sites without mar_action_category
+    # fall back to mar_action_name regex.
+    _zero_cond = mar_action_zero_dose_sql(HAS_MAR_CAT_CONT)
     cont_sed_long = mo.sql(
         f"""
         WITH unioned AS (
@@ -545,7 +618,7 @@ def _(cont_sed_starter_rates, cont_sed_within_imv):
                 med_category || '_'
                 || REPLACE(med_dose_unit, '/', '_')
                 || '_cont'
-            , med_dose: CASE WHEN mar_action_category IN ('stop', 'not_given') THEN 0 ELSE med_dose END
+            , med_dose: CASE WHEN {_zero_cond} THEN 0 ELSE med_dose END
         """
     )
     return
@@ -724,9 +797,11 @@ def _():
 
 
 @app.cell
-def _(DATA_DIR, cohort_hosp_ids_rel, duckdb):
+def _(DATA_DIR, cohort_hosp_ids_rel, duckdb, normalize_categories):
     # Inline raw DuckDB read — same pattern as cont_sed_rel above. admin_dttm
     # flows downstream as UTC TIMESTAMPTZ. See docs/timezone_audit.md.
+    # B5: mar_action_category is REQUIRED here — the detection cell above
+    # (HAS_MAR_CAT_INTM) has already asserted presence and raised otherwise.
     intm_sed_rel = duckdb.sql(f"""
         FROM '{DATA_DIR}/clif_medication_admin_intermittent.parquet' c
         JOIN cohort_hosp_ids_rel USING (hospitalization_id)
@@ -743,6 +818,9 @@ def _(DATA_DIR, cohort_hosp_ids_rel, duckdb):
             AND c.med_dose IS NOT NULL
             AND c.mar_action_category != 'not_given'
     """)
+    intm_sed_rel = normalize_categories(
+        intm_sed_rel, ['med_category', 'mar_action_category']
+    )
     if logger.isEnabledFor(logging.DEBUG):
         _n = intm_sed_rel.count("*").fetchone()[0]
         logger.debug(f"Intermittent sedation: {_n:,} non-null-dose rows")
@@ -799,12 +877,14 @@ def _(duckdb, intm_sed_rel, remove_meds_duplicates):
 
 @app.cell
 def _(convert_dose_units_by_med_category, intm_sed_deduped, vitals_rel):
-    # Intermittent: bolus mg/dose with no defined duration. Targets are
-    # weight-free amount units; vitals_rel is needed when a source row carries
-    # a /kg qualifier. Stay lazy via return_rel=True; convert_summary is the
-    # surface that confirms the unit map for each category.
+    # Intermittent bolus doses. Propofol targets `mcg/kg` (weight-adjusted)
+    # so the converted intm column drops into `prop_mcg_kg_min_total`'s sum
+    # alongside continuous; the other four drugs stay at weight-free amount
+    # units because they roll into fenteq/midazeq equivalency sums in
+    # absolute units, not per-kg. `vitals_df=vitals_rel` provides the
+    # per-bolus ASOF weight that clifpy's mcg/kg converter needs.
     _intm_sed_preferred_units = {
-        'propofol': 'mg',
+        'propofol': 'mcg/kg',
         'midazolam': 'mg',
         'fentanyl': 'mcg',
         'hydromorphone': 'mg',
@@ -991,12 +1071,13 @@ def _(cohort_meta_by_id_imvhr, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
     # Both `_cont` (continuous-only) and `_total` (cont + intm) variants
     # are exposed so consumers can pick the analytical scope.
     #
-    # Propofol exception: cont units are mcg/kg/min but intm units are mg
-    # per bolus (no /kg). They're not directly addable, so
-    # prop_mcg_kg_min_total == prop_mcg_kg_min_cont here. intm propofol is
-    # rare in ICU (procedural boluses) and excluded from the rate column;
-    # see Phase-2 comment in prior code revision.
-    # TODO: incorporate prop intm via per-bolus weight + duration assumptions.
+    # Propofol: cont is mcg/kg/min infusion rate; intm bolus mg is converted
+    # to mcg/kg upstream via clifpy's weight-adjusted unit converter (using
+    # the per-bolus ASOF weight). Both terms are then in per-hour mcg/kg
+    # units (cont = rate × duration summed; intm = sum of bolus mcg/kg),
+    # so they add cleanly. Dividing by 60 re-rates the hourly sum to a
+    # mcg/kg/min equivalent — the standard simplification of treating
+    # bolus dose as distributed across the hour.
     seddose_by_id_imvhr = mo.sql(
         f"""
         WITH joined AS (
@@ -1020,9 +1101,14 @@ def _(cohort_meta_by_id_imvhr, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
                                       + COALESCE(fentanyl_mcg_cont, 0)
             , midazeq_mg_hr_cont:    COALESCE(lorazepam_mg_cont, 0) * 2
                                       + COALESCE(midazolam_mg_cont, 0)
-            -- Total (cont + intm) per-hour avg rates. Propofol total ==
-            -- cont because intm prop has incompatible units (see header).
-            , prop_mcg_kg_min_total: COALESCE(propofol_mcg_kg_cont, 0) / 60.0
+            -- Total (cont + intm) per-hour avg rates. Propofol intm is now
+            -- weight-adjusted to mcg/kg upstream, so cont (already mcg/kg
+            -- per hour) and intm (sum of bolus mcg/kg per hour) add directly;
+            -- /60 re-rates to mcg/kg/min averaged over the hour.
+            , prop_mcg_kg_min_total: (
+                COALESCE(propofol_mcg_kg_cont, 0)
+                + COALESCE(propofol_mcg_kg_intm, 0)
+              ) / 60.0
             , fenteq_mcg_hr_total:   (COALESCE(hydromorphone_mg_cont, 0)
                                        + COALESCE(hydromorphone_mg_intm, 0)) * 50
                                       + COALESCE(fentanyl_mcg_cont, 0)
@@ -1035,6 +1121,80 @@ def _(cohort_meta_by_id_imvhr, cont_sed_dose_by_hr, intm_sed_dose_by_hr):
         """
     )
     return (seddose_by_id_imvhr,)
+
+
+@app.cell
+def _(seddose_by_id_imvhr, duckdb):
+    # M1: per-hour clinical-ceiling clamp (cap-to-ceiling, not NULL).
+    #
+    # WHAT: caps per-hour avg rates at a clinical-implausibility ceiling.
+    # Cap-to-ceiling rather than NULL because the downstream
+    # `05_modeling_dataset.py` COALESCE(..., 0) wrapper would otherwise
+    # silently re-interpret a clamped patient-shift as "no exposure," which
+    # is worse than either no-clamp (real signal preserved) or cap-to-ceiling
+    # (directional signal preserved, magnitude bounded).
+    #
+    # WHY per-hour, not per-shift: a partial-shift weight error inflates
+    # only some hours; per-shift averaging dilutes that signal past
+    # detection. Per-hour clamping lets the surviving hours contribute to
+    # the shift average via AVG-ignores-NULL semantics (we cap, not NULL,
+    # so this nuance doesn't bite — but the per-hour granularity is still
+    # the right place to bound outliers).
+    #
+    # CEILINGS: chosen at the per-row outlier-handler boundary
+    # (config/outlier_config.yaml). For propofol the per-row clamp is
+    # 200 mcg/kg/min, so a per-hour AVG of post-clamp values mathematically
+    # cannot exceed 200. Setting the M1 ceiling AT that boundary makes the
+    # clamp a defense-in-depth net for cases where the per-row clamp is
+    # bypassed (e.g., a future change to outlier_config.yaml) without
+    # creating false positives on real high-end sustained dosing.
+    #
+    # TOGGLE: `SEDDOSE_CLAMP=0` makes this cell a pass-through, useful for
+    # producing an unclamped comparison run. The raw parquet sibling
+    # written at the end of this script lets users diff clamped vs raw at
+    # the per-hour level without a second pipeline run.
+    import os as _os
+    _seddose_clamp_on = _os.getenv("SEDDOSE_CLAMP", "1") == "1"
+    _ceilings = {
+        'prop_mcg_kg_min_cont':  200,
+        'prop_mcg_kg_min_total': 200,
+        'fenteq_mcg_hr_cont':   1000,
+        'fenteq_mcg_hr_total':  1000,
+        'midazeq_mg_hr_cont':     50,
+        'midazeq_mg_hr_total':    50,
+    }
+    if not _seddose_clamp_on:
+        logger.info("M1 clinical-ceiling clamp DISABLED (SEDDOSE_CLAMP=0)")
+        seddose_by_id_imvhr_clamped = seddose_by_id_imvhr
+    else:
+        for _col, _ceil in _ceilings.items():
+            _n_above = duckdb.sql(
+                f"FROM seddose_by_id_imvhr SELECT COUNT(*) WHERE {_col} > {_ceil}"
+            ).fetchone()[0]
+            if _n_above > 0:
+                logger.warning(
+                    f"M1 clinical-ceiling clamp: capping {_n_above:,} "
+                    f"patient-hours where {_col} > {_ceil} to the ceiling. "
+                    f"Likely weight-error or unit-conversion bug — investigate "
+                    f"if count exceeds 0.5% of total."
+                )
+            else:
+                logger.info(
+                    f"M1 clinical-ceiling clamp: 0 rows above {_col} ceiling "
+                    f"({_ceil}) — no clamp applied to this column."
+                )
+        _replace_clauses = ", ".join(
+            f"LEAST({col}, {ceil}) AS {col}" for col, ceil in _ceilings.items()
+        )
+        # `.pl()` materializes to Polars DataFrame so downstream cells
+        # (sed_dose_agg via mo.sql, the write cell via .with_columns) see a
+        # consistent type whether or not the clamp was applied.
+        seddose_by_id_imvhr_clamped = duckdb.sql(f"""
+            FROM seddose_by_id_imvhr
+            SELECT * REPLACE ({_replace_clauses})
+        """).pl()
+        logger.info("M1 clinical-ceiling clamp APPLIED (SEDDOSE_CLAMP=1)")
+    return (seddose_by_id_imvhr_clamped,)
 
 
 @app.cell(hide_code=True)
@@ -1050,7 +1210,7 @@ def _():
 
 
 @app.cell
-def _(seddose_by_id_imvhr):
+def _(seddose_by_id_imvhr_clamped):
     # Per-shift avg rate = AVG of hourly rates within the shift. Algebraic
     # equivalence (each hour is the same 60-min length):
     #   total drug = Σ(rate_h × 60); shift duration = n_hours × 60
@@ -1064,9 +1224,12 @@ def _(seddose_by_id_imvhr):
     #
     # Both `_cont` (continuous-only) and `_total` (cont + intm) variants
     # propagate; consumers pick analytical scope at read time.
+    # Reads the clamped per-hour relation from the M1 cell above. Set
+    # SEDDOSE_CLAMP=0 to bypass clamping (M1 becomes a pass-through, this
+    # AVG runs over raw per-hour values).
     sed_dose_agg = mo.sql(
         f"""
-        FROM seddose_by_id_imvhr
+        FROM seddose_by_id_imvhr_clamped
         SELECT hospitalization_id, _nth_day, _shift
             , prop_mcg_kg_min_cont:  AVG(prop_mcg_kg_min_cont)
             , prop_mcg_kg_min_total: AVG(prop_mcg_kg_min_total)
@@ -1096,6 +1259,9 @@ def _(sed_dose_agg):
     # n_hours_day / n_hours_night carry through as coverage metadata —
     # downstream `05_modeling_dataset.py` no longer divides by them
     # because the rate columns are already shift-avg rates.
+    #
+    # M1 clamping (if SEDDOSE_CLAMP=1) was applied upstream at the per-hour
+    # layer, so sed_dose_agg here already reflects clamped inputs.
     seddose_by_id_imvday = mo.sql(
         f"""
         FROM sed_dose_agg
@@ -1145,18 +1311,33 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, seddose_by_id_imvday, seddose_by_id_imvhr):
+def _(SITE_NAME, seddose_by_id_imvday, seddose_by_id_imvhr, seddose_by_id_imvhr_clamped):
     import polars as pl  # cell-local — used only for the tz-bearing parquet write
 
     seddose_by_id_imvday.write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
+
+    # Canonical per-hour parquet: clamped (or pass-through if SEDDOSE_CLAMP=0).
+    # This is what every downstream consumer reads (descriptive scripts,
+    # 05_modeling_dataset.py via the daily roll-up).
     (
-        seddose_by_id_imvhr
+        seddose_by_id_imvhr_clamped
         .with_columns(pl.col("event_dttm").dt.convert_time_zone("UTC"))
         .write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
     )
 
+    # Raw sibling: pre-clamp data, always written so users can diff the two
+    # parquets to see the clamp's impact at the patient-hour level without
+    # re-running the pipeline with SEDDOSE_CLAMP=0. When SEDDOSE_CLAMP=0 the
+    # two files have identical contents (M1 cell is a pass-through).
+    (
+        seddose_by_id_imvhr
+        .with_columns(pl.col("event_dttm").dt.convert_time_zone("UTC"))
+        .write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr_raw.parquet")
+    )
+
     logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvday.parquet")
-    logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvhr.parquet (event_dttm in UTC)")
+    logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvhr.parquet (event_dttm in UTC, clamp-aware)")
+    logger.info(f"Saved: output/{SITE_NAME}/seddose_by_id_imvhr_raw.parquet (event_dttm in UTC, always pre-clamp)")
     return
 
 

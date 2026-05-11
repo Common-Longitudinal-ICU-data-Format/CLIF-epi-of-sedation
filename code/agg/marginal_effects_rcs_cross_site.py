@@ -51,10 +51,15 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.agg.marginal_effects_rcs")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
     SITE_PALETTE,
+    add_audit_badge,
+    add_salient_headline,
     list_sites,
     load_site_marginal_effects,
     save_agg_csv,
@@ -63,10 +68,28 @@ from _shared import (  # noqa: E402
 )
 
 
+# Per-outcome bold-title color for the audit branch (single-outcome figs).
+# Mirrors the convention from sed_dose_by_hr_of_day's drug-title-color
+# override — distinct dark hue per outcome so a reader can flip between
+# audit PNGs and instantly tell which outcome they're looking at.
+_OUTCOME_TITLE_COLORS: dict[str, str] = {
+    "sbt_done_multiday_next_day": "#1f4e79",  # deep blue
+    "sbt_done_prefix_next_day":   "#1f4e79",
+    "sbt_done_subira_next_day":   "#1f4e79",
+    "sbt_done_abc_next_day":      "#1f4e79",
+    "sbt_done_v2_next_day":       "#1f4e79",
+    "success_extub_next_day":     "#a61d24",  # firebrick
+    "success_extub_v2_next_day":  "#a61d24",
+}
+
+
 # ── Manuscript scope ──────────────────────────────────────────────────────
 # Two manuscript base specs (linear-spec names; the RCS variants are
 # `*_rcs_diff` or `*_rcs_full`).
-BASE_SPECS: list[str] = ["daydose_wt", "clinical_wt"]
+# Renamed 2026-05-11: weight_kg moved into BASELINE so the `_wt` suffix
+# is gone; `clinical_wt` → `daydose_physio` since the spec adds
+# physiologic markers (pH/PF/NEE) on top of daydose.
+BASE_SPECS: list[str] = ["daydose", "daydose_physio"]
 
 # Three versions of the primary marginal-effects figure. Each version
 # specifies which RCS spec suffix to use and which logit fit to pull
@@ -119,7 +142,6 @@ _DIFF_ROW = 1
 # "Predicted probability" axis label combined with `OUTCOME_HEADER`
 # bold row titles for clarity.
 Y_LABEL: dict[str, str] = {
-    "sbt_elig_next_day":          "Probability of SBT Eligibility",
     "sbt_done_multiday_next_day": "Probability of Passing SBT (multiday)",
     "sbt_done_v2_next_day":       "Probability of Passing SBT (v2)",
     "success_extub_next_day":     "Probability of Successful Extubation",
@@ -135,7 +157,6 @@ OUTCOME_HEADER: dict[str, str] = {
 
 # Filename short form per outcome (mirrors `OUTCOME_SHORT` in `code/08_models.py`).
 OUTCOME_SHORT: dict[str, str] = {
-    "sbt_elig_next_day":          "sbt_elig",
     "sbt_done_multiday_next_day": "sbt_done_multiday",
     "sbt_done_v2_next_day":       "sbt_done_v2",
     "success_extub_next_day":     "success_extub",
@@ -158,15 +179,15 @@ def _stack_per_site() -> pd.DataFrame:
     """Concat each discovered site's marginal_effects_grid.csv with a `site` column."""
     sites = list_sites()
     if not sites:
-        print("No sites found under output_to_share/. Nothing to plot.")
+        logger.info("No sites found under output_to_share/. Nothing to plot.")
         return pd.DataFrame()
-    print(f"Discovered sites: {sites}")
+    logger.info(f"Discovered sites: {sites}")
     frames: list[pd.DataFrame] = []
     for s in sites:
         try:
             df = load_site_marginal_effects(s)
         except FileNotFoundError:
-            print(
+            logger.info(
                 f"  SKIP {s}: marginal_effects_grid.csv missing — "
                 "re-run 08_models.py for this site."
             )
@@ -275,10 +296,15 @@ def _render_primary_combined(
             ncol=len(handles), frameon=False, fontsize=10, title="Site",
         )
 
-    fig.suptitle(
-        f"Manuscript outcomes by sedative night–day diff "
-        f"({base_spec}, {version_name} — {version_cfg['short_desc']})",
-        fontsize=12, y=1.04,
+    add_salient_headline(
+        fig,
+        title="Marginal effect of sedation on liberation: cross-site overlay",
+        subtitle=(
+            f"base_spec={base_spec} · "
+            f"version={version_name} (cr() basis = {version_cfg['spec_suffix']}) · "
+            f"extub model_type={version_cfg['extub_mt']}"
+        ),
+        units_line="Predicted probability vs predictor; one curve per site, ribbons = 95% CI",
     )
     fig.tight_layout()
     return fig
@@ -373,10 +399,16 @@ def _render_one(
             ncol=len(handles), frameon=False, fontsize=10, title="Site",
         )
 
-    fig.suptitle(
-        f"{Y_LABEL.get(outcome, 'Probability')} by Sedative Exposure\n"
-        f"({spec} spec, {model_type.upper()})",
-        fontsize=12, y=1.07,
+    n_sites = cell["site"].nunique() if not cell.empty else 0
+    add_salient_headline(
+        fig,
+        title=Y_LABEL.get(outcome, "Probability"),
+        subtitle=(
+            f"model_type={model_type} · spec={spec} · k={n_sites} sites · "
+            "cr() basis re-evaluated at site grids"
+        ),
+        units_line="Predicted probability vs predictor; one curve per site, ribbons = 95% CI",
+        title_color=_OUTCOME_TITLE_COLORS.get(outcome, "#1f1f1f"),
     )
     fig.tight_layout()
     return fig
@@ -404,7 +436,7 @@ def main() -> None:
     have_combos = set(map(tuple, df_all[["outcome", "model_type", "spec"]].drop_duplicates().values))
     missing = needed_combos - have_combos
     if missing:
-        print(
+        logger.info(
             f"  WARN: {len(missing)} needed (outcome, model_type, spec) combos "
             f"are missing from per-site data. Re-run 08_models.py per site. "
             f"First few: {sorted(missing)[:3]}"
@@ -432,6 +464,10 @@ def main() -> None:
             df_all, outcome, model_type, spec,
             panel_rows=[_DAYTIME_ROW, _DIFF_ROW],
         )
+        # AUDIT badge top-LEFT (away from the spec-name title at top-right
+        # of the right column). Companion to the `_audit_cross_site.png`
+        # filename suffix.
+        add_audit_badge(fig, ha="left")
         save_agg_fig(
             fig,
             f"marginal_effects_{outcome_short}_{model_type}_{spec}_audit_cross_site",

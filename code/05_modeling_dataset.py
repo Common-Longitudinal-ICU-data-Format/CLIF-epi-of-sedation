@@ -80,7 +80,7 @@ def _():
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
     from clifpy import setup_logging
-    from _utils import to_utc
+    from _utils import normalize_categories, to_utc
     import pandas as pd
     import duckdb
 
@@ -95,7 +95,15 @@ def _():
     # Per-site dual log files (pyCLIF integration guide rule 1).
     setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
-    return CONFIG_PATH, SITE_NAME, SITE_TZ, apply_outlier_handling, pd, to_utc
+    return (
+        CONFIG_PATH,
+        SITE_NAME,
+        SITE_TZ,
+        apply_outlier_handling,
+        normalize_categories,
+        pd,
+        to_utc,
+    )
 
 
 @app.cell(hide_code=True)
@@ -148,13 +156,18 @@ def _(CONFIG_PATH, apply_outlier_handling):
 
 
 @app.cell
-def _(CONFIG_PATH):
+def _(CONFIG_PATH, normalize_categories):
     from clifpy import Patient
     _patient = Patient.from_file(
         config_path=CONFIG_PATH,
         columns=['patient_id', 'sex_category'],
     )
-    patient_df = _patient.df
+    # Normalize category casing for cross-site safety. Downstream
+    # statsmodels formulas treat sex_category as a categorical factor;
+    # without normalization, 'Male'/'male' would create two separate
+    # dummy columns and a new site could silently misalign reference
+    # levels relative to UCMC/MIMIC.
+    patient_df = normalize_categories(_patient.df, ['sex_category'])
     logger.info(f"patient_df: {len(patient_df)} rows")
     return (patient_df,)
 

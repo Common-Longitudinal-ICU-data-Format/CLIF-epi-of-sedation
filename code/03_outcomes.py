@@ -41,7 +41,7 @@ def _():
 def _():
     from clifpy.utils.config import get_config_or_params
     from clifpy import setup_logging
-    from _utils import to_utc
+    from _utils import normalize_categories, to_utc
     import pandas as pd
     import duckdb
 
@@ -51,7 +51,14 @@ def _():
     CONFIG_PATH = "config/config.json"
 
     os.makedirs("output", exist_ok=True)
-    return CONFIG_PATH, get_config_or_params, pd, setup_logging, to_utc
+    return (
+        CONFIG_PATH,
+        get_config_or_params,
+        normalize_categories,
+        pd,
+        setup_logging,
+        to_utc,
+    )
 
 
 @app.cell
@@ -85,13 +92,21 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, pd):
+def _(SITE_NAME, normalize_categories, pd):
     resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
     assert os.path.exists(resp_processed_path), (
         f"Missing {resp_processed_path} — run 01_cohort.py first"
     )
     resp_p = pd.read_parquet(resp_processed_path)
-    resp_p['tracheostomy'] = resp_p['tracheostomy'].fillna(0).astype(int)
+    # tracheostomy can arrive as BOOL (warm clifpy), INT, or VARCHAR-of-bool
+    # ('True'/'False' from cold waterfall recompute via Python str()).
+    # Normalize all three to int{0,1} via lowercase-string match.
+    _trach_raw = resp_p['tracheostomy'].astype(str).str.lower()
+    resp_p['tracheostomy'] = _trach_raw.isin({'true', '1', 't'}).astype(int)
+    # Defensive normalize: even though 01_cohort.py now lowercases at load,
+    # this script can also be run standalone against an older parquet that
+    # might predate that fix.
+    resp_p = normalize_categories(resp_p, ['device_category', 'mode_category'])
     logger.info(f"resp_p: {len(resp_p)} rows from {resp_processed_path}")
     return (resp_p,)
 
@@ -139,7 +154,7 @@ def _(CONFIG_PATH):
 
 
 @app.cell
-def _(SITE_TZ, hosp, to_utc):
+def _(SITE_TZ, hosp, normalize_categories, to_utc):
     hosp_df = hosp.df[['hospitalization_id', 'discharge_category', 'discharge_dttm']].copy()
     # clifpy's `from_file` returns discharge_dttm NAIVE site-local; to_utc
     # localizes to SITE_TZ then converts to UTC so downstream DuckDB joins
@@ -147,12 +162,16 @@ def _(SITE_TZ, hosp, to_utc):
     # to_utc handles DST fall-back ambiguity (UCMC has admits/discharges
     # falling on 01:00-02:00 of fall-back days).
     hosp_df = to_utc(hosp_df, 'discharge_dttm', naive_means=SITE_TZ)
+    # Normalize category casing (cross-site safety). The existing
+    # TRIM(LOWER(...)) in the SQL below is now redundant for surviving rows
+    # but kept as defensive belt-and-suspenders.
+    hosp_df = normalize_categories(hosp_df, ['discharge_category'])
     logger.info(f"hosp_df: {len(hosp_df)} rows")
     return (hosp_df,)
 
 
 @app.cell
-def _(CONFIG_PATH, SITE_TZ, hosp, to_utc):
+def _(CONFIG_PATH, SITE_TZ, hosp, normalize_categories, to_utc):
     cs = CodeStatus.from_file(
         config_path=CONFIG_PATH,
         columns=['patient_id', 'code_status_category', 'start_dttm'],
@@ -164,6 +183,8 @@ def _(CONFIG_PATH, SITE_TZ, hosp, to_utc):
     cs_df = cs_df[['hospitalization_id', 'code_status_category', 'start_dttm']].copy()
     # Same clifpy convention: start_dttm is naive site-local on load.
     cs_df = to_utc(cs_df, 'start_dttm', naive_means=SITE_TZ)
+    # Normalize category casing for cross-site safety (cf. note in hosp_df).
+    cs_df = normalize_categories(cs_df, ['code_status_category'])
     cs_df = cs_df.sort_values(['hospitalization_id', 'start_dttm']).reset_index(drop=True)
     logger.info(f"cs_df: {len(cs_df)} rows (mapped to hospitalization_id)")
     return (cs_df,)
