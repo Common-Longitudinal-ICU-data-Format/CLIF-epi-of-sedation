@@ -79,6 +79,7 @@ def _():
 def _():
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
+    from clifpy import setup_logging
     from _utils import to_utc
     import pandas as pd
     import duckdb
@@ -91,6 +92,8 @@ def _():
     # app.setup block at the top; re-importing here would raise marimo's
     # MultipleDefinitionError.
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
+    # Per-site dual log files (pyCLIF integration guide rule 1).
+    setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
     return CONFIG_PATH, SITE_NAME, SITE_TZ, apply_outlier_handling, pd, to_utc
 

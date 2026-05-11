@@ -37,6 +37,7 @@ def _():
 @app.cell
 def _():
     from clifpy.utils.config import get_config_or_params
+    from clifpy import setup_logging
     import pandas as pd
 
     CONFIG_PATH = "config/config.json"
@@ -45,7 +46,10 @@ def _():
 
     # Site-scoped output dirs (see Makefile SITE= flag).
     # Path B++ refactor: every modeling artifact lands under {site}/models/.
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
+    # Per-site dual log files (pyCLIF integration guide rule 1).
+    setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME}")
     return SITE_NAME, pd
 

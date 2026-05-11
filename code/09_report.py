@@ -100,6 +100,7 @@ def _():
 @app.cell
 def _():
     from clifpy.utils.config import get_config_or_params
+    from clifpy import setup_logging
     import pandas as pd
     from datetime import datetime
 
@@ -112,8 +113,11 @@ def _():
     # artifacts under {site}/models/. The compiled PDF is written at the
     # top-level {site}/sedation_report.pdf so collaborators see it without
     # navigating into a subdir.
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/descriptive", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
+    # Per-site dual log files (pyCLIF integration guide rule 1).
+    setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME}")
     return SITE_NAME, datetime, pd
 

@@ -21,7 +21,9 @@ with app.setup:
     import polars as pl
     from pathlib import Path
     # sys.path.insert(0, str(Path(__file__).parent))
-    RERUN_WATERFALL = False
+    # Env-var-driven so sites can re-invalidate the (expensive) waterfall
+    # cache without editing source (e.g. `RERUN_WATERFALL=1 make run`).
+    RERUN_WATERFALL = os.getenv("RERUN_WATERFALL", "0") == "1"
     # Hoisted into setup so any cell can call them without re-importing
     # (marimo flags duplicate top-level imports across cells as
     # cross-cell shadowing). to_utc is the canonical tz-normalization helper

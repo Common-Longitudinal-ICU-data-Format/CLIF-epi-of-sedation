@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
+from clifpy import setup_logging
 from clifpy.utils.config import get_config_or_params
 from clifpy.utils.logging_config import get_logger
 from patsy import dmatrix
@@ -42,7 +43,12 @@ CONFIG_PATH = "config/config.json"
 cfg = get_config_or_params(CONFIG_PATH)
 SITE_NAME = cfg["site_name"].lower()
 OUT_DIR = f"output_to_share/{SITE_NAME}/models"
+os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
+# Per-site dual log files (pyCLIF integration guide rule 1). Even though
+# this script is shelved from `make run`, the standalone `make cascade`
+# target still calls it and needs the same logging contract.
+setup_logging(output_directory=f"output/{SITE_NAME}")
 logger.info(f"Site: {SITE_NAME}")
 
 

@@ -115,12 +115,6 @@ def _(SITE_NAME, duckdb):
 
 
 @app.cell
-def _(cohort_meta_by_id_imvhr):
-    cohort_meta_by_id_imvhr.df()
-    return
-
-
-@app.cell
 def _(cohort_meta_by_id_imvhr, duckdb):
     # Lazy one-column relation for downstream INNER JOINs. Stays as a
     # DuckDBPyRelation through the chain (no .fetchall() → Python list
@@ -223,12 +217,6 @@ def _(DATA_DIR, cohort_hosp_ids_rel, duckdb):
     else:
         logger.info("Continuous sedation: lazy relation built")
     return (cont_sed_rel,)
-
-
-@app.cell
-def _(cont_sed_rel):
-    cont_sed_rel.df()
-    return
 
 
 @app.cell
@@ -441,12 +429,6 @@ def _(apply_outlier_handling_duckdb, cont_sed_renamed):
 @app.cell
 def _(cont_sed_outliered):
     cont_sed_outliered
-    return
-
-
-@app.cell
-def _(cohort_meta_by_id_imvhr):
-    cohort_meta_by_id_imvhr.df()
     return
 
 

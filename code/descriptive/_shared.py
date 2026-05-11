@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from clifpy import setup_logging
 from clifpy.utils.logging_config import get_logger
 logger = get_logger("epi_sedation.descriptive_shared")
 
@@ -50,6 +51,15 @@ def _load_site_name() -> str:
 
 
 SITE_NAME = _load_site_name()
+
+# Per-site dual log files (pyCLIF integration guide rule 1). Every
+# descriptive script is its own entry-point subprocess and imports this
+# module exactly once, so this module-level call fires once per subprocess
+# — equivalent to setup_logging-at-entry-point. Guarded against the
+# unknown-site fallback above so a missing config doesn't crash imports.
+if SITE_NAME != "unknown":
+    os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
+    setup_logging(output_directory=f"output/{SITE_NAME}")
 
 # ── Paths (project root is CWD by convention) ──
 # All outputs are site-scoped so multiple sites coexist on disk (see the

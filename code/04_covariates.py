@@ -23,9 +23,11 @@ with app.setup:
     from clifpy.utils.logging_config import get_logger
     logger = get_logger("epi_sedation.covariates")
 
-    # Cache-bypass flags for expensive Table 1 covariate recomputes
-    RERUN_SOFA_24H = False
-    RERUN_ASE = False
+    # Cache-bypass flags for expensive Table 1 covariate recomputes.
+    # Env-var-driven so sites can re-invalidate caches without editing
+    # source (e.g. `RERUN_SOFA_24H=1 make run SITE=mimic`). Default off.
+    RERUN_SOFA_24H = os.getenv("RERUN_SOFA_24H", "0") == "1"
+    RERUN_ASE = os.getenv("RERUN_ASE", "0") == "1"
 
 
 @app.cell(hide_code=True)
@@ -42,7 +44,7 @@ def _():
 
 @app.cell
 def _():
-    from clifpy import ClifOrchestrator
+    from clifpy import ClifOrchestrator, setup_logging
     import pandas as pd
     import duckdb
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
@@ -63,18 +65,26 @@ def _():
         get_config_or_params,
         pd,
         remove_meds_duplicates,
+        setup_logging,
         to_utc,
     )
 
 
 @app.cell
-def _(CONFIG_PATH, get_config_or_params):
+def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     SITE_TZ = cfg['timezone']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
+    # Per-site dual log files at output/{site}/logs/clifpy_all.log +
+    # clifpy_errors.log (pyCLIF integration guide rule 1 — call once
+    # per entry-point subprocess).
+    setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+    logger.info(
+        f"Cache-bypass flags: RERUN_SOFA_24H={RERUN_SOFA_24H}, RERUN_ASE={RERUN_ASE}"
+    )
     return SITE_NAME, SITE_TZ
 
 
@@ -495,7 +505,10 @@ def _(SITE_NAME, sofa_raw):
         ]
     )
     _sofa_path = f"output/{SITE_NAME}/sofa_by_id_imvday.parquet"
-    sofa_daily.to_pandas().to_parquet(_sofa_path)
+    # Polars write_parquet uses Arrow natively; the prior to_pandas() round-trip
+    # was pure overhead per duckdb_perf_guide §11.4 (Polars preserves tz tags
+    # via Arrow on write, same as pandas).
+    sofa_daily.write_parquet(_sofa_path)
     logger.info(f"Saved: {_sofa_path} ({sofa_daily.height} patient-days)")
     return
 

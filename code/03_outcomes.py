@@ -40,6 +40,7 @@ def _():
 @app.cell
 def _():
     from clifpy.utils.config import get_config_or_params
+    from clifpy import setup_logging
     from _utils import to_utc
     import pandas as pd
     import duckdb
@@ -50,11 +51,11 @@ def _():
     CONFIG_PATH = "config/config.json"
 
     os.makedirs("output", exist_ok=True)
-    return CONFIG_PATH, get_config_or_params, pd, to_utc
+    return CONFIG_PATH, get_config_or_params, pd, setup_logging, to_utc
 
 
 @app.cell
-def _(CONFIG_PATH, get_config_or_params):
+def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # Site-scoped output dir (see Makefile SITE= flag).
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
@@ -66,6 +67,11 @@ def _(CONFIG_PATH, get_config_or_params):
     # ABC-trial); set to 24 in the per-site config for sensitivity.
     REINTUB_WINDOW_HRS = cfg['reintub_window_hrs']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
+    # Per-site dual log files at output/{site}/logs/clifpy_all.log +
+    # clifpy_errors.log. Each numbered script runs in its own subprocess,
+    # so each must call setup_logging itself (pyCLIF integration guide
+    # rule 1). Idempotent; output_directory is site-scoped.
+    setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ}); reintub window: {REINTUB_WINDOW_HRS}h")
     return REINTUB_WINDOW_HRS, SITE_NAME, SITE_TZ
 
