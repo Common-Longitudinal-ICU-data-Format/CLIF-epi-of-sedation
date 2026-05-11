@@ -23,4 +23,9 @@ dev = [
     # QC trajectory viewer (`make qc`) — see code/qc/trajectory_viewer.py
     "dash>=2.17.0",
     "dash-bootstrap-components>=1.6.0",
+    # Test suite (`uv run pytest tests/ -v`)
+    "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

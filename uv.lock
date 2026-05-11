@@ -237,6 +237,7 @@ dependencies = [
 dev = [
     { name = "dash" },
     { name = "dash-bootstrap-components" },
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -258,12 +259,13 @@ requires-dist = [
 dev = [
     { name = "dash", specifier = ">=2.17.0" },
     { name = "dash-bootstrap-components", specifier = ">=1.6.0" },
+    { name = "pytest", specifier = ">=8.0" },
 ]
 
 [[package]]
 name = "clifpy"
 version = "0.4.9"
-source = { git = "https://github.com/Common-Longitudinal-ICU-data-Format/clifpy.git?rev=improve-med-unit-converter-apr2026#ef1ed9fa3ca61a671148bad3a9baccfe0a4a2400" }
+source = { git = "https://github.com/Common-Longitudinal-ICU-data-Format/clifpy.git?rev=improve-med-unit-converter-apr2026#54eae6f3b51ba7c2ccc1b309e48676dd45d7006f" }
 dependencies = [
     { name = "build" },
     { name = "duckdb" },

@@ -1,4 +1,4 @@
-.PHONY: mo run table1 tables report descriptive cascade qc weight-audit agg clean-legacy _switch _descriptive_scripts
+.PHONY: mo run table1 tables report descriptive cascade qc weight-audit weight-diagnostic agg clean-legacy _switch _descriptive_scripts
 
 # ── Site selection ───────────────────────────────────────────────────
 # Usage:
@@ -53,15 +53,34 @@ _switch:
 	fi
 
 # ── Phase 1: per-site pipeline ───────────────────────────────────────
-# Full pipeline: 01 → 09 (slowest; first run includes compute_ase + SOFA recompute).
+# Full pipeline: 01 → 09 in a single pass.
 #
-# Weight-QC bootstrap (2-pass): 01_cohort.py reads the weight-QC drop list
-# from output/{site}/qc/weight_qc_drop_list.parquet if it exists. On a fresh
-# repo the file doesn't exist, so the FIRST `make run` skips weight QC and
-# completes the whole pipeline. Then `make weight-audit SITE=...` produces
-# the drop list (it consumes 05's modeling_dataset.parquet). A SECOND
-# `make run` then applies the drop. After the first round-trip, both targets
-# stay in sync.
+# B3 refactor (2026-05): weight-QC value checks are now computed INSIDE
+# 01_cohort.py via `_utils.compute_weight_qc_exclusions`. The prior 2-pass
+# `make run` → `make weight-audit` → `make run` round-trip is gone — saves
+# roughly half the wall-clock per site. `make weight-diagnostic` (alias of
+# the old `make weight-audit`) is preserved for the federated audit CSV /
+# PNG, but is no longer required for cohort definition.
+#
+# Cache controls live in the per-site config (`config/<site>_config.json`):
+#   rerun_waterfall    bool  force waterfall recompute (default false)
+#   rerun_sofa_24h     bool  force SOFA recompute      (default false)
+#   rerun_ase          bool  force ASE recompute       (default false)
+#   path_to_waterfall_processed_resp_table   str|null
+#                            if set + file exists, use it directly instead
+#                            of running the waterfall (predicate-pushdown
+#                            filter to cohort). Bypass by setting to null.
+# To force a one-shot rebuild without editing config, delete the cache file:
+#   rm output/<site>/cohort_resp_processed_bf.parquet  &&  make run SITE=...
+#
+# Other env-var knobs (kept as env vars — different ergonomics):
+#   WEIGHT_QC_MAX_JUMP_KG=15 / WEIGHT_QC_MAX_JUMP_HOURS=24
+#   WEIGHT_QC_MAX_RANGE_KG=30 / WEIGHT_QC_RANGE_RULE_ON=1
+#   SEDDOSE_CLAMP=0     disable the per-hour clinical-ceiling clamp on
+#                       sedation rates (M1). Default is on (cap to ceiling,
+#                       not NULL). seddose_by_id_imvhr_raw.parquet is
+#                       ALWAYS written alongside the canonical clamp-aware
+#                       parquet so users can diff without rerunning.
 run: _switch
 	uv sync
 	uv run python code/01_cohort.py
@@ -69,15 +88,11 @@ run: _switch
 	uv run python code/03_outcomes.py
 	uv run python code/04_covariates.py
 	uv run python code/05_modeling_dataset.py
-	$(MAKE) weight-audit
-	uv run python code/01_cohort.py
-	uv run python code/02_exposure.py
-	uv run python code/04_covariates.py
-	uv run python code/05_modeling_dataset.py
 	uv run python code/06_table1.py
-	uv run python code/07_descriptive.py
 	uv run python code/08_models.py
-	uv run python code/08b_models_cascade.py
+	# 08b_models_cascade.py is INTENTIONALLY shelved from `make run` —
+	# the 4-stage cascade is deferred analysis. Run on demand via
+	# `make cascade SITE=...` if a re-investigation is needed.
 	$(MAKE) _descriptive_scripts
 	uv run python code/09_report.py
 
@@ -103,7 +118,6 @@ tables: _switch
 	uv run python code/04_covariates.py
 	uv run python code/05_modeling_dataset.py
 	uv run python code/06_table1.py
-	uv run python code/07_descriptive.py
 	$(MAKE) _descriptive_scripts
 	uv run python code/09_report.py
 
@@ -137,9 +151,11 @@ _descriptive_scripts:
 # output_to_share/<site>/ folder read-only; never runs pipeline scripts
 # (01–09). Phase 1 (per-site runs) is complete by the time this runs.
 #
-# Currently implemented (descriptive-only): pooled Table 1, cross-site cohort
-# stats, cross-site stacked-bar prevalence, cross-site trajectory overlay.
-# Model-coefficient forest plots deferred to a later pass.
+# Implemented: pooled Table 1, cross-site cohort stats, cross-site stacked-
+# bar prevalence, cross-site trajectory overlay, cross-site forest plots
+# (night-day diff / daytime / SBT sensitivity), cross-site marginal-effects
+# RCS overlays, AND DerSimonian-Laird random-effects meta-analysis pooling
+# (meta_analysis_cross_site.py reads each site's models_coeffs.csv).
 #
 # Anonymization: set ANONYMIZE_SITES=1 to relabel sites as "Site A"/"Site B"/…
 # in all outputs. Default is real names (mimic, UCMC, ...).
@@ -160,27 +176,29 @@ agg:
 qc:
 	uv run python code/qc/trajectory_viewer.py
 
-# ── QC: weight-availability audit + drop-list generation ─────────────
+# ── QC: weight-availability diagnostic (federated audit CSVs/PNG) ────
 # Federated-safe audit of the per-kg weight used to convert sedative doses.
-# Replicates clifpy's per-admin ASOF, characterizes admission-fallback rate,
-# compares Stage A vs Stage B weights, and generates a hospitalization-level
-# drop list per the configured exclusion criteria. Phase 1 of the weight-QC
-# work (audit-only — drops are applied in Phase 2 via 01_cohort.py).
+# Characterizes the same three drop criteria 01_cohort.py applies, so site
+# QC reviewers can compare counts/distributions across sites without
+# re-running the pipeline.
 #
-# Outputs:
-#   output_to_share/{site}/qc/weight_qc_summary.csv      (federated)
-#   output_to_share/{site}/qc/weight_qc_exclusions.csv   (federated)
-#   output_to_share/{site}/qc/weight_impact_comparison.csv (federated)
-#   output_to_share/{site}/figures/weight_audit.png      (federated)
-#   output/{site}/qc/weight_qc_drop_list.parquet         (PHI-internal)
-#   output/{site}/qc/weight_audit_examples.csv           (PHI-internal)
+# B3 refactor (2026-05): no longer produces weight_qc_drop_list.parquet —
+# 01_cohort.py now computes the same drop sets in-memory via
+# `_utils.compute_weight_qc_exclusions`. `make run` no longer depends on
+# this target.
 #
-# Tunable thresholds via env vars:
+# Outputs (all federated-safe — no row-level PHI):
+#   output_to_share/{site}/qc/weight_qc_summary.csv
+#   output_to_share/{site}/qc/weight_qc_exclusions.csv
+#   output_to_share/{site}/qc/weight_impact_comparison.csv
+#   output_to_share/{site}/qc/weight_audit.png
+#
+# Tunable thresholds via env vars (defaults match 01_cohort.py):
 #   WEIGHT_QC_MAX_JUMP_KG=20              (jump rule, kg per 24h)
 #   WEIGHT_QC_MAX_JUMP_HOURS=24
 #   WEIGHT_QC_MAX_RANGE_KG=30             (range rule)
 #   WEIGHT_QC_RANGE_RULE_ON=1             (off by default)
-weight-audit: _switch
+weight-diagnostic weight-audit: _switch
 	uv run python code/qc/weight_audit.py
 
 # ── One-time cleanup of legacy flat outputs (pre-site-subdir) ────────

@@ -2,5 +2,10 @@
     "site_name": "Your_Site_Name",
     "data_directory": "/path/to/tables/",
     "filetype": "csv/parquet/fst",
-    "timezone": "US/Central"
+    "timezone": "US/Central",
+    "reintub_window_hrs": 48,
+    "path_to_waterfall_processed_resp_table": null,
+    "rerun_waterfall": false,
+    "rerun_sofa_24h": false,
+    "rerun_ase": false
 }
