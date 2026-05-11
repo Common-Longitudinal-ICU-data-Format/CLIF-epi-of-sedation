@@ -28,6 +28,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.descriptive.night_day_diff_hist")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
@@ -47,7 +50,7 @@ from _shared import (  # noqa: E402
 def main() -> None:
     apply_style()
     df = prepare_diffs(load_exposure())
-    print(
+    logger.info(
         f"Loaded {len(df):,} patient-days from "
         f"{df['hospitalization_id'].nunique():,} hospitalizations"
     )

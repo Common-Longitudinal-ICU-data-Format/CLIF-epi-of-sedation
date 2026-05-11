@@ -28,6 +28,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.descriptive.night_day_diff_hist_by_hosp")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
@@ -73,7 +76,7 @@ def main() -> None:
     apply_style()
     df = prepare_diffs(load_exposure())
     n_hosp_total = df["hospitalization_id"].nunique()
-    print(f"Loaded {len(df):,} patient-days from {n_hosp_total:,} hospitalizations")
+    logger.info(f"Loaded {len(df):,} patient-days from {n_hosp_total:,} hospitalizations")
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
 

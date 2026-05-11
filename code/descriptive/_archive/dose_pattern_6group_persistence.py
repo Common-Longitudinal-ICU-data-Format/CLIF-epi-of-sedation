@@ -49,6 +49,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.descriptive.dose_pattern_6group_persistence")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
@@ -304,7 +307,7 @@ def main() -> None:
         out_df = pd.DataFrame(rows)
         path = f"{TABLES_DIR}/dose_pattern_6group_transitions_{drug}.csv"
         out_df.to_csv(path, index=False)
-        print(f"Wrote {path}  (drug={drug}; partial-share={single_share*100:.1f}%)")
+        logger.info(f"Wrote {path}  (drug={drug}; partial-share={single_share*100:.1f}%)")
 
     fig.suptitle(
         "Dose-pattern persistence and day-to-day transitions (6 groups)\n"

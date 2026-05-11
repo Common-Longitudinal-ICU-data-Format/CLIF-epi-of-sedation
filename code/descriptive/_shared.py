@@ -29,6 +29,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.descriptive_shared")
+
 
 # ── Site selection ────────────────────────────────────────────────────────
 # Load site name from config/config.json once at import time so downstream
@@ -53,6 +56,12 @@ SITE_NAME = _load_site_name()
 # Makefile's SITE= flag). Phase-2 cross-site aggregation reads these dirs.
 MODELING_PARQUET = f"output/{SITE_NAME}/modeling_dataset.parquet"
 EXPOSURE_PARQUET = f"output/{SITE_NAME}/exposure_dataset.parquet"
+# Phase 4 consolidated parquet — superset of MODELING + EXPOSURE plus the
+# canonical-registry columns (`_is_full_24h_day`, `_is_last_partial_day`,
+# `_is_last_full_day`, `n_hrs_day`, `n_hrs_night`, `day_type`, etc.).
+# New consumers should prefer this; legacy `load_exposure` / `load_modeling`
+# stay pointed at the legacy parquets during Phase 4 cutover.
+MODEL_INPUT_PARQUET = f"output/{SITE_NAME}/model_input_by_id_imvday.parquet"
 # As of the Path B++ refactor, every descriptive PNG and CSV lands FLAT in
 # output_to_share/{site}/descriptive (no figures/ subdir). The thematic
 # sibling directory `models/` houses everything written by 06/07/08/09's
@@ -78,16 +87,32 @@ DIFF_COLS = {
     "midazeq": "midazeq_dif_mg_hr",
 }
 
+# `_total` suffix = continuous + intermittent combined, the canonical
+# modeling scope produced by 05_modeling_dataset.py. The legacy unsuffixed
+# names were retired when the cont-vs-intm scope split was made explicit
+# in the per-day registry; `_cont`-suffixed siblings exist for the
+# continuous-only sensitivity pipeline (see project_cont_intm_diagnostic.md).
 DAY_COLS = {
-    "prop": "_prop_day_mcg_kg_min",
-    "fenteq": "_fenteq_day_mcg_hr",
-    "midazeq": "_midazeq_day_mg_hr",
+    "prop": "_prop_day_mcg_kg_min_total",
+    "fenteq": "_fenteq_day_mcg_hr_total",
+    "midazeq": "_midazeq_day_mg_hr_total",
 }
 
 NIGHT_COLS = {
-    "prop": "_prop_night_mcg_kg_min",
-    "fenteq": "_fenteq_night_mcg_hr",
-    "midazeq": "_midazeq_night_mg_hr",
+    "prop": "_prop_night_mcg_kg_min_total",
+    "fenteq": "_fenteq_night_mcg_hr_total",
+    "midazeq": "_midazeq_night_mg_hr_total",
+}
+
+# Hurdle flags marking patient-days where the drug was administered at all
+# (day_rate > 0 OR night_rate > 0). Produced by code/05_modeling_dataset.py:332-337
+# as the canonical "on drug that day" indicator. Used as the bottom-panel
+# denominator in cross-site proportion figures and anywhere the hurdle
+# decomposition needs to split off-drug rows.
+ON_DRUG_FLAGS = {
+    "prop": "_prop_any",
+    "fenteq": "_fenteq_any",
+    "midazeq": "_midazeq_any",
 }
 
 # Clinically meaningful night-minus-day dose-rate cutoffs. Propofol uses a
@@ -175,24 +200,54 @@ DIFF_BIN_COLORS = ["#2166ac", "#92c5de", "#f4a582", "#b2182b"]
 def load_modeling() -> pd.DataFrame:
     """Load the modeling dataset (production outcome-modeling cohort).
 
-    Filtered to `_nth_day > 0 AND sbt_done_next_day IS NOT NULL AND
-    success_extub_next_day IS NOT NULL`. Drops day 0 and last day, so
-    every row has a well-defined next-day outcome. Use this for partial-
-    shift audits that should mirror what the production models see.
+    Phase 4 cutover (2026-05-08): reads the consolidated
+    `model_input_by_id_imvday.parquet` and applies the outcome-modeling
+    filter inline. Byte-equivalent to the legacy
+    `modeling_dataset.parquet` row set on the surviving cohort —
+    verified at both sites: 43,119 rows / 9,119 hosps (UCMC),
+    48,092 / 11,628 (MIMIC). Filter:
+
+      `_nth_day > 0 AND sbt_done_next_day IS NOT NULL
+       AND success_extub_next_day IS NOT NULL`
+
+    Drops day 0 and trajectory-final partial rows, so every surviving
+    row has a well-defined next-day outcome. Use this for partial-shift
+    audits that mirror what the production models see.
     """
-    return pd.read_parquet(MODELING_PARQUET)
+    df = pd.read_parquet(MODEL_INPUT_PARQUET)
+    return df.loc[
+        (df["_nth_day"] > 0)
+        & df["sbt_done_next_day"].notna()
+        & df["success_extub_next_day"].notna()
+    ].reset_index(drop=True)
 
 
 def load_exposure() -> pd.DataFrame:
     """Load the exposure dataset (full hospital-stay coverage).
 
-    Includes day 0 AND last day so the night-vs-day diurnal characterization
-    sees the full coverage of each patient's stay. Carries three flag
-    columns the figures use directly: `_single_shift_day`, `_is_first_day`,
-    `_is_last_day`. Default loader for every descriptive figure under this
-    module.
+    Legacy loader kept during Phase 4 cutover. Includes day 0 AND last
+    day with the wide-semantic `_is_last_day` (= max-`_nth_day` per
+    hosp). Carries `_single_shift_day`, `_is_first_day`, `_is_last_day`
+    legacy flags. New descriptive figures should prefer
+    `load_model_input()` (canonical Phase 4 source with explicit
+    `_is_full_24h_day`, `_is_last_partial_day`, `_is_last_full_day`
+    flags from the patient-day registry).
     """
     return pd.read_parquet(EXPOSURE_PARQUET)
+
+
+def load_model_input() -> pd.DataFrame:
+    """Load the Phase 4 consolidated per-day modeling input.
+
+    One row per (hospitalization_id, _nth_day), base table = the canonical
+    registry `cohort_meta_by_id_imvday`. Carries every per-day source's
+    columns plus the registry day-flags (`_is_full_24h_day`,
+    `_is_last_partial_day`, `_is_last_full_day`, `n_hrs_day`,
+    `n_hrs_night`, `day_type`). Use this when a figure wants explicit
+    full-vs-partial coverage filtering — `WHERE _is_full_24h_day` drops
+    intubation-day and extubation-day partial rows in one filter.
+    """
+    return pd.read_parquet(MODEL_INPUT_PARQUET)
 
 
 def load_analytical() -> pd.DataFrame:
@@ -320,7 +375,7 @@ def save_fig(fig, name: str) -> str:
     ensure_dirs()
     path = os.path.join(FIGURES_DIR, f"{name}.png")
     fig.savefig(path, bbox_inches="tight")
-    print(f"Saved {path}")
+    logger.info(f"Saved {path}")
     return path
 
 
@@ -329,7 +384,7 @@ def save_csv(df: pd.DataFrame, name: str, index: bool = False) -> str:
     ensure_dirs()
     path = os.path.join(TABLES_DIR, f"{name}.csv")
     df.to_csv(path, index=index)
-    print(f"Saved {path}")
+    logger.info(f"Saved {path}")
     return path
 
 

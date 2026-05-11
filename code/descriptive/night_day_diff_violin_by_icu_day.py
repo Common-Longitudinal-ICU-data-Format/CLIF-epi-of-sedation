@@ -2,7 +2,8 @@
 
 Complements `night_day_diff_mean_by_icu_day.py`: that plot shows whether the
 mean diff shrinks over time; this one shows whether the full distribution
-(spread, tails, asymmetry) also contracts. Same 1..7 / '8+' binning.
+(spread, tails, asymmetry) also contracts. Restricted to ICU days 1..7
+under full-24h coverage (n_hours_day = n_hours_night = 12).
 
 Y-axis is clipped to the 1st–99th percentile of the pooled-across-days diff
 so that long tails from day 1 don't squash later bins. ±T threshold lines
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -30,39 +32,31 @@ from _shared import (  # noqa: E402
     DRUGS,
     THRESHOLDS,
     apply_style,
-    cap_day,
-    load_exposure,
-    prepare_diffs,
+    load_model_input,
     save_fig,
 )
 
 
-def _drop_last_day_per_patient(df):
-    """Drop each hospitalization's row with the highest `_nth_day`.
-
-    Keeps only "full 24-hr ICU days" — days where the patient was on IMV
-    through the next 7am crossing. Without this, mid-stay bins
-    (1, 2, …, 8+) include extubation-day rows from short-stay patients
-    (e.g., 382 short-stay-3-day patients at mimic add their day 3
-    extubation rows to bin "3", biasing the violin's spread). Empirically
-    `_is_last_day == (_nth_day == max per hosp)` (0 mismatches across 79k
-    rows), so this is equivalent to `~_is_last_day`. Mirrors
-    `code/agg/night_day_diff_mean_cross_site.py:55-72`.
-    """
-    is_last = (
-        df.groupby("hospitalization_id")["_nth_day"].transform("max")
-        == df["_nth_day"]
-    )
-    return df.loc[~is_last].copy()
+MIN_DAY = 1
+MAX_DAY = 7
+DAY_BINS = [str(i) for i in range(MIN_DAY, MAX_DAY + 1)]
 
 
 def main() -> None:
     apply_style()
-    df = cap_day(
-        prepare_diffs(_drop_last_day_per_patient(load_exposure())),
-        max_day=7,
+    df = load_model_input()
+    # Restrict to full-24h ICU days 1..7 (drops day 0 partial,
+    # extubation-day partial, and days 8+). Replaces the old
+    # `_drop_last_day_per_patient + cap_day` pipeline; the registry's
+    # `_is_full_24h_day` flag is the canonical "complete 12+12 hr
+    # coverage" filter.
+    in_range = df["_nth_day"].between(MIN_DAY, MAX_DAY)
+    df = df.loc[df["_is_full_24h_day"] & in_range].copy()
+    df["_nth_day_bin"] = pd.Categorical(
+        df["_nth_day"].astype(int).astype(str),
+        categories=DAY_BINS, ordered=True,
     )
-    bins = list(df["_nth_day_bin"].cat.categories)
+    bins = DAY_BINS
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.5), sharex=True)
 
@@ -123,9 +117,11 @@ def main() -> None:
         "Each violin = distribution of diff for one ICU-day bin (width ∝ density at that y-level). "
         "Sister figure to `night_day_diff_combined_by_icu_day.png` — narrowing violins left-to-right "
         "indicate shift-to-shift dosing converging as patients stabilize. "
-        "Cohort: full-24-hr ICU days only — each patient's extubation day is dropped before binning so "
-        "late-stay bins are not survivor-biased. Single-shift days dropped silently via `dropna()` "
-        "(rate-diff = NaN). Glossary: docs/descriptive_figures.md §3.",
+        "Cohort: full-24h ICU-day rows from `model_input_by_id_imvday.parquet` "
+        "(`_is_full_24h_day = TRUE AND _nth_day BETWEEN 1 AND 7`). Day 0 partial intubation day, "
+        "trajectory-final partial day, and days 8+ are dropped at the load filter so each violin "
+        "reflects a fully-comparable 12+12 hr coverage population. "
+        "Glossary: docs/descriptive_figures.md §3.",
         ha="center", va="top", fontsize=8, color="dimgray", wrap=True,
     )
     save_fig(fig, "night_day_diff_violin_by_icu_day")

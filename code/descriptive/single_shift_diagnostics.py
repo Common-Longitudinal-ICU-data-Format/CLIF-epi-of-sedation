@@ -54,7 +54,15 @@ def main() -> None:
     apply_style()
 
     sd = pd.read_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
-    ad = pd.read_parquet(f"output/{SITE_NAME}/modeling_dataset.parquet")
+    # Phase 4 cutover (2026-05-08): read consolidated parquet + apply
+    # outcome-modeling filter inline. Byte-equivalent to legacy
+    # modeling_dataset.parquet on the surviving cohort.
+    _full = pd.read_parquet(f"output/{SITE_NAME}/model_input_by_id_imvday.parquet")
+    ad = _full.loc[
+        (_full["_nth_day"] > 0)
+        & _full["sbt_done_next_day"].notna()
+        & _full["success_extub_next_day"].notna()
+    ].reset_index(drop=True)
 
     # Flag kept-vs-dropped from the modeling filter so the plot shows how
     # much single-shift exposure is actually inherited downstream.

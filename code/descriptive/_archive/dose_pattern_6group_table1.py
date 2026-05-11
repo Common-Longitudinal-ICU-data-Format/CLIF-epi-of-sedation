@@ -45,6 +45,9 @@ import numpy as np
 import pandas as pd
 import tableone
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.descriptive.dose_pattern_6group_table1")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
@@ -270,9 +273,9 @@ def main() -> None:
         ].apply(lambda s: int(s.fillna(False).sum())).reindex(
             list(DOSE_PATTERN_LABELS), fill_value=0
         )
-        print(f"\n[{drug}] 6-way group counts (T = {thr}):")
+        logger.info(f"\n[{drug}] 6-way group counts (T = {thr}):")
         for label in DOSE_PATTERN_LABELS:
-            print(f"  {label:35s}  n = {counts[label]:>7,}  "
+            logger.info(f"  {label:35s}  n = {counts[label]:>7,}  "
                   f"(single-shift: {partial_counts[label]:,})")
 
         t1 = _build_tableone(d, drug, f"_pattern_{drug}")
@@ -283,7 +286,7 @@ def main() -> None:
 
         path = f"{TABLES_DIR}/dose_pattern_6group_table1_{drug}.csv"
         out_df.to_csv(path)
-        print(f"Wrote {path}")
+        logger.info(f"Wrote {path}")
 
         _draw_smd_forest(d, drug, f"_pattern_{drug}")
 

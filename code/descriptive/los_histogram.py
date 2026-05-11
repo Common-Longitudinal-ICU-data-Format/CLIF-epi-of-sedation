@@ -41,6 +41,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from clifpy.utils.logging_config import get_logger
+logger = get_logger("epi_sedation.descriptive.los_histogram")
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from _shared import (  # noqa: E402
@@ -231,7 +234,7 @@ def main() -> None:
 
     meta_path = f"output/{SITE_NAME}/cohort_meta_by_id.parquet"
     meta = pd.read_parquet(meta_path)
-    print(f"Loaded {meta_path}: {len(meta):,} hospitalizations")
+    logger.info(f"Loaded {meta_path}: {len(meta):,} hospitalizations")
 
     # Convert imv_dur_hrs → imv_duration_days for like-units binning
     # alongside n_days_full_24h. Keep both metrics so reviewers can
