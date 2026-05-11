@@ -5,7 +5,7 @@ exposure dataset (or, for the single-shift audit specifically, the
 modeling dataset). This module centralizes:
 
   - threshold definitions (fent > 25/hr, prop > 10 mcg/kg/min, midaz > 1/hr)
-  - drug label + color conventions (matching 07_descriptive.py)
+  - drug label + color conventions
   - day_n bucketing (1..7, "8+")
   - dataset loaders (load_exposure() / load_modeling()) and figure saver
   - 4-way and 6-way categorization helpers around ±threshold
@@ -51,7 +51,7 @@ def _load_site_name() -> str:
 
 SITE_NAME = _load_site_name()
 
-# ── Paths (project root is CWD by convention; matches 07_descriptive.py) ──
+# ── Paths (project root is CWD by convention) ──
 # All outputs are site-scoped so multiple sites coexist on disk (see the
 # Makefile's SITE= flag). Phase-2 cross-site aggregation reads these dirs.
 MODELING_PARQUET = f"output/{SITE_NAME}/modeling_dataset.parquet"
@@ -136,7 +136,6 @@ DRUG_UNITS = {
     "midazeq": "mg/hr",
 }
 
-# Matches the palette used in 07_descriptive.py's hourly dose bar chart.
 DRUG_COLORS = {
     "prop": "skyblue",
     "fenteq": "salmon",

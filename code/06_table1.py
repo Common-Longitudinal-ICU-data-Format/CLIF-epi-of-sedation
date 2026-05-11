@@ -4,7 +4,7 @@
 #     "marimo",
 #     "duckdb>=1.4.1",
 #     "pandas>=2.3.1",
-#     "tableone>=0.9.5",
+#     "numpy>=1.26",
 # ]
 # ///
 
@@ -27,10 +27,29 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    # 06 Table One
+    # 06 Table One — federation-friendly long-format outputs
 
-    Generates Table 1 summaries: overall (day 1) and by shift (day vs night).
-    Outputs CSV + JSON dual format for cross-site aggregation.
+    Emits FOUR CSVs into `output_to_share/{site}/models/`:
+
+      - `cohort_stats.csv` — site, n_hospitalizations, n_unique_patients
+      - `table1_continuous.csv` — one row per continuous variable carrying
+        n, n_missing, mean, sd, sum, sum_sq, min, max, median, q1, q3.
+        `sum` and `sum_sq` are the lossless primitives for cross-site
+        master-cohort mean/SD pooling at agg time.
+      - `table1_categorical.csv` — one row per (variable, category)
+        carrying n, n_missing, total_n, pct, denominator_unit. Per-stay
+        and per-patient-day rows coexist via the denominator_unit flag.
+      - `table1_histograms.csv` — long-format bin counts per non-normal
+        variable, on shared bin edges (see code/_table1_schema.py). Lets
+        the cross-site pooler compute master-cohort median/Q1/Q3 by
+        summing bin counts across sites and inverse-CDF interpolating.
+
+    No `tableone` dependency. Source-of-truth = cohort_meta_by_id.parquet
+    (built in 04_covariates.py) which already carries every per-stay
+    variable. sex_category is folded in from model_input_by_id_imvday
+    (Day-1 row). The patient-day SBT-multiday rate uses the full-24h
+    day-1..7 rows of model_input — same modeling-cohort definition the
+    cross-site descriptive figures use.
     """)
     return
 
@@ -41,295 +60,335 @@ def _():
     from clifpy.utils import apply_outlier_handling
     from clifpy import Hospitalization
     import pandas as pd
+    import numpy as np
     import duckdb
-    import tableone
     import json
+
+    from _table1_schema import (
+        BIN_EDGES,
+        BINARY_DISPLAY_LEVEL,
+        CATEGORICAL_VARS_PER_PATIENT_DAY,
+        CATEGORICAL_VARS_PER_STAY,
+        CONTINUOUS_VARS,
+    )
 
     CONFIG_PATH = "config/config.json"
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
 
-    # Site-scoped output dirs (see Makefile SITE= flag).
-    # Path B++ refactor: modeling outputs live under {site}/models/ so that
-    # descriptive (night-vs-day) artifacts and model artifacts sit in
-    # parallel thematic subdirs.
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     logger.info(f"Site: {SITE_NAME}")
-    return CONFIG_PATH, SITE_NAME, apply_outlier_handling, duckdb, json, pd, tableone
+    return (
+        BIN_EDGES,
+        BINARY_DISPLAY_LEVEL,
+        CATEGORICAL_VARS_PER_PATIENT_DAY,
+        CATEGORICAL_VARS_PER_STAY,
+        CONFIG_PATH,
+        CONTINUOUS_VARS,
+        SITE_NAME,
+        apply_outlier_handling,
+        duckdb,
+        np,
+        pd,
+    )
 
 
 @app.cell
 def _(SITE_NAME, pd):
-    # Phase 4 cutover (2026-05-08): read consolidated parquet + apply
-    # outcome-modeling filter inline. Byte-equivalent to the legacy
-    # modeling_dataset.parquet on the surviving cohort (verified at both sites).
-    _full = pd.read_parquet(f"output/{SITE_NAME}/model_input_by_id_imvday.parquet")
-    analytical_df = _full.loc[
-        (_full["_nth_day"] > 0)
-        & _full["sbt_done_next_day"].notna()
-        & _full["success_extub_next_day"].notna()
-    ].reset_index(drop=True)
-    logger.info(f"Modeling cohort: {len(analytical_df)} rows, {analytical_df['hospitalization_id'].nunique()} hospitalizations")
-    return (analytical_df,)
-
-
-@app.cell
-def _(SITE_NAME):
-    # Phase 2 (2026-05-07): `sed_dose_agg.parquet` was deleted as a redundant
-    # within-script intermediate of `02_exposure.py`. Its long-format
-    # (hosp, day, shift) per-shift dose totals are now derived on-the-fly
-    # by UNPIVOTing the wide-form `seddose_by_id_imvday.parquet` (separate
-    # `*_day_*` / `*_night_*` columns). Same variable name preserved so
-    # downstream cells continue to read `sed_dose_agg` from the cross-cell
-    # DAG without any join changes.
-    sed_dose_agg = mo.sql(f"""
-        FROM read_parquet('output/{SITE_NAME}/seddose_by_id_imvday.parquet')
-        SELECT hospitalization_id, _nth_day
-            , _shift: 'day'
-            , prop_mcg_kg: prop_day_mcg_kg
-            , fenteq_mcg:  fenteq_day_mcg
-            , midazeq_mg:  midazeq_day_mg
-            , n_hours:     n_hours_day
-        UNION ALL
-        FROM read_parquet('output/{SITE_NAME}/seddose_by_id_imvday.parquet')
-        SELECT hospitalization_id, _nth_day
-            , _shift: 'night'
-            , prop_mcg_kg: prop_night_mcg_kg
-            , fenteq_mcg:  fenteq_night_mcg
-            , midazeq_mg:  midazeq_night_mg
-            , n_hours:     n_hours_night
-    """)
-    return (sed_dose_agg,)
-
-
-@app.cell
-def _(SITE_NAME, pd):
-    covs_shift = pd.read_parquet(f"output/{SITE_NAME}/covariates_by_id_shift.parquet")
-    logger.info(f"covs_shift: {len(covs_shift)} rows")
-    return (covs_shift,)
-
-
-@app.cell
-def _(SITE_NAME, pd):
-    # Per-stay registry from 04_covariates: LOS rollups + exit_mechanism.
-    # Joined onto the day-1 Table 1 frame so the new rows render alongside
-    # the existing baseline characteristics (one row per hospitalization).
-    cohort_meta_by_id = pd.read_parquet(
-        f"output/{SITE_NAME}/cohort_meta_by_id.parquet"
+    # Eligibility cohort = Phase-4 modeling filter applied to model_input.
+    # The same filter 08_models.py uses (line 78), so Table 1 matches
+    # the population the model was fit on. Day-1 collapse to one row per
+    # hospitalization happens after we have the eligibility hosp_id set.
+    _model_input = pd.read_parquet(
+        f"output/{SITE_NAME}/model_input_by_id_imvday.parquet"
+    )
+    _eligible = _model_input.loc[
+        (_model_input["_nth_day"] > 0)
+        & _model_input["sbt_done_next_day"].notna()
+        & _model_input["success_extub_next_day"].notna()
+    ]
+    eligible_hosp_ids = sorted(_eligible["hospitalization_id"].unique().tolist())
+    # Day-1 rows of the eligibility cohort — used to fold in `sex_category`
+    # which is per-stay metadata not on cohort_meta_by_id today. (One row
+    # per hospitalization; Day-1 sex_category equals stay-level sex.)
+    day1_df = (
+        _eligible.loc[_eligible["_nth_day"] == 1, ["hospitalization_id", "sex_category"]]
+        .drop_duplicates("hospitalization_id")
     )
     logger.info(
-        f"cohort_meta_by_id: {len(cohort_meta_by_id)} hospitalizations; "
-        f"exit_mechanism distribution: "
-        f"{cohort_meta_by_id['exit_mechanism'].value_counts().to_dict()}"
+        f"Eligibility cohort: {len(eligible_hosp_ids)} hospitalizations "
+        f"({len(_eligible)} patient-days)"
     )
-    return (cohort_meta_by_id,)
+    return day1_df, eligible_hosp_ids
+
+
+@app.cell
+def _(SITE_NAME, day1_df, eligible_hosp_ids, pd):
+    # Per-stay frame = one row per hospitalization with all the baseline
+    # characteristics + per-stay outcome rollups. cohort_meta_by_id.parquet
+    # already carries every variable we need (built in 04_covariates.py),
+    # so this is a single read + filter + join with sex_category.
+    _cm = pd.read_parquet(f"output/{SITE_NAME}/cohort_meta_by_id.parquet")
+    _cm = _cm.loc[_cm["hospitalization_id"].isin(eligible_hosp_ids)].copy()
+    table1_df = _cm.merge(day1_df, on="hospitalization_id", how="left")
+
+    # Convert boolean per-stay outcomes to Yes/No so they read like clinical
+    # paper conventions in the formatted output. Keeps the per-site
+    # categorical CSV consistent across vars (Yes/No for binaries; named
+    # levels for sex_category / icu_type / exit_mechanism).
+    for _binary_col in ["ever_pressor", "sepsis_ase",
+                        "successful_extubation", "ever_sbt_done_multiday"]:
+        if _binary_col in table1_df.columns:
+            table1_df[_binary_col] = table1_df[_binary_col].map(
+                lambda v: "Yes" if v in (1, True) else ("No" if v in (0, False) else None)
+            )
+
+    logger.info(
+        f"Table 1 frame: {len(table1_df)} hospitalizations × "
+        f"{table1_df.shape[1]} columns"
+    )
+    return (table1_df,)
 
 
 @app.cell
 def _(CONFIG_PATH, apply_outlier_handling):
     hosp = Hospitalization.from_file(
         config_path=CONFIG_PATH,
-        columns=['patient_id', 'hospitalization_id', 'discharge_dttm', 'discharge_category', 'age_at_admission'],
+        columns=['patient_id', 'hospitalization_id'],
     )
     apply_outlier_handling(hosp, outlier_config_path='config/outlier_config.yaml')
     hosp_df = hosp.df
     return (hosp_df,)
 
 
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## Filter to Day 1
-    """)
-    return
-
-
 @app.cell
-def _(analytical_df):
-    cohort_merged_for_t1 = mo.sql(
-        f"""
-        -- Day 1 rows only for Table 1
-        FROM analytical_df
-        SELECT *
-        WHERE _nth_day = 1
-        """
+def _(SITE_NAME, eligible_hosp_ids, hosp_df, pd):
+    # cohort_stats.csv (unchanged behavior — just simpler: no shift-level
+    # join needed since we only count distinct hospitalizations + patients).
+    _eligible_hosp = pd.DataFrame({"hospitalization_id": eligible_hosp_ids})
+    _stats_df = _eligible_hosp.merge(
+        hosp_df[["hospitalization_id", "patient_id"]],
+        on="hospitalization_id", how="left",
     )
-    return (cohort_merged_for_t1,)
-
-
-@app.cell
-def _(cohort_merged_for_t1, covs_shift, hosp_df, sed_dose_agg):
-    cohort_merged_for_t1_w_by_shift = mo.sql(
-        f"""
-        -- Join day-1 with shift-level doses and covariates for by-shift Table 1
-        WITH t1 AS (
-        FROM cohort_merged_for_t1 g
-        LEFT JOIN sed_dose_agg s USING (hospitalization_id, _nth_day)
-        LEFT JOIN hosp_df h USING (hospitalization_id)
-        SELECT g.hospitalization_id, g._nth_day
-            , s._shift
-            , s.prop_mcg_kg
-            , s.fenteq_mcg
-            , s.midazeq_mg
-            , h.patient_id
-        )
-        , t2 AS (
-        FROM t1
-        LEFT JOIN covs_shift c USING (hospitalization_id, _nth_day, _shift)
-        SELECT *
-        )
-        SELECT *
-        FROM t2
-        ORDER BY hospitalization_id, _nth_day, _shift
-        """
-    )
-    return (cohort_merged_for_t1_w_by_shift,)
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(r"""
-    ## Generate Tables
-    """)
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, pd):
-    _df = cohort_merged_for_t1_w_by_shift.df()
-    n_hospitalizations = _df['hospitalization_id'].nunique()
-    n_unique_patients = _df['patient_id'].nunique()
+    n_hospitalizations = _stats_df["hospitalization_id"].nunique()
+    n_unique_patients = _stats_df["patient_id"].nunique()
     pd.DataFrame({
-        'site': [SITE_NAME],
-        'n_hospitalizations': [n_hospitalizations],
-        'n_unique_patients': [n_unique_patients],
-    }).to_csv(f'output_to_share/{SITE_NAME}/models/cohort_stats.csv', index=False)
-    logger.info(f"Cohort: {n_hospitalizations} hospitalizations from {n_unique_patients} unique patients")
-    return
-
-
-@app.cell
-def _(SITE_NAME, cohort_merged_for_t1, cohort_meta_by_id, hosp_df, tableone):
-    # Pull patient_id from hosp_df so we can report unique-patient count alongside Table 1
-    _df = cohort_merged_for_t1.df().merge(
-        hosp_df[['hospitalization_id', 'patient_id']],
-        on='hospitalization_id',
-        how='left',
+        "site": [SITE_NAME],
+        "n_hospitalizations": [n_hospitalizations],
+        "n_unique_patients": [n_unique_patients],
+    }).to_csv(f"output_to_share/{SITE_NAME}/models/cohort_stats.csv", index=False)
+    logger.info(
+        f"Cohort: {n_hospitalizations} hospitalizations from "
+        f"{n_unique_patients} unique patients"
     )
-    # Merge the per-stay registry — adds LOS-in-full-24h-days and the
-    # categorical `exit_mechanism` for rendering in Table 1.
-    _df = _df.merge(
-        cohort_meta_by_id[
-            ['hospitalization_id', 'n_days_full_24h', 'exit_mechanism']
-        ],
-        on='hospitalization_id',
-        how='left',
-    )
-    # Binary var relabeling: convert 0/1 to No/Yes so the row labels in Table 1 read like
-    # clinical paper conventions rather than "0" / "1". Combined with order+limit below,
-    # this collapses each binary var to a single "Yes" row (the 0 row is redundant).
-    _df['ever_pressor'] = _df['ever_pressor'].map({0: 'No', 1: 'Yes'})
-    _df['sepsis_ase'] = _df['sepsis_ase'].map({0: 'No', 1: 'Yes'})
-
-    n_hosp = _df['hospitalization_id'].nunique()
-    n_pat = _df['patient_id'].nunique()
-    logger.info(f"Table 1 cohort: N={n_hosp} hospitalizations from {n_pat} unique patients")
-
-    # NEW Table 1: standard ICU epidemiology baseline characteristics
-    _cont_vars = [
-        'age',
-        'bmi',
-        'cci_score',
-        'sofa_1st24h',
-        'pf_1st24h_min',
-        'imv_duration_hrs',
-        'n_days_full_24h',
-    ]
-    # Vars to display as median [Q1, Q3] instead of mean (SD).
-    # cci/sofa are integer + right-skewed; pf is heavily skewed (ARDS tail);
-    # imv duration has 24h floor + long right tail. age/bmi stay mean (SD).
-    # n_days_full_24h is integer + right-skewed (typical LOS distribution).
-    _nonnormal_vars = [
-        'cci_score',
-        'sofa_1st24h',
-        'pf_1st24h_min',
-        'imv_duration_hrs',
-        'n_days_full_24h',
-    ]
-    _cat_vars = [
-        'sex_category',
-        'icu_type',
-        'ever_pressor',
-        'sepsis_ase',
-        'exit_mechanism',
-    ]
-
-    # OLD Table 1 vars (kept for easy reactivation, do not delete):
-    # outcome_vars = ['_sbt_done_today', '_success_extub_today']
-    # diff_doses = ['prop_dif', 'fenteq_dif', 'midazeq_dif']
-    # _cont_vars = ['age', 'sofa_total', 'cci_score'] + diff_doses
-    # _cat_vars = outcome_vars + ['sex_category', 'icu_type']
-
-    table1_overall = tableone.TableOne(
-        data=_df,
-        continuous=_cont_vars,
-        categorical=_cat_vars,
-        nonnormal=_nonnormal_vars,
-        # Show only the "Yes" row for binary vars (the "No" row is redundant since
-        # it's simply total - yes). `order` puts Yes first, `limit=1` drops the rest.
-        # Verified via tableone/formatting.py:89-128 that apply_limits respects order.
-        order={
-            'ever_pressor': ['Yes', 'No'],
-            'sepsis_ase': ['Yes', 'No'],
-            # Display exit_mechanism in clinical-narrative order: terminal events
-            # first (trach, died_on_imv), then attempted-liberation outcomes,
-            # then census-end discharge, finally unknown.
-            'exit_mechanism': [
-                'tracheostomy',
-                'died_on_imv',
-                'palliative_extubation',
-                'failed_extubation',
-                'successful_extubation',
-                'discharge_on_imv',
-                'unknown',
-            ],
-        },
-        limit={'ever_pressor': 1, 'sepsis_ase': 1},
-    )
-    _t1_path = f'output_to_share/{SITE_NAME}/models/table1.csv'
-    table1_overall.to_csv(_t1_path)
-    logger.info(f"Saved {_t1_path}")
     return
 
 
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
-    ## Day-Night Comparison Table
+    ## Continuous variables → table1_continuous.csv
+
+    One row per variable. Carries display stats (mean/sd/median/q1/q3/min/max)
+    AND lossless pooling primitives (n, sum, sum_sq) so the cross-site
+    pooler can recompute master-cohort mean/SD via fixed-effects formulas
+    without re-reading PHI.
     """)
     return
 
 
 @app.cell
-def _(SITE_NAME, cohort_merged_for_t1_w_by_shift, tableone):
-    _df = cohort_merged_for_t1_w_by_shift.df()
-    sed_vars = ['prop_mcg_kg', 'fenteq_mcg', 'midazeq_mg']
-    _cont_vars = sed_vars + ['ph', 'pf', '_nee']
-    _cat_vars = ['ph_level', 'pf_level']
-    table1_by_shift = tableone.TableOne(
-        data=_df, continuous=_cont_vars, groupby='_shift', categorical=_cat_vars, pval=True
-    )
-    # ARCHIVED 2026-04-08: replaced by the paired+unpaired per-patient rate
-    # analysis in code/07_descriptive.py (outputs sed_dose_by_shift.csv).
-    # The tableone computation above is kept intact for git history / easy
-    # restore; only the CSV write is disabled so the outdated
-    # output_to_share/table1_by_shift.csv is no longer regenerated.
-    # table1_by_shift.to_csv('output_to_share/table1_by_shift.csv')
-    # logger.info("Saved output_to_share/table1_by_shift.csv")
+def _(CONTINUOUS_VARS, SITE_NAME, np, pd, table1_df):
+    _rows = []
+    for _var in CONTINUOUS_VARS:
+        _vals = pd.to_numeric(table1_df[_var], errors="coerce")
+        _ok = _vals.dropna().to_numpy()
+        n = int(_ok.size)
+        n_missing = int(_vals.isna().sum())
+        if n == 0:
+            mean = sd = sum_v = sum_sq = median = q1 = q3 = mn = mx = float("nan")
+        else:
+            mean = float(_ok.mean())
+            sd = float(_ok.std(ddof=1)) if n > 1 else float("nan")
+            sum_v = float(_ok.sum())
+            sum_sq = float((_ok * _ok).sum())
+            median = float(np.median(_ok))
+            q1 = float(np.percentile(_ok, 25))
+            q3 = float(np.percentile(_ok, 75))
+            mn = float(_ok.min())
+            mx = float(_ok.max())
+        _rows.append({
+            "variable": _var,
+            "n": n, "n_missing": n_missing,
+            "mean": mean, "sd": sd,
+            "sum": sum_v, "sum_sq": sum_sq,
+            "median": median, "q1": q1, "q3": q3,
+            "min": mn, "max": mx,
+        })
+    table1_continuous = pd.DataFrame(_rows)
+    _path = f"output_to_share/{SITE_NAME}/models/table1_continuous.csv"
+    table1_continuous.to_csv(_path, index=False)
+    logger.info(f"Saved {_path}  ({len(table1_continuous)} variables)")
+    return (table1_continuous,)
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Categorical variables → table1_categorical.csv
+
+    Per-stay rows (denominator = patients) + the patient-day SBT rate row
+    (denominator = patient-days) coexist via the `denominator_unit` flag.
+
+    Binary vars emit BOTH Yes and No rows so the master-cohort proportion
+    is recoverable; the cross-site formatter applies BINARY_DISPLAY_LEVEL
+    to suppress the redundant level.
+    """)
     return
 
 
-# TODO: Add structured JSON export for cross-site aggregation (table1.json)
+@app.cell
+def _(CATEGORICAL_VARS_PER_STAY, SITE_NAME, pd, table1_df):
+    # Per-stay categorical rows. value_counts(dropna=False) keeps NaN
+    # visible in counts; we then strip the NaN row to a separate
+    # n_missing column so the actual category rows don't contain NaN.
+    _per_stay_rows = []
+    for _var in CATEGORICAL_VARS_PER_STAY:
+        if _var not in table1_df.columns:
+            logger.info(f"  WARN: {_var} missing from cohort_meta_by_id; skipping")
+            continue
+        _counts = table1_df[_var].value_counts(dropna=False)
+        _na_count = int(_counts.get(float("nan"), 0)) if any(
+            isinstance(_k, float) and _k != _k for _k in _counts.index
+        ) else int(table1_df[_var].isna().sum())
+        # Drop NaN row; what's left is the named-level rows.
+        _counts_clean = _counts[_counts.index.notna()]
+        _total = int(_counts_clean.sum())
+        for _cat, _cnt in _counts_clean.items():
+            _per_stay_rows.append({
+                "variable": _var,
+                "category": str(_cat),
+                "n": int(_cnt),
+                "n_missing": _na_count,
+                "total_n": _total,
+                "pct": (100.0 * int(_cnt) / _total) if _total else float("nan"),
+                "denominator_unit": "patients",
+            })
+    table1_categorical_per_stay = pd.DataFrame(_per_stay_rows)
+    return (table1_categorical_per_stay,)
+
+
+@app.cell
+def _(SITE_NAME, pd):
+    # Patient-day SBT-multiday rate. Numerator/denominator restricted to
+    # the modeling cohort's full-24h day-1..7 rows — matches the descriptive
+    # figures' `_is_full_24h_day & _nth_day BETWEEN 1 AND 7` filter.
+    # `sbt_done_multiday_next_day` is the manuscript primary SBT outcome
+    # (08_models.py:410).
+    _model_input = pd.read_parquet(
+        f"output/{SITE_NAME}/model_input_by_id_imvday.parquet"
+    )
+    _full24h = _model_input.loc[
+        _model_input["_is_full_24h_day"]
+        & _model_input["_nth_day"].between(1, 7)
+    ]
+    _sbt_col = "_sbt_done_multiday_today"
+    _denom = int(len(_full24h))
+    _numer_yes = int((_full24h[_sbt_col] == 1).sum())
+    _n_missing = int(_full24h[_sbt_col].isna().sum())
+    _per_pday_rows = [
+        {
+            "variable": "sbt_done_multiday_per_full24h_day",
+            "category": "Yes",
+            "n": _numer_yes,
+            "n_missing": _n_missing,
+            "total_n": _denom,
+            "pct": (100.0 * _numer_yes / _denom) if _denom else float("nan"),
+            "denominator_unit": "patient-days",
+        },
+        {
+            "variable": "sbt_done_multiday_per_full24h_day",
+            "category": "No",
+            "n": _denom - _numer_yes - _n_missing,
+            "n_missing": _n_missing,
+            "total_n": _denom,
+            "pct": (100.0 * (_denom - _numer_yes - _n_missing) / _denom)
+                   if _denom else float("nan"),
+            "denominator_unit": "patient-days",
+        },
+    ]
+    table1_categorical_per_pday = pd.DataFrame(_per_pday_rows)
+    logger.info(
+        f"Patient-day SBT-multiday rate: {_numer_yes:,} / {_denom:,} "
+        f"({100.0 * _numer_yes / max(_denom, 1):.1f}%, missing {_n_missing})"
+    )
+    return (table1_categorical_per_pday,)
+
+
+@app.cell
+def _(SITE_NAME, pd, table1_categorical_per_pday, table1_categorical_per_stay):
+    table1_categorical = pd.concat(
+        [table1_categorical_per_stay, table1_categorical_per_pday],
+        ignore_index=True,
+    )
+    _path = f"output_to_share/{SITE_NAME}/models/table1_categorical.csv"
+    table1_categorical.to_csv(_path, index=False)
+    logger.info(f"Saved {_path}  ({len(table1_categorical)} rows)")
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Histograms → table1_histograms.csv
+
+    Long-format bin counts per continuous variable on hardcoded shared
+    bin edges (see code/_table1_schema.py). The cross-site pooler sums
+    bin counts across sites and inverse-CDF-interpolates the master-cohort
+    median/Q1/Q3 — exact for integer vars (1-unit bins), clinically
+    precise (≤ 1 unit) for the continuous ones.
+    """)
+    return
+
+
+@app.cell
+def _(BIN_EDGES, SITE_NAME, np, pd, table1_df):
+    # Clip values to [edges[0], edges[-1]] before binning so out-of-range
+    # values (e.g., artifactual PF ratios > 800 from FiO2-coding errors) are
+    # counted in the last bin rather than silently dropped. This keeps the
+    # per-variable cohort N consistent with the continuous CSV's `n` and
+    # ensures pooled-median computation is over the full eligibility cohort,
+    # not a truncated subset. Clipping is a no-op for medians/Q1/Q3 because
+    # those typically fall well inside the bin range; only extreme outliers
+    # are affected and they cluster harmlessly in the last bin.
+    _rows = []
+    for _var, _edges in BIN_EDGES.items():
+        _vals = pd.to_numeric(table1_df[_var], errors="coerce").dropna().to_numpy()
+        if _vals.size == 0:
+            continue
+        _n_below = int((_vals < _edges[0]).sum())
+        _n_above = int((_vals > _edges[-1]).sum())
+        _vals_clipped = np.clip(_vals, _edges[0], _edges[-1])
+        _counts, _ = np.histogram(_vals_clipped, bins=_edges)
+        if _n_below + _n_above > 0:
+            logger.info(
+                f"  WARN: {_var}: clipped {_n_below} values below "
+                f"{_edges[0]} and {_n_above} above {_edges[-1]} into the "
+                f"boundary bins (likely upstream data-quality outliers; "
+                f"median/Q1/Q3 unaffected if they fall inside the bin range)"
+            )
+        for _i, _c in enumerate(_counts):
+            _rows.append({
+                "variable": _var,
+                "bin_left": float(_edges[_i]),
+                "bin_right": float(_edges[_i + 1]),
+                "count": int(_c),
+            })
+    table1_histograms = pd.DataFrame(_rows)
+    _path = f"output_to_share/{SITE_NAME}/models/table1_histograms.csv"
+    table1_histograms.to_csv(_path, index=False)
+    logger.info(f"Saved {_path}  ({len(table1_histograms)} rows)")
+    return
 
 
 if __name__ == "__main__":

@@ -364,16 +364,8 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
-    # Dose by Shift (from 07_descriptive.py) — paired + unpaired day-vs-night
-    # sedation rates, long/tidy format (6 rows × 6 columns).
-    dose_by_shift_df = pd.read_csv(f"output_to_share/{SITE_NAME}/descriptive/sed_dose_by_shift.csv")
-    logger.info(f"Dose by Shift: {dose_by_shift_df.shape}")
-    return (dose_by_shift_df,)
-
-
-@app.cell
-def _(SITE_NAME, pd):
-    # Correlation matrix (from 07_descriptive.py)
+    # Correlation matrix (now produced by code/descriptive/pairwise_corr_matrix.py
+    # after the 07_descriptive.py retirement; same output path).
     corr_df = pd.read_csv(f"output_to_share/{SITE_NAME}/descriptive/pairwise_corr_matrix.csv", index_col=0)
     logger.info(f"Correlation matrix: {corr_df.shape}")
     return (corr_df,)
@@ -505,7 +497,6 @@ def _(
     corr_df,
     datetime,
     day0_compare_df,
-    dose_by_shift_df,
     extub_gee_df,
     extub_logit_df,
     plt,
@@ -519,7 +510,6 @@ def _(
 
     # Paths to pre-rendered images from earlier scripts
     _consort_png = f"output_to_share/{SITE_NAME}/models/consort_inclusion.png"
-    _hourly_png = f"output_to_share/{SITE_NAME}/descriptive/sed_dose_by_hr_of_day.png"
 
     # Build cohort summary lines (handle numeric vs string values gracefully)
     def _fmt_n(val):
@@ -536,32 +526,30 @@ def _(
         "  1. Title",
         "  2. CONSORT flow",
         "  3. Table 1: Baseline characteristics",
-        "  4. Dose by Shift: Day vs Night hourly sedation rates",
-        "  5. Correlation matrix",
-        "  6. Hourly dose distribution",
-        "  7. Night-minus-day diff distribution",
-        "  8. Mean night-day diff by ICU day",
-        "  9. Spread of night-day diff by ICU day",
-        " 10. Overall % of patient-days up-titrated",
-        " 11. % of patient-days up-titrated by ICU day",
-        " 12. Up-titrated subcohort characteristics",
-        " 13. Model comparison — SBT Done Next Day (GEE)",
-        " 14. Multicollinearity diagnostic (VIF) — primary SBT GEE rate spec",
-        " 15. Day-0 SA: dose-term ORs (production vs day-0)",
-        " 16. Model comparison — SBT Done Next Day, variant `anyprior` (GEE)",
-        " 17. Model comparison — SBT Done Next Day, variant `imv6h` (GEE)",
-        " 18. Model comparison — SBT Done Next Day, variant `prefix` (GEE)",
-        " 19. Model comparison — SBT Done Next Day, variant `2min` (GEE)",
-        " 20. Model comparison — SBT Done Next Day, variant `subira` (GEE)",
-        " 21. Model comparison — SBT Done Next Day, variant `abc` (GEE)",
-        " 22. Model comparison — Successful Extubation (GEE)",
-        " 23. Model comparison — Successful Extubation (Logit)",
-        " 24. Marginal effects (Linear) — SBT Done Next Day (GEE)",
-        " 25. Marginal effects (Linear) — Successful Extubation (GEE)",
-        " 26. Marginal effects (Linear) — Successful Extubation (Logit)",
-        " 27. Marginal effects (RCS) — SBT Done Next Day (GEE)",
-        " 28. Marginal effects (RCS) — Successful Extubation (GEE)",
-        " 29. Marginal effects (RCS) — Successful Extubation (Logit)",
+        "  4. Correlation matrix",
+        "  5. Night-minus-day diff distribution",
+        "  6. Mean night-day diff by ICU day",
+        "  7. Spread of night-day diff by ICU day",
+        "  8. Overall % of patient-days up-titrated",
+        "  9. % of patient-days up-titrated by ICU day",
+        " 10. Up-titrated subcohort characteristics",
+        " 11. Model comparison — SBT Done Next Day (GEE)",
+        " 12. Multicollinearity diagnostic (VIF) — primary SBT GEE rate spec",
+        " 13. Day-0 SA: dose-term ORs (production vs day-0)",
+        " 14. Model comparison — SBT Done Next Day, variant `anyprior` (GEE)",
+        " 15. Model comparison — SBT Done Next Day, variant `imv6h` (GEE)",
+        " 16. Model comparison — SBT Done Next Day, variant `prefix` (GEE)",
+        " 17. Model comparison — SBT Done Next Day, variant `2min` (GEE)",
+        " 18. Model comparison — SBT Done Next Day, variant `subira` (GEE)",
+        " 19. Model comparison — SBT Done Next Day, variant `abc` (GEE)",
+        " 20. Model comparison — Successful Extubation (GEE)",
+        " 21. Model comparison — Successful Extubation (Logit)",
+        " 22. Marginal effects (Linear) — SBT Done Next Day (GEE)",
+        " 23. Marginal effects (Linear) — Successful Extubation (GEE)",
+        " 24. Marginal effects (Linear) — Successful Extubation (Logit)",
+        " 25. Marginal effects (RCS) — SBT Done Next Day (GEE)",
+        " 26. Marginal effects (RCS) — Successful Extubation (GEE)",
+        " 27. Marginal effects (RCS) — Successful Extubation (Logit)",
     ]
 
     # Significance legend shown as footnote on every model comparison table
@@ -596,46 +584,12 @@ def _(
             fontsize=9,
         )
 
-        # Page 4: Dose by Shift (NEW) — paired + unpaired day-vs-night rates.
-        # Compose compound row labels ("<variable> — paired/unpaired") to
-        # collapse the tidy 6-row × 6-col CSV into a 6-row × 4-col
-        # publication layout matching the user's original spec.
-        _dose_by_shift_display = dose_by_shift_df.copy()
-        _dose_by_shift_display['_row_label'] = (
-            _dose_by_shift_display['Variable'] + ' — ' + _dose_by_shift_display['spec']
-        )
-        _dose_by_shift_display = (
-            _dose_by_shift_display
-            .set_index('_row_label')
-            .drop(columns=['Variable', 'spec'])
-        )
-        _dose_by_shift_display.index.name = ''
-        add_stargazer_table(
-            _pdf,
-            _dose_by_shift_display,
-            "Dose by Shift: Day vs Night Hourly Sedation Rates",
-            notes=(
-                "Per-hospitalization weighted-mean hourly dose rate "
-                "(sum of dose / sum of hours on IMV within each shift). "
-                "Paired t-test is the primary analysis; unpaired Welch's "
-                "t-test shown as a robustness check. Two-sided p-values; "
-                "95% CI for mean difference."
-            ),
-            fontsize=9,
-        )
-
-        # Page 5: Correlation matrix
+        # Page 4: Correlation matrix
+        # (produced by code/descriptive/pairwise_corr_matrix.py — same
+        # output path as the retired 07_descriptive.py's matrix cell.)
         add_heatmap_page(_pdf, corr_df, "Pairwise Pearson Correlation Matrix")
 
-        # Page 6: Hourly dose distribution
-        if os.path.exists(_hourly_png):
-            add_image_page(_pdf, _hourly_png, "Hourly Dose Distribution")
-        else:
-            add_text_page(_pdf, "Hourly Dose Distribution",
-                          [f"[Image not found: {_hourly_png}]",
-                           "Run 07_descriptive.py to generate."])
-
-        # Pages 7-12: Nocturnal up-titration descriptives.
+        # Pages 5-10: Nocturnal up-titration descriptives.
         # Generated by the standalone scripts under code/descriptive/ — each
         # script writes one PNG (or CSV) and is re-runnable on its own. They
         # live here (pre-models) because they motivate the exposure-of-interest

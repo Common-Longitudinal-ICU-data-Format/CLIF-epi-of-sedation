@@ -649,7 +649,13 @@ def _(CONFIG_PATH, first_icu_admit, get_config_or_params):
     import polars as _pl
     from _sofa import compute_sofa_polars as _compute_sofa_polars
 
-    _sofa_24h_path = "output/sofa_first_24h.parquet"
+    # Site-scoped cache path. Earlier versions used a global path
+    # (`output/sofa_first_24h.parquet`) which silently collided across
+    # sites: whichever site ran 04 last overwrote the cache, and the next
+    # site's LEFT JOIN on hospitalization_id matched zero rows because
+    # the cache held the wrong site's IDs. That bug surfaced as MIMIC's
+    # SOFA = 100% NULL on cohort_meta_by_id.parquet (2026-05-11).
+    _sofa_24h_path = f"output/{SITE_NAME}/sofa_first_24h.parquet"
     if (not os.path.exists(_sofa_24h_path)) or RERUN_SOFA_24H:
         _cfg = get_config_or_params(CONFIG_PATH)
         _sofa_24h_cohort = _pl.from_pandas(
@@ -808,8 +814,15 @@ def _(cont_veso_converted, duckdb):
 @app.cell
 def _(duckdb, first_icu_admit, po2_w, resp_p, vitals_t1_df):
     # Cell E — Worst P/F (or S/F-imputed P/F via Rice equation) in first 24 h of ICU admit.
-    # Rice formula: PF_imputed = 64 + 0.84 * (SpO2 / FiO2 * 100), valid for SpO2 <= 97
-    # (above 97, the saturation curve flattens and S/F is unreliable).
+    # Rice formula (Rice et al. 2007, doi:10.1378/chest.07-0617):
+    #     S/F = 64 + 0.84 × P/F
+    # Inverted to impute P/F from S/F:
+    #     P/F = (S/F − 64) / 0.84
+    # Valid for SpO2 ≤ 97 (above 97, the saturation curve flattens and S/F is unreliable).
+    # NOTE 2026-05-11: an earlier version applied the formula in the wrong direction
+    # (`PF = 64 + 0.84 × S/F`), inflating SpO2-derived PF values into the 30,000+ range
+    # for typical SpO2/FiO2 inputs. Fixed below; the per-stay `pf_1st24h_min` distribution
+    # now lands in the physiologically plausible range.
     # Event-driven: no fresh hourly grid — ASOF-join FiO2 from resp_p to the event times
     # of PaO2 labs and SpO2 vitals that fall within the ICU-24h window.
     pf_24h_df = duckdb.sql("""
@@ -853,7 +866,10 @@ def _(duckdb, first_icu_admit, po2_w, resp_p, vitals_t1_df):
                 ON s.hospitalization_id = r.hospitalization_id
                 AND r.recorded_dttm <= s.event_dttm
             SELECT s.hospitalization_id
-                , pf: 64 + 0.84 * (s.spo2 / r.fio2_set * 100)
+                -- Inverted Rice equation: P/F = (S/F − 64) / 0.84,
+                -- where S/F = SpO2 (percent) / FiO2 (fraction).
+                -- E.g., SpO2=97, FiO2=0.21 → S/F=462 → P/F=(462−64)/0.84≈473.
+                , pf: (s.spo2 / r.fio2_set - 64) / 0.84
                 , source: 'spo2'
             WHERE r.fio2_set IS NOT NULL AND r.fio2_set > 0
         )
@@ -1115,14 +1131,18 @@ def _(SITE_NAME, hosp_meta_df):
             -- file already replicates these flags onto every row of a hosp,
             -- so MAX is a no-op aggregator (matches the convention used by
             -- 05_modeling_dataset's analytical_dataset assembly).
+            -- `sbt_done_multiday` is the manuscript-primary SBT definition
+            -- (08_models.py:410); rolling it up to per-stay lets Table 1
+            -- report the cohort-level "ever had a multiday SBT" rate.
             FROM read_parquet('output/{SITE_NAME}/outcomes_by_id_imvday.parquet')
             SELECT
                 hospitalization_id
-                , ever_extubated:     COALESCE(MAX(_extub_1st),    0)
-                , ever_trach:         COALESCE(MAX(_trach_1st),    0)
-                , ever_success_extub: COALESCE(MAX(_success_extub), 0)
-                , ever_failed_extub:  COALESCE(MAX(_fail_extub),   0)
-                , ever_withdrawl:     COALESCE(MAX(_withdrawl_lst), 0)
+                , ever_extubated:         COALESCE(MAX(_extub_1st),       0)
+                , ever_trach:             COALESCE(MAX(_trach_1st),       0)
+                , ever_success_extub:     COALESCE(MAX(_success_extub),    0)
+                , ever_failed_extub:      COALESCE(MAX(_fail_extub),      0)
+                , ever_withdrawl:         COALESCE(MAX(_withdrawl_lst),    0)
+                , ever_sbt_done_multiday: COALESCE(MAX(sbt_done_multiday), 0)
             GROUP BY hospitalization_id
         )
         FROM read_parquet('output/{SITE_NAME}/cohort_imv_streaks.parquet') s
@@ -1168,8 +1188,9 @@ def _(SITE_NAME, hosp_meta_df):
             , cci_score:          cci.cci_score
             , elix_score:         ex.elix_score
             -- Outcome shortcuts + exit_mechanism categorical
-            , successful_extubation:    COALESCE(o.ever_success_extub, 0) = 1
+            , successful_extubation:     COALESCE(o.ever_success_extub, 0) = 1
             , reintubated_within_window: COALESCE(o.ever_failed_extub, 0) = 1
+            , ever_sbt_done_multiday:    COALESCE(o.ever_sbt_done_multiday, 0) = 1
             -- Mutually-exclusive exit_mechanism. Order matters: trach wins
             -- over death-on-IMV when both happen (trach is the cohort exit
             -- event); withdrawal-of-care wins over fail/success (different

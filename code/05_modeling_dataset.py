@@ -38,7 +38,7 @@ def _():
     Two filter views replace the historic two-parquet split:
 
     - **Outcome-modeling cohort** (consumers: `06_table1.py`,
-      `07_descriptive.py`, `08_models.py`, `08b_models_cascade.py`,
+      `08_models.py`, `08b_models_cascade.py`,
       `descriptive/_shared.py:load_modeling()`,
       `agg/_shared.py:load_site_analytical()`): apply the filter
       `_nth_day > 0 AND sbt_done_next_day IS NOT NULL AND
