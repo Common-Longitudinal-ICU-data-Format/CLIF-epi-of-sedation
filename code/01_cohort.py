@@ -11,7 +11,7 @@
 import marimo
 
 __generated_with = "0.22.5"
-app = marimo.App(sql_output="native")
+app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
     import marimo as mo
@@ -93,6 +93,7 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
     SITE_TZ = cfg['timezone']
+    DATA_DIR = cfg['data_directory']
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     # Path B++ refactor: descriptive (night-vs-day) artifacts under
     # {site}/descriptive/, modeling-cohort artifacts (incl. CONSORT) under
@@ -105,7 +106,7 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # prior version relied on) so the output_directory is site-scoped.
     setup_logging(output_directory=f"output/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
-    return SITE_NAME, SITE_TZ
+    return DATA_DIR, SITE_NAME, SITE_TZ
 
 
 @app.cell(hide_code=True)
@@ -258,14 +259,13 @@ def _(adt_rel, hosp_ids_w_icu_stays, load_data):
             f"{len(cohort_hosp_ids_post_stitch):,} remain). "
             f"Unmapped (kept as singletons): {n_unmapped_singletons:,}"
         )
-
     return (
         cohort_hosp_ids_post_stitch,
         encounter_mapping,
         n_dropped_stitch,
         n_unmapped_singletons,
-        stitch_dropped_hosp_ids,
         stitch_block_sizes,
+        stitch_dropped_hosp_ids,
     )
 
 
@@ -276,7 +276,7 @@ def _(
     n_dropped_stitch,
     n_unmapped_singletons,
     stitch_block_sizes,
-    stitch_dropped_hosp_ids,
+    stitch_dropped_hosp_ids: list,
 ):
     # Stitch QA summary — persists per-site stitch behavior + cohort-impact
     # decomposition for cross-site QA pooling. Written to
@@ -430,7 +430,6 @@ def _():
 def _(
     CONFIG_PATH,
     SITE_NAME,
-    SITE_TZ,
     apply_outlier_handling_duckdb,
     cohort_hosp_ids_post_stitch,
     load_data,
@@ -710,7 +709,7 @@ def _(cohort_hosp_ids_pre_weight, duckdb, load_data):
         f"Weight-presence exclusion: {n_dropped_no_weight:,} hospitalizations "
         f"dropped (zero weight_kg rows in vitals)"
     )
-    return cohort_hosp_ids_w_weight, n_dropped_no_weight
+    return cohort_hosp_ids_w_weight, n_dropped_no_weight, weight_presence_rel
 
 
 @app.cell
@@ -759,7 +758,11 @@ def _(
             h for h in _post_jump
             if str(h) not in _drop_by_kind['range']
         ]
-        cohort_hosp_ids = _post_range
+        # Pre-NMB cohort: post-weight-QC but BEFORE the hospitalization-level
+        # NMB exclusion (applied downstream once nmb_excluded_patient_days
+        # is computed). The final `cohort_hosp_ids` is built in a later cell
+        # by subtracting the NMB-flagged hospitalization set.
+        cohort_hosp_ids_pre_nmb = _post_range
 
         n_excl_c1_residual = len(cohort_hosp_ids_w_weight) - len(_post_c1_resid)
         n_excl_jump = len(_post_c1_resid) - len(_post_jump)
@@ -780,7 +783,7 @@ def _(
             f"jump={n_excl_jump:,}, range={n_excl_range:,}"
         )
     else:
-        cohort_hosp_ids = list(cohort_hosp_ids_w_weight)
+        cohort_hosp_ids_pre_nmb = list(cohort_hosp_ids_w_weight)
         n_excl_c1_residual = 0
         n_excl_jump = 0
         n_excl_range = 0
@@ -795,7 +798,7 @@ def _(
             "then re-run 01_cohort.py to apply)"
         )
 
-    consort_counts = {
+    consort_pre_nmb_counts = {
         **cohort_pre_weight_counts,
         'n_dropped_no_weight': n_dropped_no_weight,
         'n_post_weight_presence': len(cohort_hosp_ids_w_weight),
@@ -806,36 +809,39 @@ def _(
             len(cohort_hosp_ids_w_weight) - n_excl_c1_residual - n_excl_jump
         ),
         'n_excl_range': n_excl_range,
-        'n_post_range': len(cohort_hosp_ids),
+        'n_post_range': len(cohort_hosp_ids_pre_nmb),
         'jump_threshold_str': jump_threshold_str,
         'range_threshold_str': range_threshold_str,
     }
 
     logger.info(
-        f"Cohort hospitalizations (after all weight QC + IMV + ICU): "
-        f"{len(cohort_hosp_ids):,}"
+        f"Pre-NMB cohort (post weight QC + IMV + ICU): "
+        f"{len(cohort_hosp_ids_pre_nmb):,}"
     )
-    logger.info(f"  Excluded — no IMV: {consort_counts['n_no_imv']:,}")
+    logger.info(f"  Excluded — no IMV: {consort_pre_nmb_counts['n_no_imv']:,}")
     logger.info(
-        f"  Excluded — first IMV <24h: {consort_counts['n_first_imv_lt24']:,} "
-        f"(of which {consort_counts['n_trach_truncated']:,} tracheostomy-truncated)"
+        f"  Excluded — first IMV <24h: {consort_pre_nmb_counts['n_first_imv_lt24']:,} "
+        f"(of which {consort_pre_nmb_counts['n_trach_truncated']:,} tracheostomy-truncated)"
     )
     logger.info(f"  Excluded — no weight_kg row: {n_dropped_no_weight:,}")
     logger.info(f"  Excluded — all weights out of clamp: {n_excl_c1_residual:,}")
     logger.info(f"  Excluded — weight jump rule: {n_excl_jump:,}")
     logger.info(f"  Excluded — weight range rule: {n_excl_range:,}")
-    return cohort_hosp_ids, consort_counts
+    return cohort_hosp_ids_pre_nmb, consort_pre_nmb_counts
 
 
 @app.cell
-def _(adt_rel, cohort_hosp_ids):
+def _(adt_rel, cohort_hosp_ids_rel):
     icu_type_df = mo.sql(
         f"""
-        -- First ICU type per cohort hospitalization (earliest ADT record)
-        FROM adt_rel
+        -- First ICU type per cohort hospitalization (earliest ADT record).
+        -- INNER JOIN against the lazy cohort relation (post-NMB final cohort)
+        -- replaces the prior IN-UNNEST literal — same row count, scales to
+        -- 1M+ hospitalizations without per-query SQL-literal blowup.
+        FROM adt_rel a
+        JOIN cohort_hosp_ids_rel USING (hospitalization_id)
         SELECT hospitalization_id
-            , icu_type: FIRST(location_type ORDER BY in_dttm)
-        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+            , icu_type: FIRST(a.location_type ORDER BY a.in_dttm)
         GROUP BY hospitalization_id
         """
     )
@@ -940,33 +946,18 @@ def _():
 
 
 @app.cell
-def _(
-    cohort_hrly_grids_f,
-    encounter_mapping,
-    nmb_excluded_patient_days,
-):
-    # Aggregate hourly grid → one row per (hosp, _nth_day). Window functions
-    # over PARTITION BY hospitalization_id give us min/max _nth_day per hosp
-    # so we can label the partial-vs-full day_type. Within a kept IMV streak
-    # the hourly grid is contiguous, so middle days are full by construction
-    # — only the first and last days can be partial. Edge case: a patient
-    # extubated at 6:59am produces a max-`_nth_day` row that is still full
-    # (24 chargeable hours under the 7am-cross convention); day_type='full'
-    # is correct for those.
-    #
-    # `encounter_block` propagation: when stitch is ON, `encounter_mapping`
-    # is a (hospitalization_id, encounter_block) pandas df; when OFF it's
-    # None. To keep the SQL a single mo.sql call (rather than branching
-    # between two duckdb.sql variants), we synthesize an empty-but-schema-
-    # stable mapping df when stitch is OFF — the LEFT JOIN unifies both
-    # cases and the encounter_block column is NULL on the OFF path.
-    #
-    # Phase 2 fold-in (2026-05-07): NMB exclusion info from
-    # `cohort_nmb_excluded.parquet` is LEFT-JOINed in additively as
-    # `nmb_excluded` (bool — TRUE where any NMB exclusion applies) +
-    # `nmb_total_min` (float — total NMB minutes that day, NULL on
-    # non-flagged days). Standalone file stays on disk; canonical read
-    # source for the per-day NMB flag becomes the registry.
+def _(encounter_mapping, nmb_excluded_patient_days):
+    # Setup cell — non-SQL prep for the CTE chain below. Two materializations:
+    # (1) `encounter_map_df`: when stitch is ON, `encounter_mapping` is a
+    #     (hospitalization_id, encounter_block) pandas df; when OFF it's None.
+    #     We synthesize an empty-but-schema-stable mapping df on the OFF path
+    #     so the downstream LEFT JOIN unifies both cases (NULL encounter_block
+    #     when stitch is off).
+    # (2) `nmb_excluded_pd`: NMB-excluded patient-days as a pandas DataFrame.
+    #     DuckDB's replacement scan in marimo script mode reliably resolves
+    #     pandas DFs by name; cross-cell DuckDBPyRelation handoffs into a
+    #     consumer mo.sql block also resolve, but materializing here keeps
+    #     the downstream join self-contained.
     import pandas as _pd
     if encounter_mapping is None:
         encounter_map_df = _pd.DataFrame({
@@ -976,83 +967,141 @@ def _(
     else:
         encounter_map_df = encounter_mapping
 
-    # Materialize the NMB-excluded patient-days as a pandas DataFrame.
-    # DuckDB's replacement scan in marimo script mode reliably resolves
-    # pandas DFs by name; cross-cell DuckDBPyRelation handoffs into a
-    # consumer mo.sql block also resolve, but materializing here keeps
-    # this cell self-contained.
     nmb_excluded_pd = nmb_excluded_patient_days.df()
+    return encounter_map_df, nmb_excluded_pd
 
+
+@app.cell
+def _(cohort_hrly_grids_f):
+    # CTE 1/6 — Aggregate hourly grid → one row per (hosp, _nth_day) with
+    # shift-hour counts + day boundaries. Within a kept IMV streak the
+    # hourly grid is contiguous, so middle days are full by construction.
+    per_day = mo.sql(
+        f"""
+        FROM cohort_hrly_grids_f
+        SELECT
+            hospitalization_id
+            , _nth_day
+            , n_hrs_day:   COUNT(*) FILTER (WHERE _shift = 'day')
+            , n_hrs_night: COUNT(*) FILTER (WHERE _shift = 'night')
+            , day_start_dttm: MIN(event_dttm)
+            , day_end_dttm:   MAX(event_dttm)
+        GROUP BY hospitalization_id, _nth_day
+        """
+    )
+    return (per_day,)
+
+
+@app.cell
+def _(per_day):
+    # CTE 2/6 — Window functions over PARTITION BY hospitalization_id give
+    # us min/max _nth_day per hosp; `_is_full_24h_day` is the canonical
+    # 12-hr-day + 12-hr-night coverage flag.
+    with_extremes = mo.sql(
+        f"""
+        FROM per_day
+        SELECT *
+            , _is_full_24h_day: (n_hrs_day = 12 AND n_hrs_night = 12)
+            , _max_nth: MAX(_nth_day) OVER (PARTITION BY hospitalization_id)
+            , _min_nth: MIN(_nth_day) OVER (PARTITION BY hospitalization_id)
+        """
+    )
+    return (with_extremes,)
+
+
+@app.cell
+def _(with_extremes):
+    # CTE 3/6 — Label day_type ∈ {first_partial, last_partial, full}. Only
+    # the first and last days in a streak can be partial; middle days are
+    # full. Edge case: a patient extubated at 6:59am produces a max-`_nth_day`
+    # row that is still full (24 chargeable hours under the 7am-cross
+    # convention); day_type='full' is correct for those.
+    typed = mo.sql(
+        f"""
+        FROM with_extremes
+        SELECT
+            hospitalization_id
+            , _nth_day
+            , day_type: CASE
+                WHEN NOT _is_full_24h_day AND _nth_day = _min_nth THEN 'first_partial'
+                WHEN NOT _is_full_24h_day AND _nth_day = _max_nth THEN 'last_partial'
+                ELSE 'full'
+            END
+            , _is_full_24h_day
+            , n_hrs_day
+            , n_hrs_night
+            , day_start_dttm
+            , day_end_dttm
+        """
+    )
+    return (typed,)
+
+
+@app.cell
+def _(typed):
+    # CTE 4/6 — Compute `_max_full_nth` (last full day's _nth_day per hosp)
+    # in a separate CTE because `day_type` was derived in `typed` above;
+    # window functions can't reference an alias from the same SELECT.
+    with_last_full = mo.sql(
+        f"""
+        FROM typed
+        SELECT *
+            , _max_full_nth: MAX(CASE WHEN day_type = 'full' THEN _nth_day END)
+                             OVER (PARTITION BY hospitalization_id)
+        """
+    )
+    return (with_last_full,)
+
+
+@app.cell
+def _(encounter_map_df, with_last_full):
+    # CTE 5/6 — Final flag derivation + encounter_block LEFT JOIN. Three
+    # flags surfaced:
+    # - `_is_first_day`: patient had a partial intubation day AND this row
+    #   is it. Narrow semantic — patients whose IMV starts at 7am exactly
+    #   have NO first_partial row and therefore no row flagged.
+    # - `_is_last_partial_day`: the truncated extubation day (the row
+    #   removed by analyses that require full 24-h coverage).
+    # - `_is_last_full_day`: the patient's final full-24h day, i.e. the
+    #   last row that survives the modeling-cohort filter. For patients
+    #   with no full days at all, this is False everywhere.
+    joined = mo.sql(
+        f"""
+        FROM with_last_full t
+        LEFT JOIN encounter_map_df em USING (hospitalization_id)
+        SELECT
+            t.hospitalization_id
+            , em.encounter_block
+            , t._nth_day
+            , t.day_type
+            , _is_first_day: (t.day_type = 'first_partial')
+            , _is_last_partial_day:  (t.day_type = 'last_partial')
+            , _is_last_full_day: (t.day_type = 'full'
+                                   AND t._nth_day = t._max_full_nth)
+            , t._is_full_24h_day
+            , t.n_hrs_day
+            , t.n_hrs_night
+            , t.day_start_dttm
+            , t.day_end_dttm
+        """
+    )
+    return (joined,)
+
+
+@app.cell
+def _(joined, nmb_excluded_pd):
+    # CTE 6/6 — Attach NMB info as additive columns and emit the final
+    # registry.
+    #
+    # NMB exclusion semantic (post-2026-05-10): NMB-flagged hospitalizations
+    # are dropped at the cohort source (see the `cohort_hosp_ids` cell after
+    # `nmb_excluded_patient_days`). After that cohort filter, the terminal
+    # parquet-write step restricts `cohort_meta_by_id_imvday.parquet` to
+    # post-NMB hospitalizations, so every row on disk has `nmb_excluded =
+    # FALSE` by construction. The columns are retained as a defensive
+    # consistency check; consumers can `assert not df['nmb_excluded'].any()`
+    # to verify the cohort filter took effect.
     cohort_meta_by_id_imvday = mo.sql(f"""
-        WITH per_day AS (
-            FROM cohort_hrly_grids_f
-            SELECT
-                hospitalization_id
-                , _nth_day
-                , n_hrs_day:   COUNT(*) FILTER (WHERE _shift = 'day')
-                , n_hrs_night: COUNT(*) FILTER (WHERE _shift = 'night')
-                , day_start_dttm: MIN(event_dttm)
-                , day_end_dttm:   MAX(event_dttm)
-            GROUP BY hospitalization_id, _nth_day
-        )
-        , with_extremes AS (
-            FROM per_day
-            SELECT *
-                , _is_full_24h_day: (n_hrs_day = 12 AND n_hrs_night = 12)
-                , _max_nth: MAX(_nth_day) OVER (PARTITION BY hospitalization_id)
-                , _min_nth: MIN(_nth_day) OVER (PARTITION BY hospitalization_id)
-        )
-        , typed AS (
-            FROM with_extremes
-            SELECT
-                hospitalization_id
-                , _nth_day
-                , day_type: CASE
-                    WHEN NOT _is_full_24h_day AND _nth_day = _min_nth THEN 'first_partial'
-                    WHEN NOT _is_full_24h_day AND _nth_day = _max_nth THEN 'last_partial'
-                    ELSE 'full'
-                END
-                , _is_full_24h_day
-                , n_hrs_day
-                , n_hrs_night
-                , day_start_dttm
-                , day_end_dttm
-        )
-        -- Compute the `_nth_day` of each patient's last full day in a separate
-        -- CTE because `day_type` was derived in `typed` above; window functions
-        -- can't reference an alias from the same SELECT.
-        , with_last_full AS (
-            FROM typed
-            SELECT *
-                , _max_full_nth: MAX(CASE WHEN day_type = 'full' THEN _nth_day END)
-                                 OVER (PARTITION BY hospitalization_id)
-        )
-        , joined AS (
-            FROM with_last_full t
-            LEFT JOIN encounter_map_df em USING (hospitalization_id)
-            SELECT
-                t.hospitalization_id
-                , em.encounter_block
-                , t._nth_day
-                , t.day_type
-                -- _is_first_day = patient had a partial intubation day AND this
-                -- row is it. Narrow semantic — patients whose IMV starts at 7am
-                -- exactly have NO first_partial row and therefore no row flagged.
-                , _is_first_day: (t.day_type = 'first_partial')
-                -- _is_last_partial_day = the truncated extubation day (the row
-                -- removed by analyses that require full 24-h coverage).
-                , _is_last_partial_day:  (t.day_type = 'last_partial')
-                -- _is_last_full_day = the patient's final full-24h day, i.e.
-                -- the last row that survives the modeling-cohort filter. For
-                -- patients with no full days at all, this is False everywhere.
-                , _is_last_full_day: (t.day_type = 'full'
-                                       AND t._nth_day = t._max_full_nth)
-                , t._is_full_24h_day
-                , t.n_hrs_day
-                , t.n_hrs_night
-                , t.day_start_dttm
-                , t.day_end_dttm
-        )
         FROM joined j
         LEFT JOIN nmb_excluded_pd n USING (hospitalization_id, _nth_day)
         SELECT
@@ -1088,14 +1137,26 @@ def _():
 
 
 @app.cell
-def _(load_data):
-    nmb_rel = load_data(
-        'medication_admin_continuous',
-        config_path='config/config.json',
-        return_rel=True,
-        columns=['hospitalization_id', 'admin_dttm', 'med_name', 'med_category', 'med_dose', 'med_dose_unit'],
-        filters={'med_category': ['cisatracurium', 'vecuronium', 'rocuronium']},
-    )
+def _(DATA_DIR, duckdb):
+    # Inline raw DuckDB read of clifpy's parquet — mirrors 02_exposure.py's
+    # pattern. Bypasses clifpy.load_data (which silently does
+    # UTC→naive-site-local conversion and breaks downstream
+    # `AT TIME ZONE site_tz + extract` semantics). admin_dttm flows
+    # downstream as UTC TIMESTAMPTZ. Predicate pushdown engages on the
+    # med_category filter via the parquet scan; the cohort restriction
+    # is delegated to the downstream ASOF join in `nmb_hrly` which only
+    # keeps grid rows for kept-cohort patients.
+    nmb_rel = duckdb.sql(f"""
+        FROM '{DATA_DIR}/clif_medication_admin_continuous.parquet'
+        SELECT
+            hospitalization_id
+            , admin_dttm
+            , med_name
+            , med_category
+            , med_dose
+            , med_dose_unit
+        WHERE med_category IN ('cisatracurium', 'vecuronium', 'rocuronium')
+    """)
     if logger.isEnabledFor(logging.DEBUG):
         _n = nmb_rel.count("*").fetchone()[0]
         logger.debug(f"NMB records: {_n:,}")
@@ -1155,6 +1216,38 @@ def _(nmb_hrly):
     return (nmb_excluded_patient_days,)
 
 
+@app.cell
+def _(cohort_hosp_ids_pre_nmb, duckdb, nmb_excluded_patient_days):
+    # Apply hospitalization-level NMB exclusion as the final cohort step.
+    # Per CONSORT spec: any patient-day with NMB >1h disqualifies the entire
+    # hospitalization (not just that day). The prior implementation flagged
+    # at patient-day level but never modified `cohort_hosp_ids` — CONSORT
+    # display showed the exclusion, but every downstream parquet retained
+    # the supposedly-excluded hospitalizations.
+    #
+    # After this cell, `cohort_hosp_ids` IS the final analytic cohort; every
+    # downstream parquet (filtered via `cohort_hosp_ids_rel` at the terminal
+    # JOINs) inherits the NMB-clean cohort by construction.
+    nmb_excluded_hosp_ids = set(
+        r[0] for r in duckdb.sql(
+            "FROM nmb_excluded_patient_days SELECT DISTINCT hospitalization_id"
+        ).fetchall()
+    )
+    cohort_hosp_ids = [
+        h for h in cohort_hosp_ids_pre_nmb if h not in nmb_excluded_hosp_ids
+    ]
+    cohort_hosp_ids_rel = duckdb.sql(
+        f"SELECT UNNEST({cohort_hosp_ids}) AS hospitalization_id"
+    )
+    logger.info(
+        f"NMB exclusion: dropped "
+        f"{len(cohort_hosp_ids_pre_nmb) - len(cohort_hosp_ids):,} "
+        f"hospitalizations with any patient-day NMB >1h "
+        f"(final cohort: {len(cohort_hosp_ids):,})"
+    )
+    return cohort_hosp_ids, cohort_hosp_ids_rel
+
+
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -1173,12 +1266,12 @@ def _():
 @app.cell
 def _(
     SITE_NAME,
-    SITE_TZ,
     cohort_hosp_ids,
+    cohort_hosp_ids_rel,
     cohort_hrly_grids_f,
     cohort_imv_streaks,
     cohort_meta_by_id_imvday,
-    consort_counts,
+    consort_pre_nmb_counts,
     duckdb,
     icu_type_df,
     nmb_excluded_patient_days,
@@ -1192,7 +1285,7 @@ def _(
     _n_nmb_hosp_ids = duckdb.sql(
         "FROM nmb_excluded_patient_days SELECT COUNT(DISTINCT hospitalization_id)"
     ).fetchone()[0]
-    _cc = consort_counts
+    _cc = consort_pre_nmb_counts
 
     # Per-criterion CONSORT steps. Two conditional steps coexist via the
     # n_*=None sentinel pattern:
@@ -1273,11 +1366,15 @@ def _(
         })
 
     # NMB step (always last). n_remaining is anchored to the actual final
-    # cohort size minus NMB-excluded hosps.
+    # NMB step (always last). `cohort_hosp_ids` is now post-NMB (the
+    # earlier `nmb_excluded_hosp_ids` cell subtracted NMB-flagged
+    # hospitalizations from `cohort_hosp_ids_pre_nmb`), so n_remaining
+    # is simply `len(cohort_hosp_ids)`. CONSORT description and exclusion
+    # reason are unchanged.
     _steps.append({
         "step": 0,
         "description": "Exclude hospitalizations with any NMB >1h",
-        "n_remaining": len(cohort_hosp_ids) - _n_nmb_hosp_ids,
+        "n_remaining": len(cohort_hosp_ids),
         "n_excluded": _n_nmb_hosp_ids,
         "exclusion_reason": f"Any patient-day with NMB >1h ({_n_nmb_patient_days:,} patient-days across {_n_nmb_hosp_ids:,} hosp)",
     })
@@ -1297,19 +1394,24 @@ def _(
         json.dump(consort_flow, f, indent=2)
     logger.info(f"CONSORT flow saved to {_consort_json_path}")
 
-    # Filter cohort artifacts to the kept (post-weight-QC) cohort. SEMI JOIN
-    # in DuckDB is the lazy way; results materialize at .pl() / .to_parquet().
+    # Filter cohort artifacts to the post-NMB cohort via INNER JOIN against
+    # the lazy `cohort_hosp_ids_rel` relation. Results materialize at .pl()
+    # / .to_parquet(). Marimo's reactivity tracks SEMI JOIN poorly through
+    # the DAG; INNER JOIN with USING is the project convention.
     _streaks_kept_rel = duckdb.sql(f"""
-        FROM cohort_imv_streaks
-        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+        FROM cohort_imv_streaks s
+        JOIN cohort_hosp_ids_rel USING (hospitalization_id)
+        SELECT s.*
     """)
     _grids_kept_rel = duckdb.sql(f"""
-        FROM cohort_hrly_grids_f
-        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+        FROM cohort_hrly_grids_f g
+        JOIN cohort_hosp_ids_rel USING (hospitalization_id)
+        SELECT g.*
     """)
     _meta_imvday_kept_rel = duckdb.sql(f"""
-        FROM cohort_meta_by_id_imvday
-        WHERE hospitalization_id IN (SELECT UNNEST({cohort_hosp_ids}))
+        FROM cohort_meta_by_id_imvday t
+        JOIN cohort_hosp_ids_rel USING (hospitalization_id)
+        SELECT t.*
     """)
 
     # UTC-on-disk: every *_dttm column is written as UTC tz-aware

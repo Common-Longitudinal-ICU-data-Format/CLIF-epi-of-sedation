@@ -5,62 +5,141 @@ import pandas as pd
 from pathlib import Path
 
 
-def localize_naive_to_site_tz(s: pd.Series, site_tz: str) -> pd.Series:
-    """Attach a site-tz tag to a naive datetime Series.
-
-    Sibling to ``retag_to_local_tz`` for the OTHER tz-fix direction:
-    ``retag`` is for tz-aware columns (relabels a UTC instant); this is
-    for naive columns whose wall-clock is *already* in site-local time
-    (clifpy's ``*.from_file`` convention) and just needs the tz tag.
-
-    Handles DST edge cases that ``Series.dt.tz_localize`` would otherwise
-    raise on:
-
-    - **Fall-back ambiguity** (e.g., 2024-11-03 01:30 Central exists twice):
-      tries ``ambiguous='infer'`` first (pandas uses neighboring timestamp
-      ordering to disambiguate); falls back to ``ambiguous=False`` (= the
-      LATER, post-fall-back / standard-time occurrence) if infer can't
-      resolve isolated ambiguous values. The fallback is deterministic
-      and matches the convention used elsewhere (e.g., DuckDB's
-      ``AT TIME ZONE`` resolves fall-back ambiguity to standard time).
-
-    - **Spring-forward gap** (e.g., 2024-03-10 02:30 Central doesn't exist):
-      shifts forward to the next valid minute via ``nonexistent='shift_forward'``.
-
-    No-op if the column is already tz-aware.
-    """
-    if not pd.api.types.is_datetime64_any_dtype(s) or s.dt.tz is not None:
-        return s
-    try:
-        return s.dt.tz_localize(site_tz, ambiguous='infer', nonexistent='shift_forward')
-    except Exception:
-        return s.dt.tz_localize(site_tz, ambiguous=False, nonexistent='shift_forward')
-
-
-def retag_to_local_tz(
-    df: pd.DataFrame, columns: list[str], site_tz: str
+def to_utc(
+    df: pd.DataFrame,
+    columns: "list[str] | str",
+    *,
+    naive_means: "str | None" = None,
 ) -> pd.DataFrame:
-    """Re-tag UTC tz-aware columns as site-local tz-aware (preserves the tz
-    metadata on disk; downstream consumers read pre-converted local-tz
-    values without an extra ``tz_convert`` call).
+    """Ensure named columns are UTC tz-aware on the returned frame.
 
-    pandas ``dt.tz_convert`` is a metadata-only operation — same UTC instants,
-    different display tag. pyarrow round-trips the tag through parquet, so a
-    column written here as ``datetime64[us, America/Chicago]`` reads back the
-    same way. Naive columns are left untouched.
+    Single canonical helper for tz normalization at every boundary in the
+    pipeline. Replaces both legacy helpers (``retag_to_local_tz`` for the
+    tz-aware → UTC metadata flip and ``localize_naive_to_site_tz`` + a
+    follow-on ``tz_convert`` for the naive site-local → UTC two-step).
 
-    Used at parquet-write boundaries in ``01_cohort.py`` (and any other
-    script that persists ``*_dttm`` columns) so ``output/{site}/*.parquet``
-    files self-document their tz convention.
+    Used at parquet-write boundaries (project convention: every ``*_dttm``
+    column on disk is ``datetime64[us, UTC]``) and at clifpy-load boundaries
+    (where ``from_file`` returns naive site-local that needs both a tz tag
+    and a UTC normalization).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Returned frame is a shallow copy with the named columns replaced.
+    columns : str | list[str]
+        Column name(s) to normalize. Missing columns are silently skipped
+        so the same call works across sites with slightly different schemas
+        (e.g., ``compute_ase`` emits more event-types at UCMC than MIMIC).
+    naive_means : str, optional
+        REQUIRED if any named column is naive (no tz tag); names the tz
+        the wall-clock is *already* in. Common values:
+
+        - ``"UTC"`` — the naive timestamp IS UTC, just missing the tag.
+        - site_tz (e.g., ``"US/Eastern"``) — clifpy's ``from_file``
+          convention, where naive wall-clock is in site-local time.
+
+        Raises ``ValueError`` if a column is naive and ``naive_means`` is
+        None (defensive: silent localization to a wrong tz would shift
+        every downstream UTC instant by 4-6 hours).
+
+    DST handling for the naive→aware step (when ``naive_means`` is set):
+
+    - **Fall-back ambiguity** (e.g., ``2024-11-03 01:30 Central`` exists
+      twice): tries ``ambiguous='infer'`` first (pandas uses neighboring
+      timestamp ordering to disambiguate); falls back to
+      ``ambiguous=False`` (= post-fall-back / standard time) if isolated
+      ambiguous values defeat ``infer``. Deterministic; matches DuckDB's
+      ``AT TIME ZONE`` fall-back resolution.
+
+    - **Spring-forward gap** (e.g., ``2024-03-10 02:30 Central`` doesn't
+      exist): shifts forward to the next valid minute via
+      ``nonexistent='shift_forward'``.
+
+    Idempotent: already-UTC columns are unchanged. Non-datetime columns
+    are silently skipped.
     """
+    if isinstance(columns, str):
+        columns = [columns]
     df = df.copy()
     for col in columns:
         if col not in df.columns:
             continue
         s = df[col]
-        if pd.api.types.is_datetime64_any_dtype(s) and s.dt.tz is not None:
-            df[col] = s.dt.tz_convert(site_tz)
+        if not pd.api.types.is_datetime64_any_dtype(s):
+            continue
+        if s.dt.tz is None:
+            if naive_means is None:
+                raise ValueError(
+                    f"Column {col!r} is naive (no tz tag); pass "
+                    f"naive_means=<tz> to disambiguate "
+                    f"(e.g., 'UTC' or site_tz)"
+                )
+            try:
+                s = s.dt.tz_localize(
+                    naive_means,
+                    ambiguous='infer',
+                    nonexistent='shift_forward',
+                )
+            except Exception:
+                s = s.dt.tz_localize(
+                    naive_means,
+                    ambiguous=False,
+                    nonexistent='shift_forward',
+                )
+        if str(s.dt.tz) != 'UTC':
+            s = s.dt.tz_convert('UTC')
+        df[col] = s
     return df
+
+
+def add_dh_hr(
+    data,
+    timestamp_col: str = "event_dttm",
+    *,
+    site_tz: str,
+):
+    """Add `_dh` (local-tz hour-floor) and `_hr` (local hour-of-day, 0-23)
+    columns to ``data`` and return the same container type.
+
+    Single source of truth for `_dh` / `_hr` derivation across the
+    pipeline. Used by ``add_day_shift_id`` for the cohort grid and
+    directly by admin-side cells in ``02_exposure.py`` that need the same
+    columns without the shift-id assignment.
+
+    Polymorphic: pandas DataFrame in → pandas DataFrame out;
+    ``DuckDBPyRelation`` in → ``DuckDBPyRelation`` out (lazy). DuckDB's
+    replacement scan resolves ``data`` in Python scope, so the SQL
+    references the input by name without an explicit register call.
+
+    Caller contract: ``data[timestamp_col]`` is UTC tz-aware
+    (``datetime64[*, UTC]`` or TIMESTAMPTZ tagged UTC). ``site_tz`` is
+    REQUIRED (keyword-only) — pass ``cfg['timezone']`` from config for
+    clinical site-local semantics. To reproduce pre-`ea911a9` (UTC-hour)
+    outputs, pass ``site_tz="UTC"`` explicitly.
+
+    All local-tz interpretation is done with explicit ``AT TIME ZONE`` in
+    SQL, so the result is invariant under DuckDB's session timezone (any
+    upstream library doing ``SET TimeZone = '...'`` cannot affect us).
+    """
+    rel = duckdb.sql(f"""
+        FROM data
+        SELECT *
+            , _dh: date_trunc('hour', {timestamp_col} AT TIME ZONE '{site_tz}')
+            , _hr: extract('hour' FROM {timestamp_col} AT TIME ZONE '{site_tz}')::INT
+    """)
+    if not isinstance(data, pd.DataFrame):
+        return rel
+    # Re-anchor the timestamp column's display tz to UTC, so the function's
+    # output dtype is deterministic regardless of DuckDB's session tz at
+    # the `.df()` boundary (when session tz != UTC, the TIMESTAMPTZ →
+    # pandas conversion tags the column with whatever session tz was set;
+    # that leaks session state into the caller's frame).
+    result = rel.df()
+    s = result[timestamp_col]
+    if pd.api.types.is_datetime64_any_dtype(s) and s.dt.tz is not None:
+        result[timestamp_col] = s.dt.tz_convert("UTC")
+    return result
 
 
 def add_day_shift_id(
@@ -74,6 +153,10 @@ def add_day_shift_id(
 
     Day shift: 7:00-19:00 site-local, Night shift: 19:00-7:00 site-local.
     _nth_day increments at each local 7am boundary.
+
+    Composes ``add_dh_hr`` for the `_dh`/`_hr` step and then assigns the
+    shift-id columns on top via window functions. The `_dh` / `_hr`
+    formula lives in ``add_dh_hr`` and only there.
 
     Caller contract: ``df[timestamp_name]`` is UTC tz-aware
     (``datetime64[*, UTC]``). ``site_tz`` is REQUIRED (keyword-only) — pass
@@ -95,15 +178,10 @@ def add_day_shift_id(
     - ``_nth_day``: running count of local 7am crossings per hospitalization.
     - ``_day_shift``: e.g., ``'day1_day'`` / ``'day2_night'``.
     """
+    with_dh = add_dh_hr(df, timestamp_name, site_tz=site_tz)
     result = duckdb.sql(f"""
-        WITH local_ts AS (
-            FROM df
-            SELECT *
-                , _dh: date_trunc('hour', {timestamp_name} AT TIME ZONE '{site_tz}')
-                , _hr: extract('hour' FROM {timestamp_name} AT TIME ZONE '{site_tz}')::INT
-        )
-        , day_starts AS (
-            FROM local_ts
+        WITH day_starts AS (
+            FROM with_dh
             SELECT *
                 , _shift: CASE WHEN _hr >= 7 AND _hr < 19 THEN 'day' ELSE 'night' END
                 , _is_day_start: CASE
