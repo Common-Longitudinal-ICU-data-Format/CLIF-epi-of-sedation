@@ -49,7 +49,8 @@ def _():
 
 @app.cell
 def _():
-    from clifpy import ClifOrchestrator, setup_logging
+    from clifpy import ClifOrchestrator
+    from _logging_setup import setup_logging
     import pandas as pd
     import duckdb
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
@@ -154,7 +155,7 @@ def _():
 
 
 @app.cell
-def _(apply_outlier_handling, cohort_hosp_ids, duckdb):
+def _(SITE_TZ, apply_outlier_handling, cohort_hosp_ids, duckdb, to_utc):
     from clifpy import Labs
 
     labs = Labs.from_file(
@@ -169,7 +170,10 @@ def _(apply_outlier_handling, cohort_hosp_ids, duckdb):
         },
     )
     apply_outlier_handling(labs, outlier_config_path='config/outlier_config.yaml')
-    labs_df = labs.df
+    # Cross-site tz normalization: to_utc with naive_means=SITE_TZ guarantees
+    # UTC tz-aware regardless of source-parquet shape (UTC-tagged,
+    # local-tagged, or naive). Same pattern used for adt/ase/hosp loads.
+    labs_df = to_utc(labs.df, ['lab_order_dttm', 'lab_result_dttm'], naive_means=SITE_TZ)
     # Materialize the pivot result as a DuckDB TEMP TABLE (perf-guide §2a/§2b).
     # The previous `.df()` round-trip handed labs_w to downstream SQL via
     # pandas replacement scan, which has no zonemap/statistics; the ASOF
@@ -232,7 +236,7 @@ def _():
 
 
 @app.cell
-def _(Labs, apply_outlier_handling, cohort_hosp_ids, duckdb):
+def _(Labs, SITE_TZ, apply_outlier_handling, cohort_hosp_ids, duckdb, to_utc):
     po2 = Labs.from_file(
         config_path='config/config.json',
         columns=[
@@ -245,7 +249,8 @@ def _(Labs, apply_outlier_handling, cohort_hosp_ids, duckdb):
         },
     )
     apply_outlier_handling(po2, outlier_config_path='config/outlier_config.yaml')
-    po2_df = po2.df
+    # Cross-site tz normalization (see labs cell for rationale).
+    po2_df = to_utc(po2.df, ['lab_order_dttm', 'lab_result_dttm'], naive_means=SITE_TZ)
     # po2_w is referenced from two downstream cells (the shift-grid ASOF join
     # AND the 24h Table 1 PaO2 cell). TEMP TABLE materialization (perf-guide
     # §2b) lets both consumers join against a stat-enriched table instead of
@@ -301,7 +306,7 @@ def _():
 
 
 @app.cell
-def _(apply_outlier_handling, cohort_hosp_ids):
+def _(SITE_TZ, apply_outlier_handling, cohort_hosp_ids, to_utc):
     from clifpy import Vitals
 
     vitals = Vitals.from_file(
@@ -313,16 +318,19 @@ def _(apply_outlier_handling, cohort_hosp_ids):
         },
     )
     apply_outlier_handling(vitals, outlier_config_path='config/outlier_config.yaml')
-    vitals_df = vitals.df
+    # Cross-site tz normalization (see labs cell for rationale).
+    vitals_df = to_utc(vitals.df, ['recorded_dttm'], naive_means=SITE_TZ)
     return (vitals_df,)
 
 
 @app.cell
 def _(
+    SITE_TZ,
     apply_outlier_handling,
     cohort_hosp_ids,
     convert_dose_units_by_med_category,
     remove_meds_duplicates,
+    to_utc,
     vitals_df,
 ):
     from clifpy import MedicationAdminContinuous
@@ -383,6 +391,8 @@ def _(
         "vasopressin": "u/min",
     }
 
+    # Cross-site tz normalization (see labs cell for rationale).
+    cont_veso.df = to_utc(cont_veso.df, ['admin_dttm'], naive_means=SITE_TZ)
     cont_veso_deduped = remove_meds_duplicates(cont_veso.df)
     _n_removed = len(cont_veso.df) - len(cont_veso_deduped)
     logger.info(
@@ -754,7 +764,7 @@ def _(CONFIG_PATH, first_icu_admit, get_config_or_params):
 
 
 @app.cell
-def _(CONFIG_PATH, apply_outlier_handling, cohort_hosp_ids, duckdb):
+def _(CONFIG_PATH, SITE_TZ, apply_outlier_handling, cohort_hosp_ids, duckdb, to_utc):
     # Cell C — Load vitals needed for BMI (height_cm + weight_kg) and P/F fallback (spo2).
     # Single combined load for efficiency; kept separate from the existing weight-only
     # `vitals_df` at the top of the Vasopressors section so we don't perturb the dose
@@ -772,7 +782,8 @@ def _(CONFIG_PATH, apply_outlier_handling, cohort_hosp_ids, duckdb):
         },
     )
     apply_outlier_handling(_vitals_t1, outlier_config_path='config/outlier_config.yaml')
-    vitals_t1_df = _vitals_t1.df
+    # Cross-site tz normalization (see labs cell for rationale).
+    vitals_t1_df = to_utc(_vitals_t1.df, ['recorded_dttm'], naive_means=SITE_TZ)
 
     # First non-null height_cm and weight_kg per hospitalization → BMI.
     # Height guarded to 50–250 cm (reject impossible values even post-outlier-handling).

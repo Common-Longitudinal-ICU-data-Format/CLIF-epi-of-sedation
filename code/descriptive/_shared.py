@@ -29,7 +29,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from clifpy import setup_logging
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _logging_setup import setup_logging  # noqa: E402
 from clifpy.utils.logging_config import get_logger
 logger = get_logger("epi_sedation.descriptive_shared")
 

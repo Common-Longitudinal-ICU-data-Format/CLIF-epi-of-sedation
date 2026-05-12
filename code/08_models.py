@@ -37,7 +37,7 @@ def _():
 @app.cell
 def _():
     from clifpy.utils.config import get_config_or_params
-    from clifpy import setup_logging
+    from _logging_setup import setup_logging
     import pandas as pd
 
     CONFIG_PATH = "config/config.json"
@@ -229,13 +229,17 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
             _df_scaled[_col] = _df_scaled[_col] / _info['scale']
 
     # ── Fit functions ──────────────────────────────────────────────────
-    # maxiter=100 raised from statsmodels defaults (Logit=35, GEE=60) so the
-    # RCS-extub-logit fit (~37 coefficients) has headroom to converge instead
-    # of stopping at the cap.
+    # maxiter=500 (statsmodels defaults: Logit=35, GEE=60). The earlier
+    # 100-iter ceiling stopped success_extub_v2 × daydose_rcs_diff short of
+    # convergence on logit + logit_asym (function value plateaued at ~0.4407
+    # with near-zero gradient). 500 gives the optimizer headroom; fits still
+    # hitting the cap here are structurally ill-conditioned rather than
+    # iteration-bound, and the NO_CONVERGE flag propagates into
+    # models_coeffs.csv (fit_status column) for downstream filtering.
     def _fit_gee(formula, data):
         m = smf.gee(formula=formula, groups='hospitalization_id',
                     data=data, family=sm.families.Binomial())
-        return m.fit(maxiter=100)
+        return m.fit(maxiter=500)
 
     def _fit_logit(formula, data):
         """Cluster-robust logit (groups=hospitalization_id).
@@ -257,7 +261,7 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
         m = smf.logit(formula=formula, data=_d)
         return m.fit(cov_type='cluster',
                      cov_kwds={'groups': _d['hospitalization_id']},
-                     maxiter=100)
+                     maxiter=500, disp=False)
 
     def _fit_logit_asym(formula, data):
         """Asymptotic-SE logit (no cluster-robust).
@@ -272,7 +276,18 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
             _names.append('hospitalization_id')
         _d = data.dropna(subset=_names)
         m = smf.logit(formula=formula, data=_d)
-        return m.fit(maxiter=100)
+        return m.fit(maxiter=500, disp=False)
+
+    def _is_converged(result):
+        # Logit exposes mle_retvals['converged']; GEE exposes result.converged.
+        # Default True when neither attribute is present (e.g. future statsmodels
+        # API change) so we never spuriously flag a fit as non-converged.
+        mle = getattr(result, 'mle_retvals', None)
+        if isinstance(mle, dict) and 'converged' in mle:
+            return bool(mle['converged'])
+        if hasattr(result, 'converged'):
+            return bool(result.converged)
+        return True
 
     # ── Dimension 1: nested covariate sets (all include exposures) ────
     # Rate-based exposures (mcg/kg/min for propofol, mcg/hr for fentanyl,
@@ -461,18 +476,22 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
                     'n_events': int(_d_for_count[_config['outcome']].sum()),
                     'n_clusters': int(_d_for_count['hospitalization_id'].nunique()),
                 }
-                logger.info(
-                    f"  OK: {_spec['label']} / {_config['outcome']} / "
+                _converged = _is_converged(_result)
+                _status = 'OK' if _converged else 'NO_CONVERGE'
+                _tag = 'OK' if _converged else 'NO_CONVERGE'
+                _log = logger.info if _converged else logger.warning
+                _log(
+                    f"  {_tag}: {_spec['label']} / {_config['outcome']} / "
                     f"{_config['model_type']} (N={int(_result.nobs)})"
                 )
                 fit_summary_rows.append({
                     'outcome': _config['outcome'],
                     'method': _config['model_type'],
                     'spec': _spec['label'],
-                    'status': 'OK',
+                    'status': _status,
                     'n_obs': int(_result.nobs),
                     'n_events': int(_d_for_count[_config['outcome']].sum()),
-                    'fail_reason': '',
+                    'fail_reason': '' if _converged else 'maxiter reached without convergence',
                 })
             except Exception as e:
                 logger.info(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
@@ -500,31 +519,35 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
     ).groupby(['method', '_fam']):
         _n_total = len(_grp)
         _n_ok = (_grp['status'] == 'OK').sum()
-        _n_fail = _n_total - _n_ok
+        _n_nc = (_grp['status'] == 'NO_CONVERGE').sum()
+        _n_fail = (_grp['status'] == 'FAIL').sum()
         _is_primary = (
             (_fam == 'SBT' and _method == 'gee') or
             (_fam == 'success_extub' and _method == 'logit')
         )
         _tag = "PRIMARY" if _is_primary else "sensitivity"
-        if _n_fail == 0:
+        if _n_fail == 0 and _n_nc == 0:
             logger.info(
                 f"  {_method:11s} ({_fam:13s}): {_n_ok}/{_n_total} OK   [{_tag}]"
             )
         else:
-            _failed_specs = _grp.loc[_grp['status'] == 'FAIL', 'spec'].tolist()
+            _bits = []
+            if _n_fail:
+                _failed_specs = _grp.loc[_grp['status'] == 'FAIL', 'spec'].tolist()
+                _bits.append(f"FAIL on: {', '.join(_failed_specs)}")
+            if _n_nc:
+                _nc_specs = _grp.loc[_grp['status'] == 'NO_CONVERGE', 'spec'].tolist()
+                _bits.append(f"NO_CONVERGE on: {', '.join(_nc_specs)}")
             logger.info(
                 f"  {_method:11s} ({_fam:13s}): {_n_ok}/{_n_total} OK   "
-                f"[{_tag}] — FAIL on: {', '.join(_failed_specs)}"
+                f"[{_tag}] — {'; '.join(_bits)}"
             )
     logger.info("=" * 70)
 
-    # Persist structured fit summary CSV (federation-safe — group-level).
-    _qc_dir = Path(f"output_to_share/{SITE_NAME}/qc")
-    _qc_dir.mkdir(parents=True, exist_ok=True)
-    _summary_df.to_csv(_qc_dir / "model_fit_summary.csv", index=False)
-    logger.info(f"Saved: {_qc_dir}/model_fit_summary.csv ({len(_summary_df)} rows)")
-
-    return HURDLE_INDICATORS, MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fit_meta, fitted, np, re
+    # fit_summary_rows threads through to the models_coeffs.csv builder cell,
+    # where its per-fit status stamps every coefficient row and a sentinel
+    # row is appended for any FAIL fit (no coefficients otherwise).
+    return HURDLE_INDICATORS, MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fit_meta, fit_summary_rows, fitted, np, re
 
 
 @app.cell
@@ -904,7 +927,7 @@ def _():
 
 @app.cell
 def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
-      cohort_merged_final, fit_meta, fitted, np, pd, re):
+      cohort_merged_final, fit_meta, fit_summary_rows, fitted, np, pd, re):
     import matplotlib.pyplot as _plt
     from patsy import dmatrix as _dmatrix
 
@@ -1159,11 +1182,20 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
         return 'adjustment_continuous'
 
     NAN = float('nan')
+    # Lookup (outcome, method, spec) → (status, fail_reason) so the per-fit
+    # convergence flag rides every coefficient row of that fit. Built once.
+    _fit_status_map = {
+        (r['outcome'], r['method'], r['spec']): (r['status'], r['fail_reason'])
+        for r in fit_summary_rows
+    }
     coeffs_rows = []
     for (_outcome, _mt), _spec_dict in fitted.items():
         for _spec_label, _result in _spec_dict.items():
             _meta = fit_meta.get((_outcome, _mt), {}).get(_spec_label, {})
             _spec_family = 'rcs' if 'rcs' in _spec_label else 'linear'
+            _status, _reason = _fit_status_map.get(
+                (_outcome, _mt, _spec_label), ('OK', '')
+            )
             _seen = set()
             for _vn in _result.params.index:
                 _logical, _role = _strip_predictor(_vn)
@@ -1242,7 +1274,37 @@ def _(HURDLE_INDICATORS, MODEL_CONFIGS, OUTCOME_SHORT, SITE_NAME, VAR_DISPLAY,
                     'n_obs': _meta.get('n_obs', 0),
                     'n_events': _meta.get('n_events', 0),
                     'n_clusters': _meta.get('n_clusters', 0),
+                    'fit_status': _status,
+                    'fail_reason': _reason,
                 })
+    # FAIL sentinels — fitted[] only has fits that produced coefficients, so
+    # exception-failed fits would otherwise vanish from the master CSV. One
+    # placeholder row per failed (outcome × method × spec) with coefficient
+    # columns NaN; fit_status='FAIL' carries the signal.
+    for _r in fit_summary_rows:
+        if _r['status'] != 'FAIL':
+            continue
+        coeffs_rows.append({
+            'outcome': _r['outcome'],
+            'model_type': _r['method'],
+            'spec': _r['spec'],
+            'spec_family': 'rcs' if 'rcs' in _r['spec'] else 'linear',
+            'predictor': NAN,
+            'row_type': NAN,
+            'log_or': NAN, 'se_log_or': NAN,
+            'unit_size': NAN, 'unit_label': '',
+            'x_ref_raw': NAN,
+            'log_or_per_unit': NAN, 'se_per_unit': NAN,
+            'or_per_unit': NAN, 'or_per_unit_lo': NAN, 'or_per_unit_hi': NAN,
+            'x10_raw': NAN, 'x90_raw': NAN,
+            'log_or_p10_p90': NAN, 'se_p10_p90': NAN,
+            'or_p10_p90': NAN, 'or_p10_p90_lo': NAN, 'or_p10_p90_hi': NAN,
+            'n_obs': _r.get('n_obs', 0),
+            'n_events': _r.get('n_events', 0),
+            'n_clusters': 0,
+            'fit_status': 'FAIL',
+            'fail_reason': _r['fail_reason'],
+        })
     coeffs_df = pd.DataFrame(coeffs_rows)
     _coeffs_path = f'output_to_share/{SITE_NAME}/models/models_coeffs.csv'
     coeffs_df.to_csv(_coeffs_path, index=False)

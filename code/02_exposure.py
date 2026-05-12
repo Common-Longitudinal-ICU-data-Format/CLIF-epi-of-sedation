@@ -91,12 +91,13 @@ def _():
 
 @app.cell
 def _():
-    from clifpy import setup_logging
+    from _logging_setup import setup_logging
     import duckdb
     from clifpy.utils.unit_converter import convert_dose_units_by_med_category
     from clifpy.utils.config import get_config_or_params
     from _utils import (
         add_dh_hr,
+        coerce_dttm_to_utc,
         mar_action_not_given_filter_sql,
         mar_action_zero_dose_sql,
         normalize_categories,
@@ -121,6 +122,7 @@ def _():
     return (
         CONFIG_PATH,
         apply_outlier_handling_duckdb,
+        coerce_dttm_to_utc,
         convert_dose_units_by_med_category,
         duckdb,
         get_config_or_params,
@@ -217,13 +219,14 @@ def _():
 
 
 @app.cell
-def _(DATA_DIR, apply_outlier_handling_duckdb, cohort_hosp_ids_rel, duckdb):
+def _(DATA_DIR, SITE_TZ, apply_outlier_handling_duckdb, coerce_dttm_to_utc,
+      cohort_hosp_ids_rel, duckdb):
     # Inline raw DuckDB read of clifpy's parquet — bypasses
-    # `clifpy.load_data` (which silently does UTC→naive-site-local via
-    # `timezone(site_tz, col)` and breaks the project's downstream
-    # `AT TIME ZONE site_tz + extract` pattern). Returns recorded_dttm as
-    # UTC TIMESTAMPTZ — same as what's actually on disk in the parquet.
-    # Predicate + projection pushdown engages via parquet zonemap.
+    # `clifpy.load_data` (slow pandas-based tz path). Predicate +
+    # projection pushdown engages via parquet zonemap.
+    # tz coercion: `coerce_dttm_to_utc` normalizes recorded_dttm to
+    # TIMESTAMPTZ UTC instant regardless of source shape (UTC tagged /
+    # local tagged / naive). For MIMIC/UCMC (UTC tagged) it's a passthrough.
     # See docs/timezone_audit.md.
     vitals_rel = duckdb.sql(f"""
         FROM '{DATA_DIR}/clif_vitals.parquet' v
@@ -235,10 +238,11 @@ def _(DATA_DIR, apply_outlier_handling_duckdb, cohort_hosp_ids_rel, duckdb):
             , v.vital_value
         WHERE v.vital_category = 'weight_kg'
     """)
+    vitals_rel = coerce_dttm_to_utc(vitals_rel, ['recorded_dttm'], SITE_TZ)
     vitals_rel = apply_outlier_handling_duckdb(
         vitals_rel, 'vitals', 'config/outlier_config.yaml',
     )
-    logger.info("Vitals (weight_kg): lazy relation built (raw DuckDB read, UTC TIMESTAMPTZ)")
+    logger.info(f"Vitals (weight_kg): lazy relation built (tz-normalized via site_tz={SITE_TZ})")
     return (vitals_rel,)
 
 
@@ -285,13 +289,15 @@ def _(DATA_DIR, duckdb):
 def _(
     DATA_DIR,
     HAS_MAR_CAT_CONT,
+    SITE_TZ,
+    coerce_dttm_to_utc,
     duckdb,
     mar_action_not_given_filter_sql,
     normalize_categories,
 ):
-    # Inline raw DuckDB read — bypasses clifpy.load_data (see vitals cell
-    # comment + docs/timezone_audit.md). admin_dttm flows downstream as
-    # UTC TIMESTAMPTZ. Predicate + projection pushdown engages.
+    # Inline raw DuckDB read — bypasses clifpy.load_data. admin_dttm is
+    # tz-normalized to UTC TIMESTAMPTZ via coerce_dttm_to_utc (handles
+    # UTC tagged / local tagged / naive sources uniformly).
     # B5: mar_action_category SELECT and WHERE both branch on column presence.
     _mar_cat_select = (
         ", c.mar_action_category" if HAS_MAR_CAT_CONT
@@ -314,6 +320,7 @@ def _(
             AND c.med_dose IS NOT NULL
             AND {_not_given_filter}
     """)
+    cont_sed_rel = coerce_dttm_to_utc(cont_sed_rel, ['admin_dttm'], SITE_TZ)
     # Normalize category casing (cross-site safety). If mar_action_category
     # is the synthetic NULL column, normalize is a no-op for it.
     cont_sed_rel = normalize_categories(
@@ -888,9 +895,9 @@ def _():
 
 
 @app.cell
-def _(DATA_DIR, cohort_hosp_ids_rel, duckdb, normalize_categories):
+def _(DATA_DIR, SITE_TZ, coerce_dttm_to_utc, cohort_hosp_ids_rel, duckdb, normalize_categories):
     # Inline raw DuckDB read — same pattern as cont_sed_rel above. admin_dttm
-    # flows downstream as UTC TIMESTAMPTZ. See docs/timezone_audit.md.
+    # tz-normalized via coerce_dttm_to_utc.
     # B5: mar_action_category is REQUIRED here — the detection cell above
     # (HAS_MAR_CAT_INTM) has already asserted presence and raised otherwise.
     intm_sed_rel = duckdb.sql(f"""
@@ -909,6 +916,7 @@ def _(DATA_DIR, cohort_hosp_ids_rel, duckdb, normalize_categories):
             AND c.med_dose IS NOT NULL
             AND c.mar_action_category != 'not_given'
     """)
+    intm_sed_rel = coerce_dttm_to_utc(intm_sed_rel, ['admin_dttm'], SITE_TZ)
     intm_sed_rel = normalize_categories(
         intm_sed_rel, ['med_category', 'mar_action_category']
     )

@@ -48,12 +48,19 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import sys
+
 import duckdb
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from clifpy import setup_logging
 from clifpy.utils.logging_config import get_logger
+
+# Make `code/` importable so we can pull the canonical _utils.to_utc for
+# cross-site tz normalization at the raw-CLIF-load boundary.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _utils import to_utc as _to_utc_load  # noqa: E402
 
 logger = get_logger("epi_sedation.weight_audit")
 
@@ -70,7 +77,15 @@ def _load_site_name() -> str:
         return json.load(f).get("site_name", "unknown").lower()
 
 
+def _load_site_tz() -> str:
+    if not CONFIG_PATH.exists():
+        return "UTC"
+    with CONFIG_PATH.open() as f:
+        return json.load(f).get("timezone", "UTC")
+
+
 SITE = os.getenv("SITE", _load_site_name())
+SITE_TZ = _load_site_tz()
 SITE_OUT = PROJECT_ROOT / "output" / SITE
 SITE_QC = SITE_OUT / "qc"
 SHARE_QC = PROJECT_ROOT / "output_to_share" / SITE / "qc"
@@ -79,11 +94,14 @@ SHARE_QC = PROJECT_ROOT / "output_to_share" / SITE / "qc"
 # alongside the weight_qc_* CSVs.
 SHARE_FIG = SHARE_QC
 
-# Per-site dual log files at output/{site}/logs/clifpy_all.log +
-# clifpy_errors.log (pyCLIF integration guide rule 1). weight_audit is
-# its own entry-point subprocess so it must call setup_logging itself.
+# Per-site dual log files at output_to_share/{site}/logs/clifpy_all.log +
+# clifpy_errors.log (Step 2 NU fix — logs co-located with the federation
+# bundle so a single-folder zip-and-upload covers everything). weight_audit
+# is its own entry-point subprocess so it must call setup_logging itself.
 SITE_OUT.mkdir(parents=True, exist_ok=True)
-setup_logging(output_directory=str(SITE_OUT))
+_share_log_dir = PROJECT_ROOT / "output_to_share" / SITE
+_share_log_dir.mkdir(parents=True, exist_ok=True)
+setup_logging(output_directory=str(_share_log_dir))
 
 # ── Drop-policy thresholds (env-var configurable) ────────────────────────
 WEIGHT_QC_MAX_JUMP_KG = float(os.getenv("WEIGHT_QC_MAX_JUMP_KG", "20"))
@@ -170,7 +188,9 @@ def load_raw_weight_events(hosp_ids: list[str]) -> pd.DataFrame:
         columns=["hospitalization_id", "recorded_dttm", "vital_value", "vital_category"],
         filters={"vital_category": ["weight_kg"], "hospitalization_id": hosp_ids},
     )
-    df = v.df
+    # Cross-site tz normalization at the raw-load boundary: guarantees
+    # recorded_dttm is UTC tz-aware regardless of source-parquet shape.
+    df = _to_utc_load(v.df, ["recorded_dttm"], naive_means=SITE_TZ)
     df = df[df["vital_value"].notna() & (df["vital_value"] > 0)].copy()
     df = df.rename(columns={"vital_value": "weight_kg_raw"})
     return df[["hospitalization_id", "recorded_dttm", "weight_kg_raw"]].sort_values(
@@ -193,7 +213,8 @@ def load_med_admins(hosp_ids: list[str]) -> pd.DataFrame:
             "hospitalization_id": hosp_ids,
         },
     )
-    return m.df
+    # Cross-site tz normalization at the raw-load boundary.
+    return _to_utc_load(m.df, ["admin_dttm"], naive_means=SITE_TZ)
 
 
 def load_weight_daily() -> pd.DataFrame:

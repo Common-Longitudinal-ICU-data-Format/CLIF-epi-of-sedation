@@ -129,28 +129,47 @@ SITE_PALETTE = [
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 # Project root is CWD by convention (matches Makefile's invocation pattern).
-SHARE_ROOT = Path("output_to_share")
+# AGG_INPUT_DIR env var overrides the input root so the Makefile can point
+# `make agg` at the shared Box folder (coordinator workflow) while
+# `make agg-local` keeps the repo-local output_to_share/ default for testing.
+SHARE_ROOT = Path(os.environ.get("AGG_INPUT_DIR", "output_to_share"))
 AGG_ROOT = Path("output_to_agg")
 AGG_FIGURES_DIR = AGG_ROOT / "figures"
 
 
 # ── Site discovery ────────────────────────────────────────────────────────
 _NON_SITE_DIRS = frozenset({
-    "figures",  # legacy pre-refactor top-level figures dir
-    "qc",       # cross-site QC PNGs/CSVs — not a site, no models/ subdir
+    "figures",       # legacy pre-refactor top-level figures dir
+    "qc",            # cross-site QC PNGs/CSVs — not a site, no models/ subdir
+    "abstract_run",  # archival snapshot in the Box share, not a real site
 })
 
 
+def _is_empty_site_dir(path: Path) -> bool:
+    """True if `path` contains no real content — used to skip placeholder
+    folders for sites that haven't uploaded results yet.
+
+    Ignores hidden / metadata entries (anything starting with '.', e.g.
+    `.DS_Store` on Box-mounted folders) so a freshly-created empty dir on
+    macOS still counts as empty.
+    """
+    return not any(not c.name.startswith(".") for c in path.iterdir())
+
+
 def list_sites() -> list[str]:
-    """Return sorted list of real site directories under output_to_share/.
+    """Return sorted list of real site directories under SHARE_ROOT.
 
     Skips:
       - leading-underscore dirs (reserved — e.g., future `_meta/` for cross-
         site helpers; also guards against `__pycache__` or similar).
-      - known non-site directories (`figures/`, `qc/`) listed in `_NON_SITE_DIRS`.
+      - known non-site directories listed in `_NON_SITE_DIRS`
+        (`figures/`, `qc/`, `abstract_run/`).
+      - empty placeholder dirs (no non-hidden contents — site folder created
+        on Box but results not yet uploaded). Logged at INFO so a missing
+        site is visible in the run output.
 
-    New sites plug in by dropping `output_to_share/<newsite>/` and rerunning
-    `make agg` — no code edit required.
+    New sites plug in by dropping `<SHARE_ROOT>/<newsite>/` (with content)
+    and rerunning `make agg` — no code edit required.
     """
     if not SHARE_ROOT.exists():
         return []
@@ -162,6 +181,9 @@ def list_sites() -> list[str]:
         if name.startswith("_"):
             continue
         if name in _NON_SITE_DIRS:
+            continue
+        if _is_empty_site_dir(child):
+            logger.info(f"Skipping empty site placeholder: {name}/")
             continue
         out.append(name)
     return sorted(out)

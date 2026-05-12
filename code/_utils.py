@@ -93,6 +93,54 @@ def to_utc(
     return df
 
 
+def coerce_dttm_to_utc(rel, columns, site_tz):
+    """DuckDB-native tz coercion for raw-CLIF-load boundaries.
+
+    Lazy `DuckDBPyRelation` sibling of :func:`to_utc` (which is pandas-side).
+    Normalizes named `*_dttm` columns to `TIMESTAMPTZ` (UTC instant)
+    regardless of source-parquet shape:
+
+    - ``TIMESTAMPTZ`` (source tagged UTC OR tagged local-tz): passthrough.
+      DuckDB's TIMESTAMPTZ stores the underlying UTC instant regardless
+      of source-parquet tz metadata, so downstream `AT TIME ZONE site_tz +
+      extract` patterns produce correct local-hour values without further
+      transformation.
+    - ``TIMESTAMP`` (naive, no tz tag): interpret the wall-clock as
+      `site_tz`-local via DuckDB's ``timezone(<tz>, <ts>)`` function,
+      returning ``TIMESTAMPTZ`` of the corresponding UTC instant. DuckDB's
+      DST handling mirrors pandas' ``tz_localize(ambiguous='infer',
+      nonexistent='shift_forward')`` defaults.
+
+    Parameters
+    ----------
+    rel : DuckDBPyRelation
+        Lazy relation; the new columns replace the named ones via
+        ``rel.project(...)``.
+    columns : str | list[str]
+        `*_dttm` column name(s) to normalize. Missing columns are silently
+        skipped.
+    site_tz : str
+        IANA timezone string from `config["timezone"]`. Used to interpret
+        naive wall-clocks as site-local time.
+
+    Returns
+    -------
+    DuckDBPyRelation
+        A new lazy relation; no materialization. Idempotent on already-
+        normalized columns.
+    """
+    if isinstance(columns, str):
+        columns = [columns]
+    schema = {n: str(t).upper() for n, t in zip(rel.columns, rel.types)}
+    parts = []
+    for col in rel.columns:
+        if col in columns and schema.get(col) == 'TIMESTAMP':  # naive
+            parts.append(f"timezone('{site_tz}', {col}) AS {col}")
+        else:
+            parts.append(col)
+    return rel.project(", ".join(parts))
+
+
 def compute_weight_qc_exclusions(
     weight_rel,
     hosp_ids,

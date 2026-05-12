@@ -58,7 +58,8 @@ def _():
 def _():
     from clifpy.utils.config import get_config_or_params
     from clifpy.utils import apply_outlier_handling
-    from clifpy import Hospitalization, setup_logging
+    from clifpy import Hospitalization
+    from _logging_setup import setup_logging
     import pandas as pd
     import numpy as np
     import duckdb

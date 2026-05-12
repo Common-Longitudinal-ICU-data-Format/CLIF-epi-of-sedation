@@ -100,7 +100,7 @@ def _():
 @app.cell
 def _():
     from clifpy.utils.config import get_config_or_params
-    from clifpy import setup_logging
+    from _logging_setup import setup_logging
     import pandas as pd
     from datetime import datetime
 

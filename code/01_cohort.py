@@ -42,6 +42,7 @@ with app.setup:
     from _utils import (
         to_utc,
         add_day_shift_id,
+        coerce_dttm_to_utc,
         compute_weight_qc_exclusions,
         normalize_categories,
         plot_consort,
@@ -78,7 +79,8 @@ def _():
 
 @app.cell
 def _():
-    from clifpy import load_data, setup_logging
+    from clifpy import load_data
+    from _logging_setup import setup_logging
     import duckdb
     from clifpy.utils.config import get_config_or_params
     from _outlier_handler import apply_outlier_handling_duckdb
@@ -159,7 +161,7 @@ def _():
 
 
 @app.cell
-def _(duckdb, load_data):
+def _(SITE_TZ, duckdb, load_data):
     # Lazy ADT load with column + ICU-category pushdown into the parquet scan.
     # hospital_id is included so the same relation can feed both ICU filtering
     # and clifpy's stitch_encounters (which requires it in adt) without a
@@ -175,6 +177,9 @@ def _(duckdb, load_data):
         return_rel=True,
         columns=['hospitalization_id', 'hospital_id', 'in_dttm', 'out_dttm', 'location_category', 'location_type'],
     )
+    # Cross-site tz normalization: naive TIMESTAMP cols are reinterpreted as
+    # SITE_TZ-local → UTC TIMESTAMPTZ; tagged sources pass through unchanged.
+    adt_rel = coerce_dttm_to_utc(adt_rel, ['in_dttm', 'out_dttm'], SITE_TZ)
     adt_rel = normalize_categories(adt_rel, ['location_category', 'location_type'])
     adt_rel = duckdb.sql("FROM adt_rel WHERE location_category = 'icu'")
     hosp_ids_w_icu_stays = [
@@ -218,7 +223,7 @@ def _():
 
 
 @app.cell
-def _(adt_rel, hosp_ids_w_icu_stays, load_data):
+def _(SITE_TZ, adt_rel, hosp_ids_w_icu_stays, load_data):
     # Encounter-stitch DEDUP filter — see markdown above. Toggle:
     # COHORT_STITCH_DEDUP_ON=0 short-circuits to identity passthrough
     # (n_dropped_stitch=None → CONSORT step 2 is omitted). Default ON.
@@ -248,6 +253,10 @@ def _(adt_rel, hosp_ids_w_icu_stays, load_data):
                 'admission_type_category', 'discharge_category',
             ],
             filters={'hospitalization_id': hosp_ids_w_icu_stays},
+        )
+        # Cross-site tz normalization (see ADT cell for rationale).
+        _hosp_rel = coerce_dttm_to_utc(
+            _hosp_rel, ['admission_dttm', 'discharge_dttm'], SITE_TZ
         )
         _hosp_df = _hosp_rel.df()
         _adt_df = adt_rel.df()
@@ -325,6 +334,7 @@ def _(adt_rel, hosp_ids_w_icu_stays, load_data):
 @app.cell
 def _(
     SITE_NAME,
+    SITE_TZ,
     load_data,
     n_dropped_stitch,
     n_unmapped_singletons,
@@ -365,13 +375,18 @@ def _(
         # underscore-prefixed cell-local relations, so we materialize the
         # filtered relation to pandas and aggregate there.
         if len(stitch_dropped_hosp_ids) > 0:
-            _resp_dropped_df = load_data(
+            _resp_dropped_rel = load_data(
                 'respiratory_support',
                 config_path='config/config.json',
                 return_rel=True,
                 columns=['hospitalization_id', 'recorded_dttm', 'device_category'],
                 filters={'hospitalization_id': stitch_dropped_hosp_ids},
-            ).df()
+            )
+            # Cross-site tz normalization (see ADT cell for rationale).
+            _resp_dropped_rel = coerce_dttm_to_utc(
+                _resp_dropped_rel, ['recorded_dttm'], SITE_TZ
+            )
+            _resp_dropped_df = _resp_dropped_rel.df()
             _resp_imv = _resp_dropped_df[
                 _resp_dropped_df['device_category'] == 'imv'
             ]
@@ -483,6 +498,7 @@ def _():
 def _(
     CONFIG_PATH,
     SITE_NAME,
+    SITE_TZ,
     apply_outlier_handling_duckdb,
     cohort_hosp_ids_post_stitch,
     load_data,
@@ -575,7 +591,10 @@ def _(
             resp_p, ['device_category', 'mode_category']
         )
         # UTC display tag (project convention — see docs/timezone_audit.md).
-        resp_p = to_utc(resp_p, ['recorded_dttm'])
+        # naive_means=SITE_TZ: for sites whose external waterfall table writes
+        # naive `recorded_dttm` (no tz tag), interpret the wall-clock as
+        # site-local before converting to UTC. No-op for tz-aware sources.
+        resp_p = to_utc(resp_p, ['recorded_dttm'], naive_means=SITE_TZ)
         # Step 1 (NU-reported fix): write the canonical internal cache after
         # Mode A's filter + normalization. 03_outcomes.py asserts this path
         # exists; without this write Mode-A site reruns crash at the assert.
@@ -627,6 +646,11 @@ def _(
             filters={"hospitalization_id": cohort_hosp_ids_post_stitch},
             site_tz="",  # skip auto-conversion; values stay UTC tz-aware
         )
+        # Cross-site tz normalization (see ADT cell for rationale). For a site
+        # whose CLIF parquet stores recorded_dttm as naive TIMESTAMP, this
+        # reinterprets the wall-clock as SITE_TZ-local and emits TIMESTAMPTZ
+        # (UTC). For tagged sources (MIMIC/UCMC) it is a passthrough.
+        _resp_rel = coerce_dttm_to_utc(_resp_rel, ['recorded_dttm'], SITE_TZ)
         # Normalize category casing at load (cross-site safety). UCMC and
         # MIMIC deliver these lowercase; a new CLIF site whose loader
         # leaves 'IMV' / 'Pressure Support/CPAP' mixed-case would
@@ -858,7 +882,7 @@ def _(
 
 
 @app.cell
-def _(cohort_hosp_ids_pre_weight, duckdb, load_data):
+def _(SITE_TZ, cohort_hosp_ids_pre_weight, duckdb, load_data):
     # Cell B — weight-presence exclusion (upfront, runtime).
     # Drop hospitalizations with ZERO non-null weight_kg rows in vitals so the
     # first-pass cohort already excludes hosps that can never produce weight-
@@ -876,6 +900,10 @@ def _(cohort_hosp_ids_pre_weight, duckdb, load_data):
             'vital_category': ['weight_kg'],
             'hospitalization_id': cohort_hosp_ids_pre_weight,
         },
+    )
+    # Cross-site tz normalization (see ADT cell for rationale).
+    weight_presence_rel = coerce_dttm_to_utc(
+        weight_presence_rel, ['recorded_dttm'], SITE_TZ
     )
     cohort_hosp_ids_w_weight = [
         r[0] for r in duckdb.sql("""
@@ -1308,7 +1336,7 @@ def _():
 
 
 @app.cell
-def _(DATA_DIR, duckdb):
+def _(DATA_DIR, SITE_TZ, duckdb):
     # Inline raw DuckDB read of clifpy's parquet — mirrors 02_exposure.py's
     # pattern. Bypasses clifpy.load_data (which silently does
     # UTC→naive-site-local conversion and breaks downstream
@@ -1328,6 +1356,10 @@ def _(DATA_DIR, duckdb):
             , med_dose_unit
         WHERE med_category IN ('cisatracurium', 'vecuronium', 'rocuronium')
     """)
+    # Cross-site tz normalization: for sites whose CLIF parquet stores
+    # admin_dttm as naive TIMESTAMP, reinterpret wall-clock as SITE_TZ-local
+    # and emit TIMESTAMPTZ (UTC). Passthrough for tagged sources.
+    nmb_rel = coerce_dttm_to_utc(nmb_rel, ['admin_dttm'], SITE_TZ)
     if logger.isEnabledFor(logging.DEBUG):
         _n = nmb_rel.count("*").fetchone()[0]
         logger.debug(f"NMB records: {_n:,}")

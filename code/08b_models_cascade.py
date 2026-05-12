@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
-from clifpy import setup_logging
+from _logging_setup import setup_logging
 from clifpy.utils.config import get_config_or_params
 from clifpy.utils.logging_config import get_logger
 from patsy import dmatrix
