@@ -139,10 +139,15 @@ def _(cohort_hrly_grids):
 
 
 @app.cell
-def _(SITE_NAME, pd):
+def _(SITE_NAME, duckdb):
+    # Step 2 (scalability): scan via DuckDB instead of materializing the full
+    # parquet to pandas. At 1M-source-DB scale this resp_p can be 28-56 GB.
+    # Downstream uses (ASOF JOINs at the P/F and PaO2 cells) are mo.sql which
+    # work natively on DuckDBPyRelation via marimo's replacement scan.
     resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
-    resp_p = pd.read_parquet(resp_processed_path)
-    logger.info(f"resp_p: {len(resp_p)} rows (from {resp_processed_path})")
+    resp_p = duckdb.sql(f"FROM '{resp_processed_path}'")
+    _n_rows = resp_p.count('*').fetchone()[0]
+    logger.info(f"resp_p: {_n_rows} rows (from {resp_processed_path}; DuckDBPyRelation)")
     return (resp_p,)
 
 

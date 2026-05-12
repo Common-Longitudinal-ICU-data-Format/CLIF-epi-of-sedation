@@ -43,6 +43,10 @@ def _():
     CONFIG_PATH = "config/config.json"
     cfg = get_config_or_params(CONFIG_PATH)
     SITE_NAME = cfg['site_name'].lower()
+    # Mirror of 03_outcomes.py's flag (see that file for full rationale).
+    # When false, the v2 outcome family (success_extub_v2, sbt_done_v2) is
+    # all-zero in the modeling dataset, and 08 explicitly skips those fits.
+    ENABLE_V2_OUTCOMES = bool(cfg.get('enable_v2_outcomes', True))
 
     # Site-scoped output dirs (see Makefile SITE= flag).
     # Path B++ refactor: every modeling artifact lands under {site}/models/.
@@ -50,8 +54,8 @@ def _():
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     # Per-site dual log files (pyCLIF integration guide rule 1).
     setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
-    logger.info(f"Site: {SITE_NAME}")
-    return SITE_NAME, pd
+    logger.info(f"Site: {SITE_NAME}; enable_v2_outcomes: {ENABLE_V2_OUTCOMES}")
+    return ENABLE_V2_OUTCOMES, SITE_NAME, pd
 
 
 @app.cell
@@ -215,7 +219,7 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
+def _(ENABLE_V2_OUTCOMES, SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
     import statsmodels.formula.api as smf
     import statsmodels.api as sm
     import numpy as np
@@ -460,6 +464,28 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
         _key = (_config['outcome'], _config['model_type'])
         fitted[_key] = {}
         fit_meta[_key] = {}
+        # SKIP_V2 path: when enable_v2_outcomes=false, the *_v2_next_day
+        # columns are all-zero placeholders from 03_outcomes.py. Fitting on a
+        # constant outcome would produce singular-matrix errors or nonsense
+        # coefficients; explicitly skip and record SKIPPED_V2 status so the
+        # operator can confirm the flag took effect. Forest + marginal-effect
+        # plots for v2 outcomes do not render in this mode.
+        if (not ENABLE_V2_OUTCOMES) and '_v2_next_day' in _config['outcome']:
+            for _spec in COVARIATE_SPECS:
+                fit_summary_rows.append({
+                    'outcome': _config['outcome'],
+                    'method': _config['model_type'],
+                    'spec': _spec['label'],
+                    'status': 'SKIPPED_V2',
+                    'n_obs': 0,
+                    'n_events': 0,
+                    'fail_reason': 'enable_v2_outcomes=false',
+                })
+            logger.info(
+                f"  SKIPPED_V2: {_config['outcome']} / {_config['model_type']} "
+                f"(all {len(COVARIATE_SPECS)} specs)"
+            )
+            continue
         for _spec in COVARIATE_SPECS:
             _formula = _spec['formula'].replace('{{outcome}}', _config['outcome'])
             # Replicate the dropna logic used by _fit_logit / _fit_logit_asym
@@ -468,6 +494,53 @@ def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
             if 'hospitalization_id' not in _names_in_formula:
                 _names_in_formula.append('hospitalization_id')
             _d_for_count = _df_scaled.dropna(subset=_names_in_formula)
+
+            # Pre-fit singularity check (Step 3) — LINEAR SPECS ONLY.
+            # RCS specs use cr() basis which is INHERENTLY rank-deficient by
+            # construction (basis columns span a continuous space with
+            # built-in linear dependencies). statsmodels handles this via
+            # iterative regularization; a naive np.linalg.matrix_rank check
+            # would false-flag every RCS spec as singular even when the fit
+            # converges fine. Restrict the check to linear specs where
+            # rank-deficiency genuinely predicts fit failure. The truly-
+            # singular failures observed at NU (per F11) were on the linear
+            # `sofa` spec, not on RCS — so this scope is exactly right.
+            # Rank check is O(n_cols^3) — trivial vs the iterative cost.
+            _is_rcs = 'rcs' in _spec['label']
+            _is_singular = False
+            _rank = _ncols = 0
+            if not _is_rcs:
+                try:
+                    import patsy
+                    _y_dm, _x_dm = patsy.dmatrices(
+                        _formula, _d_for_count, return_type='dataframe'
+                    )
+                    _x_arr = _x_dm.values
+                    _rank = int(np.linalg.matrix_rank(_x_arr, tol=1e-10))
+                    _ncols = int(_x_arr.shape[1])
+                    _is_singular = _rank < _ncols
+                except Exception:
+                    # If we can't even build the design matrix, let the
+                    # fit_fn handle the failure path; don't pre-judge.
+                    _is_singular = False
+
+            if _is_singular:
+                logger.warning(
+                    f"  SKIP_SINGULAR: {_spec['label']} / {_config['outcome']} / "
+                    f"{_config['model_type']} — design matrix rank "
+                    f"{_rank}/{_ncols} (deficient)"
+                )
+                fit_summary_rows.append({
+                    'outcome': _config['outcome'],
+                    'method': _config['model_type'],
+                    'spec': _spec['label'],
+                    'status': 'SKIP_SINGULAR',
+                    'n_obs': len(_d_for_count),
+                    'n_events': int(_d_for_count[_config['outcome']].sum()),
+                    'fail_reason': f'design matrix rank {_rank}/{_ncols}',
+                })
+                continue
+
             try:
                 _result = _config['fit_fn'](_formula, _df_scaled)
                 fitted[_key][_spec['label']] = _result

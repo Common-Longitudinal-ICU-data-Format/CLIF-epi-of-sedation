@@ -53,6 +53,7 @@ def _():
     os.makedirs("output", exist_ok=True)
     return (
         CONFIG_PATH,
+        duckdb,
         get_config_or_params,
         normalize_categories,
         pd,
@@ -73,6 +74,14 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # matches the ventilator-liberation literature (Esteban, Thille,
     # ABC-trial); set to 24 in the per-site config for sensitivity.
     REINTUB_WINDOW_HRS = cfg['reintub_window_hrs']
+    # V2 outcome family (success_extub_v2, sbt_done_v2, exit_mechanism_v2_based)
+    # is SENSITIVITY-ONLY — no manuscript primary depends on it. Large sites
+    # (≥50K cohort) should set `enable_v2_outcomes: false` to skip the V2
+    # state-machine cell entirely (saves ~7 min at NU scale; ~110 min at
+    # 200K cohort scale). When false, V2-suffix columns are emitted as
+    # constant zero so downstream schema stays stable; 08_models.py skips
+    # *_v2_next_day outcome fits explicitly.
+    ENABLE_V2_OUTCOMES = bool(cfg.get('enable_v2_outcomes', True))
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     # Per-site dual log files at output/{site}/logs/clifpy_all.log +
     # clifpy_errors.log. Each numbered script runs in its own subprocess,
@@ -80,7 +89,8 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # rule 1). Idempotent; output_directory is site-scoped.
     setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ}); reintub window: {REINTUB_WINDOW_HRS}h")
-    return REINTUB_WINDOW_HRS, SITE_NAME, SITE_TZ
+    logger.info(f"enable_v2_outcomes: {ENABLE_V2_OUTCOMES}")
+    return ENABLE_V2_OUTCOMES, REINTUB_WINDOW_HRS, SITE_NAME, SITE_TZ
 
 
 @app.cell(hide_code=True)
@@ -92,27 +102,38 @@ def _():
 
 
 @app.cell
-def _(SITE_NAME, normalize_categories, pd):
+def _(SITE_NAME, duckdb, normalize_categories):
     resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
     assert os.path.exists(resp_processed_path), (
         f"Missing {resp_processed_path} — run 01_cohort.py first"
     )
-    resp_p = pd.read_parquet(resp_processed_path)
-    # Tracheostomy dtype normalization — defensive against an older parquet
-    # written before the 01_cohort.py canonicalization. Source may be BOOL /
-    # INT / FLOAT / VARCHAR-of-bool / VARCHAR-of-numeric / VARCHAR-of-yesno.
-    # Two-branch check covers all known shapes; NU's float source ('1.0'/
-    # '0.0') previously got coerced to 0 → empty 'tracheostomy' exit bucket.
-    _as_num = pd.to_numeric(resp_p['tracheostomy'], errors='coerce')
-    _as_str = resp_p['tracheostomy'].astype(str).str.strip().str.lower()
-    resp_p['tracheostomy'] = (
-        (_as_num.fillna(0) > 0) | _as_str.isin({'true', 't', 'yes', 'y'})
-    ).astype(int)
-    # Defensive normalize: even though 01_cohort.py now lowercases at load,
-    # this script can also be run standalone against an older parquet that
-    # might predate that fix.
+    # Step 2 (scalability): scan via DuckDB instead of materializing the full
+    # parquet to pandas. At 1M-source-DB scale this resp_p can be 28-56 GB —
+    # pandas OOMs; DuckDB streams. Downstream `FROM resp_p` mo.sql cells work
+    # equivalently on DuckDBPyRelation via marimo's replacement scan. The V2
+    # state machine cell (if enabled) materializes its own pandas copy via
+    # `resp_p.df()`.
+    resp_p = duckdb.sql(f"FROM '{resp_processed_path}'")
+    # F5 tracheostomy dtype normalization — ported to SQL REPLACE so it
+    # composes with the DuckDB relation. Same two-branch logic as the prior
+    # pandas implementation: numeric > 0 OR string match in the truthy set.
+    # TRY_CAST returns NULL on non-numeric values (instead of throwing), so
+    # the numeric branch fails cleanly on VARCHAR sources and the string
+    # branch picks them up.
+    resp_p = duckdb.sql("""
+        FROM resp_p
+        SELECT * REPLACE (
+            CASE
+                WHEN TRY_CAST(tracheostomy AS DOUBLE) > 0 THEN 1
+                WHEN LOWER(CAST(tracheostomy AS VARCHAR)) IN ('true', 't', 'yes', 'y') THEN 1
+                ELSE 0
+            END :: INTEGER AS tracheostomy
+        )
+    """)
+    # Defensive category normalize (polymorphic — DuckDBPyRelation in / out).
     resp_p = normalize_categories(resp_p, ['device_category', 'mode_category'])
-    logger.info(f"resp_p: {len(resp_p)} rows from {resp_processed_path}")
+    _n_rows = resp_p.count('*').fetchone()[0]
+    logger.info(f"resp_p: {_n_rows} rows from {resp_processed_path} (DuckDBPyRelation)")
     return (resp_p,)
 
 
@@ -501,14 +522,32 @@ def _():
 
 
 @app.cell
-def _(count_intubations_v2, pd, resp_p):
+def _(ENABLE_V2_OUTCOMES, count_intubations_v2, pd, resp_p):
     # Apply state machine per hospitalization. group_keys=False preserves the
     # original index so we can concat back to resp_p without realignment.
-    _sorted = resp_p.sort_values(['hospitalization_id', 'recorded_dttm']).reset_index(drop=True)
-    _events = _sorted.groupby('hospitalization_id', group_keys=False).apply(
-        count_intubations_v2
-    )
-    resp_p_v2 = pd.concat([_sorted, _events], axis=1)
+    # ENABLE_V2_OUTCOMES=False short-circuit: emit constant-zero v2 event
+    # columns and skip the ~7-min pandas state machine entirely. Downstream
+    # SQL aggregations (sbt_t5_v2, etc.) continue to execute on the all-zero
+    # inputs and emit all-zero v2 outcome columns — schema stays stable for
+    # cross-site agg scripts. 08_models.py skips the *_v2_next_day outcome
+    # fits explicitly (does NOT attempt to fit on constant-zero outcomes).
+    #
+    # resp_p is a DuckDBPyRelation (Step 2 of the scalability refactor);
+    # materialize to pandas once here. At 1M-source-DB scale this is bounded
+    # by the cohort size (~28-56 GB at 100-200K cohort) — still large but
+    # consumed only by the V2 cell when enabled, never module-level.
+    _resp_pdf = resp_p.df()
+    _sorted = _resp_pdf.sort_values(['hospitalization_id', 'recorded_dttm']).reset_index(drop=True)
+    if ENABLE_V2_OUTCOMES:
+        _events = _sorted.groupby('hospitalization_id', group_keys=False).apply(
+            count_intubations_v2
+        )
+        resp_p_v2 = pd.concat([_sorted, _events], axis=1)
+    else:
+        resp_p_v2 = _sorted.assign(
+            _intub_event_v2=0, _extub_event_v2=0, _trach_event_v2=0,
+        )
+        logger.info("V2 state machine SKIPPED (enable_v2_outcomes=false)")
     logger.info(
         f"resp_p_v2: {len(resp_p_v2)} rows | "
         f"_intub_event_v2 fired on {int(resp_p_v2['_intub_event_v2'].sum())} rows | "
