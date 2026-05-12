@@ -117,8 +117,36 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # + clifpy_errors.log. setup_logging is idempotent; we call it explicitly
     # here (replaces the ClifOrchestrator instantiation side effect that the
     # prior version relied on) so the output_directory is site-scoped.
-    setup_logging(output_directory=f"output/{SITE_NAME}")
+    setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
+
+    # Step 5 (cache-state banner): tell the operator at a glance which
+    # heavy step will recompute vs reuse, and which load Mode the resp
+    # waterfall will take (A=external / B=cache / C=fresh).
+    import datetime as _dt
+    _resp_cache = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
+    if os.path.exists(_resp_cache):
+        _st = os.stat(_resp_cache)
+        _mb = _st.st_size / (1024 * 1024)
+        _mtime = _dt.datetime.fromtimestamp(_st.st_mtime).strftime('%Y-%m-%d %H:%M')
+        _cache_status = f"EXISTS ({_mb:,.1f} MB, written {_mtime})"
+    else:
+        _cache_status = "ABSENT — will be created"
+    _external = PATH_TO_WATERFALL_PROCESSED_RESP_TABLE
+    _external_present = bool(_external) and os.path.exists(_external)
+    if _external_present:
+        _mode = "A (external — load from config path, write internal cache)"
+    elif os.path.exists(_resp_cache) and not RERUN_WATERFALL:
+        _mode = "B (internal cache reuse)"
+    else:
+        _mode = "C (fresh waterfall recompute)"
+    logger.info("=" * 60)
+    logger.info("Cache state at entry (01_cohort.py):")
+    logger.info(f"  rerun_waterfall (config):                    {RERUN_WATERFALL}")
+    logger.info(f"  path_to_waterfall_processed_resp_table:      {_external or '(not set)'}")
+    logger.info(f"  cohort_resp_processed_bf.parquet:            {_cache_status}")
+    logger.info(f"  → Effective mode: {_mode}")
+    logger.info("=" * 60)
     return DATA_DIR, SITE_NAME, SITE_TZ
 
 
@@ -460,6 +488,7 @@ def _(
     load_data,
 ):
     from clifpy import RespiratorySupport
+    import pandas as pd  # used by trach-dtype normalization in Mode A and Mode C
 
     resp_processed_path = f"output/{SITE_NAME}/cohort_resp_processed_bf.parquet"
 
@@ -526,13 +555,20 @@ def _(
                 f"{_n_target - _n_actual:,} hospitalizations."
             )
         resp_p = _resp_df.to_pandas()
-        # Tracheostomy dtype normalization (Bug C) — incoming may be BOOL,
-        # INT, or VARCHAR-of-bool depending on how the external table was
-        # produced. Coerce all to int8 for downstream SQL compatibility.
-        _trach_str = resp_p['tracheostomy'].astype(str).str.lower()
+        # Tracheostomy dtype normalization (Bug C + Step 0 NU fix) — source
+        # may be BOOL / INT / FLOAT / VARCHAR-of-bool / VARCHAR-of-int /
+        # VARCHAR-of-float / VARCHAR-of-yesno. The two-branch check covers
+        # all known shapes: numeric coercion (handles bool/int/float/'1'/
+        # '1.0') OR lowercased-string match (handles 'True'/'Yes'). NU
+        # stores trach as float ('1.0'/'0.0') which the prior
+        # `.isin({'true','1','t'})` check missed → entire trach cohort
+        # silently coerced to 0 and exit_mechanism='tracheostomy' was
+        # empty in NU's Table 1.
+        _as_num = pd.to_numeric(resp_p['tracheostomy'], errors='coerce')
+        _as_str = resp_p['tracheostomy'].astype(str).str.strip().str.lower()
         resp_p['tracheostomy'] = (
-            _trach_str.isin({'true', '1', 't'}).astype('int8')
-        )
+            (_as_num.fillna(0) > 0) | _as_str.isin({'true', 't', 'yes', 'y'})
+        ).astype('int8')
         # Category casing (B4) — defensive against external sources that
         # haven't applied the lowercase convention.
         resp_p = normalize_categories(
@@ -540,7 +576,17 @@ def _(
         )
         # UTC display tag (project convention — see docs/timezone_audit.md).
         resp_p = to_utc(resp_p, ['recorded_dttm'])
-        logger.info(f"resp_p: {len(resp_p):,} rows (Mode A — external)")
+        # Step 1 (NU-reported fix): write the canonical internal cache after
+        # Mode A's filter + normalization. 03_outcomes.py asserts this path
+        # exists; without this write Mode-A site reruns crash at the assert.
+        # The on-disk parquet is schema-indistinguishable from Mode C's
+        # output (same column set, same dtypes, same UTC tz tag) so
+        # downstream consumers can't tell which Mode produced it.
+        pl.from_pandas(resp_p).write_parquet(resp_processed_path)
+        logger.info(
+            f"resp_p: {len(resp_p):,} rows (Mode A — external); "
+            f"wrote canonical cache to {resp_processed_path}"
+        )
     elif not os.path.exists(resp_processed_path) or RERUN_WATERFALL:
         # Mode C — fresh waterfall. Load via clifpy.utils.io.load_data with
         # site_tz="" to skip the
@@ -609,10 +655,14 @@ def _(
         # forces a VARCHAR→INT implicit cast that chokes on 'False'. Coerce
         # to int{0,1} here so the parquet has a single canonical INT type
         # regardless of warm/cold path (also fixes 03_outcomes.py).
-        _trach_str = cohort_resp_p.df['tracheostomy'].astype(str).str.lower()
+        # Robust truth check (Step 0): handles bool / int / float / numeric
+        # string / yes-no string. NU stores trach as float ('1.0'/'0.0')
+        # which the old `.isin({'true','1','t'})` check missed.
+        _as_num = pd.to_numeric(cohort_resp_p.df['tracheostomy'], errors='coerce')
+        _as_str = cohort_resp_p.df['tracheostomy'].astype(str).str.strip().str.lower()
         cohort_resp_p.df['tracheostomy'] = (
-            _trach_str.isin({'true', '1', 't'}).astype('int8')
-        )
+            (_as_num.fillna(0) > 0) | _as_str.isin({'true', 't', 'yes', 'y'})
+        ).astype('int8')
         # Re-tag recorded_dttm to UTC display tag at the parquet-write
         # boundary (project convention: every *_dttm column on disk is
         # UTC tz-aware — see docs/timezone_audit.md). Same UTC instants;

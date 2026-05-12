@@ -78,7 +78,7 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # clifpy_errors.log. Each numbered script runs in its own subprocess,
     # so each must call setup_logging itself (pyCLIF integration guide
     # rule 1). Idempotent; output_directory is site-scoped.
-    setup_logging(output_directory=f"output/{SITE_NAME}")
+    setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ}); reintub window: {REINTUB_WINDOW_HRS}h")
     return REINTUB_WINDOW_HRS, SITE_NAME, SITE_TZ
 
@@ -98,11 +98,16 @@ def _(SITE_NAME, normalize_categories, pd):
         f"Missing {resp_processed_path} — run 01_cohort.py first"
     )
     resp_p = pd.read_parquet(resp_processed_path)
-    # tracheostomy can arrive as BOOL (warm clifpy), INT, or VARCHAR-of-bool
-    # ('True'/'False' from cold waterfall recompute via Python str()).
-    # Normalize all three to int{0,1} via lowercase-string match.
-    _trach_raw = resp_p['tracheostomy'].astype(str).str.lower()
-    resp_p['tracheostomy'] = _trach_raw.isin({'true', '1', 't'}).astype(int)
+    # Tracheostomy dtype normalization — defensive against an older parquet
+    # written before the 01_cohort.py canonicalization. Source may be BOOL /
+    # INT / FLOAT / VARCHAR-of-bool / VARCHAR-of-numeric / VARCHAR-of-yesno.
+    # Two-branch check covers all known shapes; NU's float source ('1.0'/
+    # '0.0') previously got coerced to 0 → empty 'tracheostomy' exit bucket.
+    _as_num = pd.to_numeric(resp_p['tracheostomy'], errors='coerce')
+    _as_str = resp_p['tracheostomy'].astype(str).str.strip().str.lower()
+    resp_p['tracheostomy'] = (
+        (_as_num.fillna(0) > 0) | _as_str.isin({'true', 't', 'yes', 'y'})
+    ).astype(int)
     # Defensive normalize: even though 01_cohort.py now lowercases at load,
     # this script can also be run standalone against an older parquet that
     # might predate that fix.

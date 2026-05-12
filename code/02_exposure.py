@@ -11,7 +11,7 @@
 import marimo
 
 __generated_with = "0.22.5"
-app = marimo.App(width="full", sql_output="polars")
+app = marimo.App(width="full", sql_output="native")
 
 with app.setup:
     import marimo as mo
@@ -27,6 +27,49 @@ with app.setup:
     # log lines under the project namespace.
     from clifpy.utils.logging_config import get_logger
     logger = get_logger("epi_sedation.exposure")
+
+    # Single source of truth for the 5 expected sedatives + their preferred
+    # post-conversion units. Drives BOTH:
+    #   (a) clifpy's `convert_dose_units_by_med_category(preferred_units=...)`
+    #       — what unit each drug is normalized to.
+    #   (b) `PIVOT_WIDER ... ON med_category_unit IN (value_list)` — what
+    #       columns the pivot is GUARANTEED to produce, even if a site
+    #       has zero rows for one of the drugs (would otherwise crash
+    #       downstream SQL with `Referenced column not found`).
+    # Adding/removing a drug here automatically flows through to both
+    # call sites + the IN list, with no separate "expected cols" registry
+    # to keep in sync.
+    CONT_SED_PREFERRED_UNITS = {
+        'propofol':      'mcg/kg/min',
+        'midazolam':     'mg/min',
+        'fentanyl':      'mcg/min',
+        'hydromorphone': 'mg/min',
+        'lorazepam':     'mg/min',
+    }
+    INTM_SED_PREFERRED_UNITS = {
+        'propofol':      'mcg/kg',
+        'midazolam':     'mg',
+        'fentanyl':      'mcg',
+        'hydromorphone': 'mg',
+        'lorazepam':     'mg',
+    }
+
+    def _expected_pivot_cols(preferred_units, suffix):
+        """Build the expected pivot column names from a preferred_units dict.
+
+        Mirrors the pivot's column-name builder:
+            <drug> || '_' || replace(<unit>, '/', '_') || '_' || <suffix>
+        Returns the list passed to `PIVOT_WIDER ... ON col IN (...)` so
+        the pivot output schema is deterministic regardless of which
+        drugs appear in the underlying data.
+        """
+        return [
+            f"{drug}_{unit.replace('/', '_')}_{suffix}"
+            for drug, unit in preferred_units.items()
+        ]
+
+    CONT_EXPECTED_PIVOT_COLS = _expected_pivot_cols(CONT_SED_PREFERRED_UNITS, 'cont')
+    INTM_EXPECTED_PIVOT_COLS = _expected_pivot_cols(INTM_SED_PREFERRED_UNITS, 'intm')
 
 
 @app.cell(hide_code=True)
@@ -101,7 +144,7 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # clifpy_all.log + clifpy_errors.log. setup_logging is idempotent; we
     # call it explicitly here (instead of via ClifOrchestrator's __init__
     # side effect) so the output_directory is site-scoped.
-    setup_logging(output_directory=f"output/{SITE_NAME}")
+    setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
     return DATA_DIR, SITE_NAME, SITE_TZ
 
@@ -431,16 +474,14 @@ def _(cont_sed_with_weight, convert_dose_units_by_med_category):
     #     boundary in the next cell.
     #   - cont_sed_convert_summary: lazy relation surfacing per-category
     #     unit-mapping counts. Exposed publicly for inspection.
-    _cont_sed_preferred_units = {
-        'propofol': 'mcg/kg/min',
-        'midazolam': 'mg/min',
-        'fentanyl': 'mcg/min',
-        'hydromorphone': 'mg/min',
-        'lorazepam': 'mg/min',
-    }
+    #
+    # `CONT_SED_PREFERRED_UNITS` is hoisted to setup scope so it's the
+    # single source of truth for both this conversion AND the pivot's
+    # IN list (line ~650 cont_sed_w) that guarantees the expected
+    # columns exist even for sites without all 5 drugs.
     cont_sed_converted_rel, cont_sed_convert_summary = convert_dose_units_by_med_category(
         cont_sed_with_weight,
-        preferred_units=_cont_sed_preferred_units,
+        preferred_units=CONT_SED_PREFERRED_UNITS,
         override=True,
         return_rel=True,
     )
@@ -450,6 +491,20 @@ def _(cont_sed_with_weight, convert_dose_units_by_med_category):
 @app.cell
 def _(cont_sed_convert_summary):
     cont_sed_convert_summary
+    return
+
+
+@app.cell
+def _(SITE_NAME, cont_sed_convert_summary):
+    # Persist the convert summary to output_to_share/{site}/qc/ so sites'
+    # uploaded bundles include per-(drug, source-unit) conversion counts.
+    # Federation-safe: group-level counts only, no IDs.
+    _qc_dir = Path(f"output_to_share/{SITE_NAME}/qc")
+    _qc_dir.mkdir(parents=True, exist_ok=True)
+    cont_sed_convert_summary.pl().write_csv(
+        _qc_dir / "cont_sed_convert_summary.csv"
+    )
+    logger.info(f"Saved: {_qc_dir}/cont_sed_convert_summary.csv")
     return
 
 
@@ -534,11 +589,11 @@ def _(cohort_meta_by_id_imvhr, cont_sed_with_dh):
         """
     )
     if logger.isEnabledFor(logging.DEBUG):
-        # cont_sed_with_dh is a DuckDBPyRelation (.count("*").fetchone());
-        # cont_sed_within_imv comes from mo.sql under sql_output="polars",
-        # so it's a Polars DataFrame and len() is the right call.
+        # Both cont_sed_with_dh and cont_sed_within_imv are DuckDBPyRelation
+        # (sql_output="native"). Use .count("*").fetchone() for row counts —
+        # a cheap scalar query that doesn't materialize the relation.
         _n_before = cont_sed_with_dh.count("*").fetchone()[0]
-        _n_after = len(cont_sed_within_imv)
+        _n_after = cont_sed_within_imv.count("*").fetchone()[0]
         logger.debug(
             f"cont_sed within-IMV filter: {_n_before:,} → {_n_after:,} rows "
             f"({(_n_before - _n_after) / _n_before * 100 if _n_before else 0.0:.2f}% off-IMV dropped)"
@@ -584,8 +639,9 @@ def _(cont_sed_outliered, imv_starts):
         """
     )
     if logger.isEnabledFor(logging.DEBUG):
-        # Polars DataFrame from mo.sql — len() not .count("*").
-        logger.debug(f"cont_sed ASOF starter rates: {len(cont_sed_starter_rates):,} rows injected")
+        # DuckDBPyRelation (sql_output="native") — scalar count via .count().
+        _n_starter = cont_sed_starter_rates.count("*").fetchone()[0]
+        logger.debug(f"cont_sed ASOF starter rates: {_n_starter:,} rows injected")
     return (cont_sed_starter_rates,)
 
 
@@ -640,15 +696,50 @@ def _():
     #
     # NOTE: stop events forced to dose=0 so forward-fill doesn't propagate
     # stale rates (audit H1).
+    #
+    # `ON med_category_unit IN (...)` — explicit value list pinned from
+    # CONT_EXPECTED_PIVOT_COLS (derived from CONT_SED_PREFERRED_UNITS in
+    # setup scope). Guarantees all 5 expected drug columns are produced
+    # even at sites with zero rows for one of the drugs; missing drugs
+    # become NULL columns that COALESCE down to 0 through the existing
+    # cont chain. Without this, downstream SQL referencing the drug by
+    # name (cont_sed_per_event:757-761, merge cell:1099-1119) would crash
+    # with `Referenced column not found`.
+    _cont_in_list = ", ".join(f"'{c}'" for c in CONT_EXPECTED_PIVOT_COLS)
     cont_sed_w = mo.sql(
         f"""
         PIVOT_WIDER cont_sed_long
-        ON med_category_unit
+        ON med_category_unit IN ({_cont_in_list})
         USING AVG(med_dose)
         ORDER BY hospitalization_id, event_dttm
         """
     )
     return (cont_sed_w,)
+
+
+@app.cell
+def _(cont_sed_w, duckdb):
+    # Diagnostics: log WARN per all-NULL drug column. Cheap scalar SQL on
+    # the lazy relation (5 COUNT-FILTER queries). Pure observability — no
+    # materialization, no downstream effect. A NULL-only column means the
+    # site has zero post-conversion rows for that drug; downstream COALESCE
+    # treats it as zero exposure but operators may want to verify upstream
+    # ETL (e.g., a misspelled med_category mapping) rather than silently
+    # accept it.
+    for _col in CONT_EXPECTED_PIVOT_COLS:
+        _n_non_null = duckdb.sql(
+            f"FROM cont_sed_w SELECT COUNT(*) FILTER (WHERE {_col} IS NOT NULL)"
+        ).fetchone()[0]
+        if _n_non_null == 0:
+            _drug = _col.split('_')[0]
+            logger.warning(
+                f"Drug column '{_col}' is all NULL — this site has zero "
+                f"continuous {_drug} admin rows in the cohort. Downstream "
+                f"treats as zero exposure. Verify upstream ETL "
+                f"(med_category mapping, outlier filter) if this is "
+                f"unexpected."
+            )
+    return
 
 
 @app.cell
@@ -883,17 +974,14 @@ def _(convert_dose_units_by_med_category, intm_sed_deduped, vitals_rel):
     # units because they roll into fenteq/midazeq equivalency sums in
     # absolute units, not per-kg. `vitals_df=vitals_rel` provides the
     # per-bolus ASOF weight that clifpy's mcg/kg converter needs.
-    _intm_sed_preferred_units = {
-        'propofol': 'mcg/kg',
-        'midazolam': 'mg',
-        'fentanyl': 'mcg',
-        'hydromorphone': 'mg',
-        'lorazepam': 'mg',
-    }
+    #
+    # `INTM_SED_PREFERRED_UNITS` is hoisted to setup scope (see header) —
+    # single source of truth for both this conversion AND the intm pivot's
+    # IN list at intm_sed_w.
     intm_sed_converted_rel, intm_sed_convert_summary = convert_dose_units_by_med_category(
         intm_sed_deduped,
         vitals_df=vitals_rel,
-        preferred_units=_intm_sed_preferred_units,
+        preferred_units=INTM_SED_PREFERRED_UNITS,
         override=True,
         return_rel=True,
     )
@@ -903,6 +991,19 @@ def _(convert_dose_units_by_med_category, intm_sed_deduped, vitals_rel):
 @app.cell
 def _(intm_sed_convert_summary):
     intm_sed_convert_summary
+    return
+
+
+@app.cell
+def _(SITE_NAME, intm_sed_convert_summary):
+    # Persist the intm convert summary alongside the cont one. Same QC
+    # purpose: cross-site verification of unit-mapping per drug.
+    _qc_dir = Path(f"output_to_share/{SITE_NAME}/qc")
+    _qc_dir.mkdir(parents=True, exist_ok=True)
+    intm_sed_convert_summary.pl().write_csv(
+        _qc_dir / "intm_sed_convert_summary.csv"
+    )
+    logger.info(f"Saved: {_qc_dir}/intm_sed_convert_summary.csv")
     return
 
 
@@ -979,8 +1080,15 @@ def _():
     # Pivot intermittent sedation to wide format. F4 fix: the column-name
     # builder embeds `_hr_intm` directly so the SUM-per-hour step
     # downstream produces final names without rename. After SUM-per-hour,
-    # `propofol_mg_hr_intm` represents total mg delivered that hour from
+    # `propofol_mcg_kg_intm` (post F2: weight-adjusted) and the other
+    # `*_intm` columns represent the amount delivered that hour from
     # intermittent admin.
+    #
+    # `ON med_category_unit IN (...)` — explicit value list pinned from
+    # INTM_EXPECTED_PIVOT_COLS (derived from INTM_SED_PREFERRED_UNITS in
+    # setup scope). Same robustness guarantee as the cont pivot: missing
+    # drugs become NULL columns, downstream COALESCE treats as zero.
+    _intm_in_list = ", ".join(f"'{c}'" for c in INTM_EXPECTED_PIVOT_COLS)
     intm_sed_w = mo.sql(
         f"""
         WITH t1 AS (
@@ -994,12 +1102,32 @@ def _():
             , med_dose: CASE WHEN mar_action_category = 'not_given' THEN 0 ELSE med_dose END
         )
         PIVOT_WIDER t1
-        ON med_category_unit
+        ON med_category_unit IN ({_intm_in_list})
         USING AVG(med_dose)
         ORDER BY hospitalization_id, event_dttm
         """
     )
     return (intm_sed_w,)
+
+
+@app.cell
+def _(duckdb, intm_sed_w):
+    # Diagnostics: WARN per all-NULL intm drug column. Mirror of the cont
+    # cell above — cheap scalar COUNT-FILTER queries, no materialization.
+    for _col in INTM_EXPECTED_PIVOT_COLS:
+        _n_non_null = duckdb.sql(
+            f"FROM intm_sed_w SELECT COUNT(*) FILTER (WHERE {_col} IS NOT NULL)"
+        ).fetchone()[0]
+        if _n_non_null == 0:
+            _drug = _col.split('_')[0]
+            logger.warning(
+                f"Drug column '{_col}' is all NULL — this site has zero "
+                f"intermittent {_drug} admin rows in the cohort. Downstream "
+                f"treats as zero exposure. Verify upstream ETL "
+                f"(med_category mapping, outlier filter) if this is "
+                f"unexpected."
+            )
+    return
 
 
 @app.cell
@@ -1167,32 +1295,70 @@ def _(seddose_by_id_imvhr, duckdb):
         logger.info("M1 clinical-ceiling clamp DISABLED (SEDDOSE_CLAMP=0)")
         seddose_by_id_imvhr_clamped = seddose_by_id_imvhr
     else:
+        # Step 4: enriched clamp logging. For each ceiling column compute
+        # in one scalar SQL pass: count above ceiling, total rows, plus
+        # p50/p95/max of the PRE-CLAMP distribution among violators. The
+        # pre-clamp percentiles tell operators if the overage is mild
+        # (close to ceiling → likely real edge case) vs wild (≫ ceiling
+        # → likely weight-error or unit-conversion bug). On-disk parquet
+        # caps via LEAST() so stored values never exceed the ceiling —
+        # these percentiles describe the ORIGINAL magnitudes.
+        _total = duckdb.sql(
+            "FROM seddose_by_id_imvhr SELECT COUNT(*)"
+        ).fetchone()[0]
+        _clamp_rows = []  # for the qc/m1_clamp_summary.csv
         for _col, _ceil in _ceilings.items():
-            _n_above = duckdb.sql(
-                f"FROM seddose_by_id_imvhr SELECT COUNT(*) WHERE {_col} > {_ceil}"
-            ).fetchone()[0]
+            _stats = duckdb.sql(f"""
+                FROM seddose_by_id_imvhr
+                SELECT
+                    COUNT(*) FILTER (WHERE {_col} > {_ceil})                       AS n_above
+                    , quantile_cont({_col}, 0.50) FILTER (WHERE {_col} > {_ceil})  AS p50_above
+                    , quantile_cont({_col}, 0.95) FILTER (WHERE {_col} > {_ceil})  AS p95_above
+                    , MAX({_col})                  FILTER (WHERE {_col} > {_ceil}) AS max_above
+            """).fetchone()
+            _n_above, _p50_above, _p95_above, _max_above = _stats
+            _pct = _n_above / _total * 100 if _total else 0
+            _clamp_rows.append({
+                'column': _col, 'ceiling': _ceil,
+                'n_above': _n_above, 'n_total': _total, 'pct_above': round(_pct, 4),
+                'p50_above': _p50_above, 'p95_above': _p95_above, 'max_above': _max_above,
+            })
             if _n_above > 0:
                 logger.warning(
-                    f"M1 clinical-ceiling clamp: capping {_n_above:,} "
-                    f"patient-hours where {_col} > {_ceil} to the ceiling. "
-                    f"Likely weight-error or unit-conversion bug — investigate "
-                    f"if count exceeds 0.5% of total."
+                    f"M1 clamp [{_col}]: {_n_above:,} / {_total:,} ({_pct:.3f}%) "
+                    f"above ceiling {_ceil}. Pre-clamp distribution among "
+                    f"violators — p50={_p50_above:.1f}, p95={_p95_above:.1f}, "
+                    f"max={_max_above:.1f}. (On disk: LEAST(col, {_ceil}) — "
+                    f"parquet caps at {_ceil}; these percentiles describe "
+                    f"ORIGINAL magnitudes to help diagnose severity.) "
+                    f"p50 close to {_ceil} → likely real edge case; p50 ≫ "
+                    f"{_ceil} → likely weight-error or unit-conversion bug. "
+                    f"Investigate if proportion > 0.5%."
                 )
             else:
                 logger.info(
-                    f"M1 clinical-ceiling clamp: 0 rows above {_col} ceiling "
-                    f"({_ceil}) — no clamp applied to this column."
+                    f"M1 clamp [{_col}]: 0 / {_total:,} above ceiling {_ceil} "
+                    f"— no cap applied."
                 )
+        # Persist structured summary CSV — federation-safe (per-ceiling
+        # aggregates only, no IDs).
+        import polars as _pl_clamp_qc
+        _qc_dir = Path(f"output_to_share/{SITE_NAME}/qc")
+        _qc_dir.mkdir(parents=True, exist_ok=True)
+        _pl_clamp_qc.DataFrame(_clamp_rows).write_csv(
+            _qc_dir / "m1_clamp_summary.csv"
+        )
+        logger.info(f"Saved: {_qc_dir}/m1_clamp_summary.csv")
         _replace_clauses = ", ".join(
             f"LEAST({col}, {ceil}) AS {col}" for col, ceil in _ceilings.items()
         )
-        # `.pl()` materializes to Polars DataFrame so downstream cells
-        # (sed_dose_agg via mo.sql, the write cell via .with_columns) see a
-        # consistent type whether or not the clamp was applied.
+        # Stay lazy — return a DuckDBPyRelation. Downstream sed_dose_agg
+        # consumes it via mo.sql replacement scan; the terminal write cell
+        # materializes to Polars only at the parquet-write boundary.
         seddose_by_id_imvhr_clamped = duckdb.sql(f"""
             FROM seddose_by_id_imvhr
             SELECT * REPLACE ({_replace_clauses})
-        """).pl()
+        """)
         logger.info("M1 clinical-ceiling clamp APPLIED (SEDDOSE_CLAMP=1)")
     return (seddose_by_id_imvhr_clamped,)
 
@@ -1295,12 +1461,16 @@ def _():
     Terminal materialization. UTC-everywhere on disk: every `*_dttm`
     column is written as UTC TIMESTAMPTZ. `seddose_by_id_imvday` has no
     `*_dttm` columns. `seddose_by_id_imvhr` has `event_dttm` (UTC from
-    the cohort grid join). Per the new convention, DuckDB's parquet
-    writer's UTC normalization is exactly what we want — but
-    `sql_output="polars"` makes both relations Polars DataFrames at this
-    point, so we go through Polars `write_parquet` uniformly with an
-    explicit `convert_time_zone("UTC")` to make the UTC-on-disk tag
-    intent obvious. See `docs/timezone_audit.md`.
+    the cohort grid join).
+
+    Under `sql_output="native"`, every upstream `mo.sql` cell returns a
+    lazy `DuckDBPyRelation` — the full cont/intm pipelines stay
+    unmaterialized through pivot, forward-fill, per-hour aggregation,
+    M1 clamp, per-shift aggregation, and pivot-to-day/night. The write
+    cell below materializes to Polars exactly ONCE per output file via
+    `.pl()`, then applies `convert_time_zone("UTC")` (Polars metadata
+    op, no row scan) and calls `.write_parquet(...)` (Polars preserves
+    the tz tag). See `docs/timezone_audit.md`.
 
     Phase 2 (2026-05-07): `sed_dose_agg.parquet` is no longer written.
     Its per-shift dose totals were already mirrored as separate day/night
@@ -1314,13 +1484,21 @@ def _():
 def _(SITE_NAME, seddose_by_id_imvday, seddose_by_id_imvhr, seddose_by_id_imvhr_clamped):
     import polars as pl  # cell-local — used only for the tz-bearing parquet write
 
-    seddose_by_id_imvday.write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvday.parquet")
+    # Under sql_output="native" (post Step 2), the inputs are all lazy
+    # DuckDBPyRelations. Materialize to Polars right at the write boundary
+    # via `.pl()` so we can apply `convert_time_zone("UTC")` (Polars
+    # metadata op, no row scan) before `.write_parquet(...)`. Polars'
+    # parquet writer preserves the tz tag, matching the project's
+    # UTC-everywhere convention (docs/timezone_audit.md).
+    seddose_by_id_imvday.pl().write_parquet(
+        f"output/{SITE_NAME}/seddose_by_id_imvday.parquet"
+    )
 
     # Canonical per-hour parquet: clamped (or pass-through if SEDDOSE_CLAMP=0).
     # This is what every downstream consumer reads (descriptive scripts,
     # 05_modeling_dataset.py via the daily roll-up).
     (
-        seddose_by_id_imvhr_clamped
+        seddose_by_id_imvhr_clamped.pl()
         .with_columns(pl.col("event_dttm").dt.convert_time_zone("UTC"))
         .write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr.parquet")
     )
@@ -1330,7 +1508,7 @@ def _(SITE_NAME, seddose_by_id_imvday, seddose_by_id_imvhr, seddose_by_id_imvhr_
     # re-running the pipeline with SEDDOSE_CLAMP=0. When SEDDOSE_CLAMP=0 the
     # two files have identical contents (M1 cell is a pass-through).
     (
-        seddose_by_id_imvhr
+        seddose_by_id_imvhr.pl()
         .with_columns(pl.col("event_dttm").dt.convert_time_zone("UTC"))
         .write_parquet(f"output/{SITE_NAME}/seddose_by_id_imvhr_raw.parquet")
     )

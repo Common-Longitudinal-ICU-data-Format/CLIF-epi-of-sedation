@@ -49,7 +49,7 @@ def _():
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     # Per-site dual log files (pyCLIF integration guide rule 1).
-    setup_logging(output_directory=f"output/{SITE_NAME}")
+    setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME}")
     return SITE_NAME, pd
 
@@ -215,7 +215,7 @@ def _():
 
 
 @app.cell
-def _(VAR_DISPLAY, cohort_merged_final, pd):
+def _(SITE_NAME, VAR_DISPLAY, cohort_merged_final, pd):
     import statsmodels.formula.api as smf
     import statsmodels.api as sm
     import numpy as np
@@ -438,6 +438,9 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
     # models_coeffs.csv for downstream inverse-variance meta-analysis.
     fitted = {}
     fit_meta = {}
+    # Step 6: collect per-fit status into a structured table for end-of-loop
+    # summary + qc/model_fit_summary.csv.
+    fit_summary_rows = []
     for _config in MODEL_CONFIGS:
         _key = (_config['outcome'], _config['model_type'])
         fitted[_key] = {}
@@ -462,8 +465,65 @@ def _(VAR_DISPLAY, cohort_merged_final, pd):
                     f"  OK: {_spec['label']} / {_config['outcome']} / "
                     f"{_config['model_type']} (N={int(_result.nobs)})"
                 )
+                fit_summary_rows.append({
+                    'outcome': _config['outcome'],
+                    'method': _config['model_type'],
+                    'spec': _spec['label'],
+                    'status': 'OK',
+                    'n_obs': int(_result.nobs),
+                    'n_events': int(_d_for_count[_config['outcome']].sum()),
+                    'fail_reason': '',
+                })
             except Exception as e:
                 logger.info(f"  FAIL: {_spec['label']} / {_config['outcome']} / {_config['model_type']}: {e}")
+                fit_summary_rows.append({
+                    'outcome': _config['outcome'],
+                    'method': _config['model_type'],
+                    'spec': _spec['label'],
+                    'status': 'FAIL',
+                    'n_obs': len(_d_for_count),
+                    'n_events': int(_d_for_count[_config['outcome']].sum()),
+                    'fail_reason': str(e)[:200],  # truncate long tracebacks
+                })
+
+    # Aggregated summary block — per-method OK/FAIL counts so the operator
+    # can read primary-vs-sensitivity status at a glance without grepping
+    # individual FAIL lines. Primary: SBT outcomes = GEE; success_extub = logit.
+    _summary_df = pd.DataFrame(fit_summary_rows)
+    logger.info("=" * 70)
+    logger.info("Model fit summary (per outcome × method):")
+    _outcome_family = lambda o: (
+        'SBT' if 'sbt_done' in o else 'success_extub' if 'success_extub' in o else 'other'
+    )
+    for (_method, _fam), _grp in _summary_df.assign(
+        _fam=_summary_df['outcome'].map(_outcome_family)
+    ).groupby(['method', '_fam']):
+        _n_total = len(_grp)
+        _n_ok = (_grp['status'] == 'OK').sum()
+        _n_fail = _n_total - _n_ok
+        _is_primary = (
+            (_fam == 'SBT' and _method == 'gee') or
+            (_fam == 'success_extub' and _method == 'logit')
+        )
+        _tag = "PRIMARY" if _is_primary else "sensitivity"
+        if _n_fail == 0:
+            logger.info(
+                f"  {_method:11s} ({_fam:13s}): {_n_ok}/{_n_total} OK   [{_tag}]"
+            )
+        else:
+            _failed_specs = _grp.loc[_grp['status'] == 'FAIL', 'spec'].tolist()
+            logger.info(
+                f"  {_method:11s} ({_fam:13s}): {_n_ok}/{_n_total} OK   "
+                f"[{_tag}] — FAIL on: {', '.join(_failed_specs)}"
+            )
+    logger.info("=" * 70)
+
+    # Persist structured fit summary CSV (federation-safe — group-level).
+    _qc_dir = Path(f"output_to_share/{SITE_NAME}/qc")
+    _qc_dir.mkdir(parents=True, exist_ok=True)
+    _summary_df.to_csv(_qc_dir / "model_fit_summary.csv", index=False)
+    logger.info(f"Saved: {_qc_dir}/model_fit_summary.csv ({len(_summary_df)} rows)")
+
     return HURDLE_INDICATORS, MODEL_CONFIGS, SBT_VARIANT_OUTCOMES, fit_meta, fitted, np, re
 
 

@@ -48,7 +48,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 # Per-site dual log files (pyCLIF integration guide rule 1). Even though
 # this script is shelved from `make run`, the standalone `make cascade`
 # target still calls it and needs the same logging contract.
-setup_logging(output_directory=f"output/{SITE_NAME}")
+setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
 logger.info(f"Site: {SITE_NAME}")
 
 

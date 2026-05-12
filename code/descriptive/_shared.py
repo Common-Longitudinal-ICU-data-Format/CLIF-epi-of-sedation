@@ -59,7 +59,7 @@ SITE_NAME = _load_site_name()
 # unknown-site fallback above so a missing config doesn't crash imports.
 if SITE_NAME != "unknown":
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
-    setup_logging(output_directory=f"output/{SITE_NAME}")
+    setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
 
 # ── Paths (project root is CWD by convention) ──
 # All outputs are site-scoped so multiple sites coexist on disk (see the

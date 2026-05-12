@@ -86,11 +86,33 @@ def _(CONFIG_PATH, get_config_or_params, setup_logging):
     # Per-site dual log files at output/{site}/logs/clifpy_all.log +
     # clifpy_errors.log (pyCLIF integration guide rule 1 — call once
     # per entry-point subprocess).
-    setup_logging(output_directory=f"output/{SITE_NAME}")
+    setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME} (tz: {SITE_TZ})")
-    logger.info(
-        f"Cache-bypass flags: RERUN_SOFA_24H={RERUN_SOFA_24H}, RERUN_ASE={RERUN_ASE}"
-    )
+
+    # Step 5 (cache-state banner): tell the operator at a glance whether
+    # SOFA and ASE will recompute vs reuse cache.
+    import datetime as _dt
+    def _cache_status(path):
+        if os.path.exists(path):
+            _st = os.stat(path)
+            _mb = _st.st_size / (1024 * 1024)
+            _mtime = _dt.datetime.fromtimestamp(_st.st_mtime).strftime('%Y-%m-%d %H:%M')
+            return f"EXISTS ({_mb:,.1f} MB, written {_mtime})"
+        return "ABSENT — will be created"
+
+    _sofa_path = f"output/{SITE_NAME}/sofa_first_24h.parquet"
+    _ase_path = f"output/{SITE_NAME}/covariates_ase.parquet"
+    _sofa_will_recompute = (not os.path.exists(_sofa_path)) or RERUN_SOFA_24H
+    _ase_will_recompute = (not os.path.exists(_ase_path)) or RERUN_ASE
+    logger.info("=" * 60)
+    logger.info("Cache state at entry (04_covariates.py):")
+    logger.info(f"  rerun_sofa_24h (config):    {RERUN_SOFA_24H}")
+    logger.info(f"  rerun_ase (config):         {RERUN_ASE}")
+    logger.info(f"  sofa_first_24h.parquet:     {_cache_status(_sofa_path)}")
+    logger.info(f"  covariates_ase.parquet:     {_cache_status(_ase_path)}")
+    logger.info(f"  → SOFA action: {'RECOMPUTE' if _sofa_will_recompute else 'REUSE CACHE'}")
+    logger.info(f"  → ASE action:  {'RECOMPUTE' if _ase_will_recompute else 'REUSE CACHE'}")
+    logger.info("=" * 60)
     return SITE_NAME, SITE_TZ
 
 

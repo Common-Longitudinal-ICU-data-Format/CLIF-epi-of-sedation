@@ -79,7 +79,7 @@ def _():
     os.makedirs(f"output/{SITE_NAME}", exist_ok=True)
     os.makedirs(f"output_to_share/{SITE_NAME}/models", exist_ok=True)
     # Per-site dual log files (pyCLIF integration guide rule 1).
-    setup_logging(output_directory=f"output/{SITE_NAME}")
+    setup_logging(output_directory=f"output_to_share/{SITE_NAME}")
     logger.info(f"Site: {SITE_NAME}")
     return (
         BIN_EDGES,
