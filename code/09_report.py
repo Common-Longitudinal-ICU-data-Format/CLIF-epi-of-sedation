@@ -358,9 +358,26 @@ def _(SITE_NAME, pd):
 
 @app.cell
 def _(SITE_NAME, pd):
-    # Table 1 (from 06_table1.py) — tableone CSV has hierarchical 2-col format
-    table1_df = pd.read_csv(f"output_to_share/{SITE_NAME}/models/table1.csv")
-    # Replace NaN with empty string for cleaner display
+    _cont = pd.read_csv(f"output_to_share/{SITE_NAME}/models/table1_continuous.csv")
+    _cat = pd.read_csv(f"output_to_share/{SITE_NAME}/models/table1_categorical.csv")
+    rows = []
+    for _, r in _cont.iterrows():
+        rows.append({
+            "Variable": r["variable"],
+            "Value": f"{r['mean']:.1f} ({r['sd']:.1f}), median {r['median']:.1f} [{r['q1']:.1f}–{r['q3']:.1f}]",
+        })
+    _prev_var = None
+    for _, r in _cat.iterrows():
+        label = f"  {r['category']}" if r["variable"] == _prev_var else r["variable"]
+        if r["variable"] != _prev_var:
+            rows.append({"Variable": r["variable"], "Value": ""})
+            label = f"  {r['category']}"
+        rows.append({
+            "Variable": label,
+            "Value": f"{int(r['n'])} ({r['pct']:.1f}%)",
+        })
+        _prev_var = r["variable"]
+    table1_df = pd.DataFrame(rows)
     table1_df = table1_df.fillna('')
     logger.info(f"Table 1: {len(table1_df)} rows, {len(table1_df.columns)} cols")
     return (table1_df,)

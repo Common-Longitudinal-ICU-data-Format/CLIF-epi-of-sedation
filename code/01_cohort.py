@@ -539,7 +539,8 @@ def _(
             resp_p, ['device_category', 'mode_category']
         )
         # UTC display tag (project convention — see docs/timezone_audit.md).
-        resp_p = to_utc(resp_p, ['recorded_dttm'])
+        resp_p = to_utc(resp_p, ['recorded_dttm'], naive_means=SITE_TZ)
+        resp_p.to_parquet(resp_processed_path)
         logger.info(f"resp_p: {len(resp_p):,} rows (Mode A — external)")
     elif not os.path.exists(resp_processed_path) or RERUN_WATERFALL:
         # Mode C — fresh waterfall. Load via clifpy.utils.io.load_data with
@@ -617,7 +618,7 @@ def _(
         # boundary (project convention: every *_dttm column on disk is
         # UTC tz-aware — see docs/timezone_audit.md). Same UTC instants;
         # tz_convert is metadata-only.
-        cohort_resp_p.df = to_utc(cohort_resp_p.df, ["recorded_dttm"])
+        cohort_resp_p.df = to_utc(cohort_resp_p.df, ["recorded_dttm"], naive_means=SITE_TZ)
         cohort_resp_p.df.to_parquet(resp_processed_path)
         resp_p = cohort_resp_p.df
     else:
