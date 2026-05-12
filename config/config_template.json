@@ -7,5 +7,6 @@
     "path_to_waterfall_processed_resp_table": null,
     "rerun_waterfall": false,
     "rerun_sofa_24h": false,
-    "rerun_ase": false
+    "rerun_ase": false,
+    "enable_v2_outcomes": true
 }
