@@ -258,6 +258,13 @@ def _(SITE_TZ, adt_rel, hosp_ids_w_icu_stays, load_data):
         _hosp_rel = coerce_dttm_to_utc(
             _hosp_rel, ['admission_dttm', 'discharge_dttm'], SITE_TZ
         )
+        # Category normalization (cross-site safety). UCMC/MIMIC deliver
+        # lowercase, but a new CLIF site with mixed-case discharge_category
+        # ('Expired' vs 'expired') would silently break any downstream
+        # equality filter. Same load-boundary pattern as line 660.
+        _hosp_rel = normalize_categories(
+            _hosp_rel, ['admission_type_category', 'discharge_category']
+        )
         _hosp_df = _hosp_rel.df()
         _adt_df = adt_rel.df()
 
@@ -385,6 +392,13 @@ def _(
             # Cross-site tz normalization (see ADT cell for rationale).
             _resp_dropped_rel = coerce_dttm_to_utc(
                 _resp_dropped_rel, ['recorded_dttm'], SITE_TZ
+            )
+            # Category normalization (cross-site safety). The `== 'imv'`
+            # equality filter below assumes lowercase; a new CLIF site
+            # delivering 'IMV' would silently return zero stitch-dropped
+            # IMV rows. Mirrors the line-660 pattern on the main resp load.
+            _resp_dropped_rel = normalize_categories(
+                _resp_dropped_rel, ['device_category']
             )
             _resp_dropped_df = _resp_dropped_rel.df()
             _resp_imv = _resp_dropped_df[
