@@ -15,8 +15,8 @@ Multi-site analysis of diurnal variation in sedation practices in mechanically v
   - macOS/Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
   - Windows: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
 3. rename `config/config_template.json` to `config/config.json` and fill in `site_name`, `data_directory`, `filetype`, `timezone`
-  1. if you did not make significant updates to your `respiratory_support` table since last run in Novemember and you still have a copy of the waterfall-processed table from that run (default location should be `output/intermediate/resp_processed.parquet`), you can point the `path_to_waterfall_processed_resp_table` config towards it to bypass the waterfall step.
-  2. likewise if you have a relatively large cohort you can set `enable_v2_outcomes: false` to skip some computationally intensive sensitivity analyses.
+    - if you did not make significant updates to your `respiratory_support` table since last run in Novemember and you still have a copy of the waterfall-processed table from that run (default location should be `output/intermediate/resp_processed.parquet`), you can point the `path_to_waterfall_processed_resp_table` config towards it to bypass the waterfall step.
+  - likewise if you have a relatively large cohort you can set `enable_v2_outcomes: false` to skip some computationally intensive sensitivity analyses.
 4. run `make run` from the command line
 5. Upload `output_to_share/<site_name>/` to the project's Box folder (include `logs/clifpy_all.log` + `clifpy_errors.log` if crashed)
 
