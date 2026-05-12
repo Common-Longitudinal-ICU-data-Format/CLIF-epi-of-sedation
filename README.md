@@ -75,8 +75,8 @@ output_to_share/{site}/              — federated outputs (safe to ship)
 After `make run` completes, ship the entire `output_to_share/{site}/` folder to the coordinator. The federated agg pipeline (`code/agg/`) reads only this directory and never touches `output/{site}/`.
 
 If `make run` crashes at any step, also include both log files:
-- `output/{site}/logs/clifpy_all.log`
-- `output/{site}/logs/clifpy_errors.log`
+- `output_to_share/{site}/logs/clifpy_all.log`
+- `output_to_share/{site}/logs/clifpy_errors.log`
 
 Both files are produced per-script per-subprocess (pyCLIF logging integration guide rule 1), so even a mid-pipeline crash captures the failing script's trace.
 
@@ -87,8 +87,10 @@ Single-pass orchestration after the B3 refactor. No more 2-pass weight-audit dan
 ```
 01_cohort.py → 02_exposure.py → 03_outcomes.py → 04_covariates.py
             → 05_modeling_dataset.py → 06_table1.py → 08_models.py
-            → code/descriptive/*.py → 09_report.py
+            → code/descriptive/*.py
 ```
+
+`09_report.py` (PDF compilation) is intentionally shelved from `make run` — invoke `make report SITE=...` explicitly when the bundled PDF is wanted. Same opt-in pattern as `08b_models_cascade.py`.
 
 Per-script roles:
 
@@ -167,14 +169,17 @@ make run SITE=<your-site>    # swap to your <site>_config.json
 Other targets:
 
 ```bash
-make tables       # fast refresh of Table 1 + descriptive + report (skips 01, 03, 08)
+make tables       # fast refresh of Table 1 + descriptive (skips 01, 03, 08; no PDF)
 make table1       # even faster: just 04 + 05 + 06
-make report       # PDF-only from cached CSVs/PNGs (no compute)
-make descriptive  # run all code/descriptive/*.py + rebuild PDF
+make report       # PDF compilation from cached CSVs/PNGs (no compute)
+make descriptive  # run all code/descriptive/*.py (no PDF)
 make cascade      # run 08b_models_cascade.py (shelved; only if reviewing the 4-stage)
 make weight-diagnostic  # federated weight-availability audit CSVs/PNG
+make trach-funnel       # federated trach-bucket diagnostic (only if exit_mechanism='tracheostomy' looks empty)
 make agg          # Phase-2 cross-site pooling (coordinator-side; reads output_to_share/<site>/)
 ```
+
+`make report` is the only target that runs `09_report.py`. The main `make run` pipeline ends at the descriptive scripts; the PDF is an explicit opt-in (rationale: presentation layer over already-written CSVs/PNGs; ~30-page matplotlib render is wasteful when iterating on upstream stages).
 
 The `SITE=` flag works on every target (via the shared `_switch` prerequisite).
 
@@ -225,7 +230,7 @@ After a successful `make run`:
 If `make run` crashed:
 
 - `output_to_share/{site}/` (whatever was produced before the crash).
-- `output/{site}/logs/clifpy_all.log` and `output/{site}/logs/clifpy_errors.log`.
+- `output_to_share/{site}/logs/clifpy_all.log` and `output_to_share/{site}/logs/clifpy_errors.log`.
 
 The two log files together let the coordinator diagnose the failure without needing PHI access.
 

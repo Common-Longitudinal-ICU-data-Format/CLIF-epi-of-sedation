@@ -366,3 +366,4 @@ secrets.json
 _build/
 _static/
 _templates/
+.claude/scheduled_tasks.lock

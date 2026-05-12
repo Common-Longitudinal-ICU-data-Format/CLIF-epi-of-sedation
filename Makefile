@@ -1,4 +1,4 @@
-.PHONY: mo run table1 tables report descriptive cascade qc weight-audit weight-diagnostic agg clean-legacy _switch _descriptive_scripts
+.PHONY: mo run table1 tables report descriptive cascade qc weight-audit weight-diagnostic trach-funnel agg agg-local clean-legacy _switch _descriptive_scripts _agg_run
 
 # ── Site selection ───────────────────────────────────────────────────
 # Usage:
@@ -53,7 +53,12 @@ _switch:
 	fi
 
 # ── Phase 1: per-site pipeline ───────────────────────────────────────
-# Full pipeline: 01 → 09 in a single pass.
+# Pipeline: 01 → 08 + descriptive scripts. PDF report generation (09)
+# is intentionally EXCLUDED — invoke `make report` explicitly when the
+# bundled PDF is wanted. The rationale: the report is a presentation
+# layer over already-written CSVs/PNGs and slow (matplotlib renders 30+
+# pages); running it on every `make run` is wasteful when a site is
+# iterating on upstream stages.
 #
 # B3 refactor (2026-05): weight-QC value checks are now computed INSIDE
 # 01_cohort.py via `_utils.compute_weight_qc_exclusions`. The prior 2-pass
@@ -94,7 +99,9 @@ run: _switch
 	# the 4-stage cascade is deferred analysis. Run on demand via
 	# `make cascade SITE=...` if a re-investigation is needed.
 	$(MAKE) _descriptive_scripts
-	uv run python code/09_report.py
+	# 09_report.py is INTENTIONALLY shelved from `make run` — the
+	# bundled PDF is a presentation layer over already-written CSVs/PNGs.
+	# Run on demand via `make report SITE=...` when the PDF is wanted.
 
 # Fast Table 1-only refresh — skip 01–03 since their outputs don't change here
 table1: _switch
@@ -110,29 +117,31 @@ table1: _switch
 cascade: _switch
 	uv run python code/08b_models_cascade.py
 
-# Refresh all tables + descriptive outputs + compiled PDF
-# (common iterate-and-share workflow).
+# Refresh all tables + descriptive outputs.
+# (common iterate-and-share workflow.)
 # Includes 02_exposure because we track n_hours columns that flow into 05/07.
+# PDF report generation is INTENTIONALLY EXCLUDED — invoke `make report`
+# explicitly when the bundled PDF is wanted (same rationale as `make run`).
 tables: _switch
 	uv run python code/02_exposure.py
 	uv run python code/04_covariates.py
 	uv run python code/05_modeling_dataset.py
 	uv run python code/06_table1.py
 	$(MAKE) _descriptive_scripts
-	uv run python code/09_report.py
 
 # Regenerate just the PDF from existing CSVs/PNGs (fastest, no compute)
 report: _switch
 	uv run python code/09_report.py
 
-# Run only the per-figure scripts under code/descriptive/ and rebuild the PDF.
+# Run only the per-figure scripts under code/descriptive/.
 # Assumes 05_modeling_dataset.py has already run for the active site — each
 # descriptive script reads output/{site}/exposure_dataset.parquet (and some
 # read modeling_dataset.parquet). Skips the
 # expensive 01–08 compute. Useful for iterating on the nocturnal up-titration
 # figures (histograms, stacked bars, subcohort table) without re-running models.
+# PDF report generation is INTENTIONALLY EXCLUDED — invoke `make report`
+# explicitly when the bundled PDF is wanted.
 descriptive: _switch _descriptive_scripts
-	uv run python code/09_report.py
 
 # Internal: glob every *.py under code/descriptive/ (skipping _shared.py and
 # other _-prefixed helpers) and run them in turn. Exits on first failure.
@@ -148,8 +157,21 @@ _descriptive_scripts:
 # ── Phase 2: cross-site aggregation (coordinator-side) ───────────────
 # Follows the VC convention from vc_proj_patterns.md §6 — aggregation
 # scripts live in code/agg/ and write to output_to_agg/. Reads each site's
-# output_to_share/<site>/ folder read-only; never runs pipeline scripts
+# <input_root>/<site>/ folder read-only; never runs pipeline scripts
 # (01–09). Phase 1 (per-site runs) is complete by the time this runs.
+#
+# Input source (controlled by the AGG_INPUT_DIR env var, plumbed through
+# code/agg/_shared.py:SHARE_ROOT):
+#   make agg          → reads from the shared Box folder (default; coordinator
+#                       workflow — assumes each site has uploaded their
+#                       output_to_share/<site>/ bundle to AGG_BOX_DIR).
+#   make agg-local    → reads from the repo-local output_to_share/ tree
+#                       (use when iterating on agg scripts against a local
+#                       copy without round-tripping through Box).
+# Override the Box path on the command line if needed:
+#   make agg AGG_BOX_DIR=/some/other/mount
+#
+# Both targets write pooled outputs to output_to_agg/ in the repo.
 #
 # Implemented: pooled Table 1, cross-site cohort stats, cross-site stacked-
 # bar prevalence, cross-site trajectory overlay, cross-site forest plots
@@ -158,8 +180,20 @@ _descriptive_scripts:
 # (meta_analysis_cross_site.py reads each site's models_coeffs.csv).
 #
 # Anonymization: set ANONYMIZE_SITES=1 to relabel sites as "Site A"/"Site B"/…
-# in all outputs. Default is real names (mimic, UCMC, ...).
+# in all outputs. Default is real names (mimic, UCMC, ...). Orthogonal to the
+# input-source switch — composes with both `make agg` and `make agg-local`.
+AGG_BOX_DIR := /Users/wliao0504/Library/CloudStorage/Box-Box/CLIF/Projects/CLIF-epi-of-sedation
+
 agg:
+	@AGG_INPUT_DIR="$(AGG_BOX_DIR)" $(MAKE) _agg_run
+
+agg-local:
+	@$(MAKE) _agg_run
+
+# Shared loop body — recursing through $(MAKE) propagates AGG_INPUT_DIR to
+# each `uv run python` subprocess without export-ing it into the user's shell.
+_agg_run:
+	@echo "→ Aggregating from: $${AGG_INPUT_DIR:-output_to_share}"
 	@for script in code/agg/*.py; do \
 		case "$$(basename $$script)" in _*) continue ;; esac; \
 		echo "→ $$script"; \
@@ -200,6 +234,20 @@ qc:
 #   WEIGHT_QC_RANGE_RULE_ON=1             (off by default)
 weight-diagnostic weight-audit: _switch
 	uv run python code/qc/weight_audit.py
+
+# ── Trach funnel diagnostic (optional, run only on sites with issue) ──
+# Standalone diagnostic for triangulating an empty
+# `exit_mechanism = 'tracheostomy'` bucket in Table 1. Reads pipeline
+# outputs + raw CLIF respiratory_support; writes federation-safe CSVs to
+# output_to_share/{site}/qc/. Independent of `make run`. Sites without
+# the issue do not need to run it. See docs/audit_tracker.md F13.
+#
+# Outputs (all federated-safe — aggregates only, no row-level PHI):
+#   output_to_share/{site}/qc/trach_funnel.csv          (6-stage funnel)
+#   output_to_share/{site}/qc/trach_table1_variants.csv (canonical vs v2-based
+#                                                        exit_mechanism preview)
+trach-funnel: _switch
+	uv run python code/qc/trach_funnel_audit.py
 
 # ── One-time cleanup of legacy flat outputs (pre-site-subdir) ────────
 # Lists (and optionally deletes) artifacts left at the top level of
