@@ -136,12 +136,22 @@ def _(SITE_NAME, day1_df, eligible_hosp_ids, pd):
     _cm = _cm.loc[_cm["hospitalization_id"].isin(eligible_hosp_ids)].copy()
     table1_df = _cm.merge(day1_df, on="hospitalization_id", how="left")
 
+    # In-hospital mortality binaries derived from the already-normalized
+    # `discharge_category` (normalize_categories runs at 04_covariates.py:1189).
+    # Strict (`died_in_hospital`) matches the death predicate baked into
+    # `exit_mechanism = 'died_on_imv'` (04_covariates.py:1292) so the two stay
+    # consistent. Composite (`died_or_hospice`) is the sensitivity definition.
+    _dc_lower = table1_df["discharge_category"].str.lower()
+    table1_df["died_in_hospital"] = _dc_lower.eq("expired")
+    table1_df["died_or_hospice"] = _dc_lower.isin(["expired", "hospice"])
+
     # Convert boolean per-stay outcomes to Yes/No so they read like clinical
     # paper conventions in the formatted output. Keeps the per-site
     # categorical CSV consistent across vars (Yes/No for binaries; named
     # levels for sex_category / icu_type / exit_mechanism).
     for _binary_col in ["ever_pressor", "sepsis_ase",
-                        "successful_extubation", "ever_sbt_done_multiday"]:
+                        "successful_extubation", "ever_sbt_done_multiday",
+                        "died_in_hospital", "died_or_hospice"]:
         if _binary_col in table1_df.columns:
             table1_df[_binary_col] = table1_df[_binary_col].map(
                 lambda v: "Yes" if v in (1, True) else ("No" if v in (0, False) else None)

@@ -50,6 +50,15 @@ CATEGORICAL_VARS_PER_STAY: list[str] = [
     "exit_mechanism",
     "ever_sbt_done_multiday",  # NEW per-stay rollup (added in 04_covariates.py)
     "successful_extubation",   # already on cohort_meta_by_id; just not displayed today
+    # In-hospital mortality (derived from discharge_category in 06_table1.py).
+    # `discharge_category` carries the full disposition breakdown so reviewers
+    # can reconstruct any alternative mortality definition post-hoc. Strict
+    # (`died_in_hospital`) matches the existing `died_on_imv` predicate
+    # (04_covariates.py:1292); composite (`died_or_hospice`) is the
+    # sensitivity definition.
+    "discharge_category",
+    "died_in_hospital",
+    "died_or_hospice",
 ]
 
 # Categorical, per-patient-day denominator. Different denominator from the
@@ -68,6 +77,8 @@ BINARY_DISPLAY_LEVEL: dict[str, str] = {
     "ever_sbt_done_multiday":            "Yes",
     "successful_extubation":             "Yes",
     "sbt_done_multiday_per_full24h_day": "Yes",
+    "died_in_hospital":                  "Yes",
+    "died_or_hospice":                   "Yes",
 }
 
 # Display ordering for multi-level categoricals. Per-site CSV emits all

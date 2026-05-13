@@ -1,4 +1,4 @@
-.PHONY: mo run table1 tables report descriptive cascade qc weight-audit weight-diagnostic trach-funnel agg agg-local clean-legacy _switch _descriptive_scripts _agg_run
+.PHONY: mo run table1 mortality tables report descriptive cascade qc weight-audit weight-diagnostic trach-funnel agg agg-local clean-legacy _switch _descriptive_scripts _agg_run
 
 # ── Site selection ───────────────────────────────────────────────────
 # Usage:
@@ -16,9 +16,10 @@
 #   output/{site}/                  — pipeline intermediates (PHI-tier)
 #   output_to_share/{site}/         — shareable CSVs + compiled PDF
 #   output_to_share/{site}/figures/ — PNGs
-#   output_to_agg/                  — Phase-2 cross-site pooled outputs
-#                                     (produced by code/agg/ scripts; not
-#                                     yet implemented — see `make agg`)
+#   output_to_agg/descriptive/      — Phase-2 cross-site descriptive outputs
+#                                     (CSVs + figures side-by-side)
+#   output_to_agg/models/           — Phase-2 cross-site model outputs
+#                                     (forests, pooled coeffs, RCS overlays)
 SITE ?=
 site ?=
 
@@ -109,6 +110,17 @@ table1: _switch
 	uv run python code/05_modeling_dataset.py
 	uv run python code/06_table1.py
 
+# Mortality addendum — for sites that have already run the full pipeline and
+# just need to refresh Table 1 with the new in-hospital mortality variables
+# (`discharge_category`, `died_in_hospital`, `died_or_hospice`). Skips all
+# upstream re-derivation since `discharge_category` already lives on
+# output/{site}/cohort_meta_by_id.parquet from the prior `make run`.
+# Overwrites output_to_share/{site}/models/table1_*.csv; only
+# table1_categorical.csv has new content (the other three are deterministic).
+# Site shares the updated table1_categorical.csv.
+mortality: _switch
+	uv run python code/06_table1.py
+
 # ── Liberation cascade (4-stage modeling sibling to 08) ──────────────
 # Decomposes the sedation→liberation pathway into 4 conditional stages
 # (eligibility → SBT → extubation → success). Reads modeling_dataset.parquet
@@ -156,7 +168,8 @@ _descriptive_scripts:
 
 # ── Phase 2: cross-site aggregation (coordinator-side) ───────────────
 # Follows the VC convention from vc_proj_patterns.md §6 — aggregation
-# scripts live in code/agg/ and write to output_to_agg/. Reads each site's
+# scripts live in code/agg/ and write to output_to_agg/{descriptive,models}/.
+# Reads each site's
 # <input_root>/<site>/ folder read-only; never runs pipeline scripts
 # (01–09). Phase 1 (per-site runs) is complete by the time this runs.
 #
@@ -171,7 +184,13 @@ _descriptive_scripts:
 # Override the Box path on the command line if needed:
 #   make agg AGG_BOX_DIR=/some/other/mount
 #
-# Both targets write pooled outputs to output_to_agg/ in the repo.
+# Both targets write pooled outputs under output_to_agg/ in the repo,
+# split by output type via the `category=` kwarg on the save helpers:
+#   output_to_agg/descriptive/  → cohort stats, dose patterns, LOS, Table 1,
+#                                 sed-dose-by-hour, night-day-diff trajectory
+#   output_to_agg/models/       → meta-analysis pooled coeffs, forest plots
+#                                 (night-day / daytime / SBT-sensitivity),
+#                                 RCS marginal-effects overlays
 #
 # Implemented: pooled Table 1, cross-site cohort stats, cross-site stacked-
 # bar prevalence, cross-site trajectory overlay, cross-site forest plots
@@ -194,11 +213,21 @@ agg-local:
 # each `uv run python` subprocess without export-ing it into the user's shell.
 _agg_run:
 	@echo "→ Aggregating from: $${AGG_INPUT_DIR:-output_to_share}"
+	@echo "→ Writing to:       output_to_agg/{descriptive,models}/"
 	@for script in code/agg/*.py; do \
 		case "$$(basename $$script)" in _*) continue ;; esac; \
 		echo "→ $$script"; \
 		uv run python $$script || exit 1; \
 	done
+	@echo ""
+	@echo "Done. New artifacts:"
+	@echo "  output_to_agg/descriptive/  ($$(ls output_to_agg/descriptive 2>/dev/null | wc -l | tr -d ' ') files)"
+	@echo "  output_to_agg/models/       ($$(ls output_to_agg/models 2>/dev/null | wc -l | tr -d ' ') files)"
+	@if [ -d output_to_agg/figures ] || ls output_to_agg/*.csv >/dev/null 2>&1; then \
+		echo ""; \
+		echo "Note: legacy artifacts still present at output_to_agg/figures/ and output_to_agg/*.csv —"; \
+		echo "      run 'make clean-legacy' to list them, 'make clean-legacy FORCE=1' to delete."; \
+	fi
 
 # ── QC tool: per-patient interactive trajectory dashboard ───────────
 # Launches a Plotly Dash app on http://localhost:8050. Pick a site + a
@@ -259,10 +288,17 @@ clean-legacy:
 		! -name '.gitignore' ! -name '.DS_Store' ! -name '*.yaml' ! -name 'README*' -print 2>/dev/null || true
 	@find output_to_share/figures -maxdepth 1 -type f ! -name 'README*' -print 2>/dev/null || true
 	@echo ""
+	@echo "Legacy cross-site outputs (pre-descriptive/models restructure):"
+	@find output_to_agg -maxdepth 1 -type f ! -name '.gitignore' ! -name 'README*' -print 2>/dev/null || true
+	@find output_to_agg/figures -maxdepth 1 -type f ! -name 'README*' -print 2>/dev/null || true
+	@echo ""
 	@echo "Pass FORCE=1 to delete them."
 	@if [ "$(FORCE)" = "1" ]; then \
 		find output output_to_share -maxdepth 1 -type f \
 			! -name '.gitignore' ! -name '.DS_Store' ! -name '*.yaml' ! -name 'README*' -delete 2>/dev/null; \
 		find output_to_share/figures -maxdepth 1 -type f ! -name 'README*' -delete 2>/dev/null; \
+		find output_to_agg -maxdepth 1 -type f ! -name '.gitignore' ! -name 'README*' -delete 2>/dev/null; \
+		find output_to_agg/figures -maxdepth 1 -type f ! -name 'README*' -delete 2>/dev/null; \
+		rmdir output_to_agg/figures 2>/dev/null || true; \
 		echo "Deleted."; \
 	fi
