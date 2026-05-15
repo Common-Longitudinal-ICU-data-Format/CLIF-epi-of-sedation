@@ -931,25 +931,6 @@ def _(cs_df, hosp_df, sbt_all_blocks_w_duration, sbt_t5_v2_w_fail):
     return (sbt_outcomes,)
 
 
-@app.cell
-def _(SITE_NAME, sbt_outcomes, to_utc):
-    # Persist the raw row-level table for audit / QC dashboard consumption.
-    # Naming convention: this is the second-to-last aggregation tier (before
-    # hourly + daily roll-ups), saved alongside `outcomes_by_id_imvday.parquet`.
-    # Retag every *_dttm column to UTC before writing — DuckDB's .df()
-    # stamps TIMESTAMPTZ columns with the session tz, which leaks the
-    # runner's OS tz into the on-disk schema. Auto-detect over column
-    # suffix so derived/renamed *_dttm columns (event_dttm, cs_start_dttm,
-    # discharge_dttm, _imv_streak_start_dttm, etc.) all get normalized.
-    _out = sbt_outcomes.df()
-    _dttm_cols = [c for c in _out.columns if c.endswith('_dttm')]
-    _out = to_utc(_out, _dttm_cols)
-    _path = f"output/{SITE_NAME}/outcomes_by_event.parquet"
-    _out.to_parquet(_path)
-    logger.info(f"Saved: {_path} ({len(_out)} rows, {_out['hospitalization_id'].nunique()} hospitalizations)")
-    return
-
-
 @app.cell(hide_code=True)
 def _():
     mo.md(r"""
@@ -957,6 +938,15 @@ def _():
 
     Floor event_dttm to hour, aggregate SBT outcomes per hour,
     join back to cohort hourly grid, then roll up to daily.
+
+    NOTE: the row-level `outcomes_by_event.parquet` save was removed — its
+    only consumer was the QC trajectory viewer (`code/qc/_shared.py`), and
+    materializing `sbt_outcomes.df()` to a 24M-row pandas DataFrame plus
+    the parquet write dominated 03's wall-clock at large-cohort sites. The
+    QC viewer is already defensive against the missing file (`path.exists()`
+    guards at `_shared.py:322, 371` → empty SBT panel). DuckDB now pipelines
+    `sbt_outcomes` straight into the hourly aggregation below, and the
+    SBT-SQL chain executes once per run instead of twice.
     """)
     return
 

@@ -1,4 +1,4 @@
-.PHONY: mo run table1 mortality tables report descriptive cascade qc weight-audit weight-diagnostic trach-funnel agg agg-local clean-legacy _switch _descriptive_scripts _agg_run
+.PHONY: mo run table1 mortality pickup-from-outcomes tables report descriptive cascade qc weight-audit weight-diagnostic trach-funnel agg agg-local clean-legacy _switch _descriptive_scripts _agg_run
 
 # ── Site selection ───────────────────────────────────────────────────
 # Usage:
@@ -120,6 +120,33 @@ table1: _switch
 # Site shares the updated table1_categorical.csv.
 mortality: _switch
 	uv run python code/06_table1.py
+
+# ── Pickup from 03_outcomes.py onward ────────────────────────────────
+# Resumes the pipeline from 03, skipping the expensive 01 (cohort
+# materialization) and 02 (exposure). Common use cases:
+#   • Collaborator started `make run` with the template's
+#     `enable_v2_outcomes: true`, realized the V2 state machine doesn't
+#     scale to their cohort, and wants to flip it to false in
+#     config/<site>_config.json and resume.
+#   • Iterating on outcome definitions (sbt_done variants, success_extub,
+#     fail_extub window) without re-deriving cohort or exposure.
+#
+# 03 no longer writes the row-level `outcomes_by_event.parquet` (only the
+# QC viewer consumed it; that consumer is defensive against the missing
+# file). 03 produces only the daily roll-up
+# `outcomes_by_id_imvday.parquet` now, with DuckDB pipelining directly
+# into the aggregation instead of materializing 24M rows to pandas first
+# — significant wall-clock + memory savings at large-cohort sites.
+# 08b_models_cascade.py + 09_report.py stay shelved here for the same
+# reason as `make run` (deferred / on-demand artifacts).
+pickup-from-outcomes: _switch
+	uv sync
+	uv run python code/03_outcomes.py
+	uv run python code/04_covariates.py
+	uv run python code/05_modeling_dataset.py
+	uv run python code/06_table1.py
+	uv run python code/08_models.py
+	$(MAKE) _descriptive_scripts
 
 # ── Liberation cascade (4-stage modeling sibling to 08) ──────────────
 # Decomposes the sedation→liberation pathway into 4 conditional stages
